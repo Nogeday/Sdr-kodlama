@@ -101,6 +101,10 @@ class MeasurementResult:
     t_start_ns: int = 0
     duration_s: float = 0.0
     artifacts: list[str] = field(default_factory=list)         # files written by the report
+    # Reasons (TR) why ``value`` must NOT be compared with the KTR target even though it is a
+    # number (e.g. "koherens yok", "gerçek zamanlı olmayan simülatör", "kalibrasyonsuz").
+    # ``eds.measure.targets.apply_targets`` gives no verdict when this is non-empty.
+    blockers: list[str] = field(default_factory=list)
 
     def evaluate_target(self, target: float | None, op: str) -> None:
         self.target, self.target_op = target, op
@@ -126,8 +130,9 @@ class MeasurementResult:
             "summary": self.summary, "status": self.status, "passed": self.passed,
             "target": self.target, "target_op": self.target_op, "uncertainty": self.uncertainty,
             "conditions": self.conditions, "extra": self.extra, "t_start_ns": self.t_start_ns,
-            "duration_s": self.duration_s, "device": self.device.get("name", ""),
-        })
+            "duration_s": self.duration_s, "device": self.device.get("info", {}).get("name", "")
+            or self.device.get("name", ""),
+        } | ({"extra": {**self.extra, "blockers": list(self.blockers)}} if self.blockers else {}))
 
 
 def _jsonable(o: Any) -> Any:
@@ -304,4 +309,7 @@ def run_measurement(spec_id: str, ctx: MeasurementContext, **params: Any) -> Mea
                                summary=f"Başarısız: {e}")
             res.extra["traceback"] = traceback.format_exc(limit=8)
     res.t_start_ns, res.duration_s = t0_ns, mono() - t0
+    # every result records how it was obtained (jury report: quick / simulator banners)
+    res.conditions.setdefault("quick", bool(ctx.quick))
+    res.conditions.setdefault("simulated", bool(ctx.is_sim))
     return res

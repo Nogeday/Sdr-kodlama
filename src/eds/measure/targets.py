@@ -171,6 +171,8 @@ def _verdict_blocker(r: MeasurementResult) -> str:
     """
     from .base import MEASUREMENTS
 
+    if r.blockers:
+        return "; ".join(r.blockers) + " — hedefle karşılaştırılmadı"
     cls = MEASUREMENTS.get(r.spec_id)
     if cls is not None and r.unit and cls.unit and r.unit != cls.unit:
         return f"Birim uyuşmuyor ({r.unit} ≠ hedef birimi {cls.unit}); hedefle karşılaştırılmadı"

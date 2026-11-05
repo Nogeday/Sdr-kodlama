@@ -65,6 +65,7 @@ class DeviceProfile:
     interface_practical_bytes_per_s: float = 32e6    # warning threshold; measure with max_rate
     bytes_per_sample: int = 4               # on-wire bytes per complex sample per channel
     kernel_buffers: int = 4                 # stale buffers after retune (libiio default)
+    rx_max_input_dbm: float = math.inf      # highest stimulus level a procedure may apply at the RX port
     default_buffer_size: int = 65536
     candidate_sample_rates_hz: tuple[float, ...] = ()
     gain_bands: tuple[GainBand, ...] = ()
@@ -161,7 +162,7 @@ _SCALAR_FIELDS = {
     "tx_channels", "coherent_rx", "adc_bits", "full_scale_counts", "freq_min_hz", "freq_max_hz",
     "bw_min_hz", "bw_max_hz", "sample_rate_min_hz", "sample_rate_max_hz", "ref_clock_hz",
     "ref_clock_ppm", "interface", "interface_max_bytes_per_s", "interface_practical_bytes_per_s",
-    "bytes_per_sample", "kernel_buffers", "default_buffer_size",
+    "bytes_per_sample", "kernel_buffers", "default_buffer_size", "rx_max_input_dbm",
 }
 
 
@@ -183,7 +184,7 @@ def profile_from_dict(d: dict[str, Any], source: str = "<dict>") -> DeviceProfil
                 raise ConfigError(f"{source}: gain_bands[{i}] anahtarları {sorted(band_keys)} olmalı (geldi: {b!r})")
             bands.append(GainBand(**{k: float(v) for k, v in b.items()}))
         rates = tuple(float(r) for r in d.pop("candidate_sample_rates_hz", []))
-        float_fields = {k for k in _SCALAR_FIELDS if k.endswith(("_hz", "_s", "_ppm", "_counts"))}
+        float_fields = {k for k in _SCALAR_FIELDS if k.endswith(("_hz", "_s", "_ppm", "_counts", "_dbm"))}
         for k in float_fields & set(d):
             d[k] = float(d[k])
     except (TypeError, ValueError) as e:

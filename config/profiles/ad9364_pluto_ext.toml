@@ -26,6 +26,9 @@ interface_max_bytes_per_s = 53.248e6
 interface_practical_bytes_per_s = 24e6
 bytes_per_sample = 4
 kernel_buffers = 4
+# Ölçüm prosedürlerinin RX girişine uygulayabileceği en yüksek uyaran seviyesi. AD936x RX
+# mutlak maksimum girişi ≈ +2.5 dBm; marj + düşük kazançta sıkışma (P1dB) için -5 dBm.
+rx_max_input_dbm = -5.0
 default_buffer_size = 65536
 candidate_sample_rates_hz = [1.0e6, 2.4e6, 4.0e6, 6.0e6, 8.0e6, 10.0e6, 15.36e6, 20.0e6, 30.72e6, 61.44e6]
 
