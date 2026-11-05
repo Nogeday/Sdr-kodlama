@@ -89,6 +89,10 @@ class DetectConfig:
     min_bw_bins: int = 1
     fixed_threshold: float = -80.0          # for method = fixed (same unit as spectrum)
     exclude_dc: bool = True
+    # multi-resolution CFAR: 1 = native bins; D > 1 = D adjacent bins power-averaged.
+    # Wideband emitters (LTE 10 MHz, Wi-Fi 20 MHz) mask themselves in a narrow training
+    # window at native resolution; the coarse passes find them.
+    resolutions: list[int] = field(default_factory=lambda: [1, 16, 128])
 
 
 @dataclass
