@@ -13,8 +13,26 @@ without a shared 40 MHz reference the phase difference rotates continuously at
 * :func:`phase_offset` — ``arg(Σ x1·conj(x0))`` and the normalized coherence.
 * :func:`align` — fractional-delay compensation ``align(x1, d)[n] ≈ x1[n + d] ≈ x0[n]``.
 * :func:`check_coherence` — per block: delay, delay-compensated phase; across blocks:
-  phase drift (deg/s) and phase stability. ``coherent`` iff |drift| < 1 °/s, coherence >
-  0.9 and phase std < 5° after drift removal.
+  phase drift (deg/s) with its standard error and phase stability. ``coherent`` iff
+  ``|drift| < max(1 °/s, k·σ_drift)`` (``k`` = :data:`DRIFT_K_SIGMA`), coherence > 0.9 and
+  phase std < 5° after drift removal.
+
+Drift verdict. Over a short capture the ±1 °/s limit is close to the estimator's
+resolution: block phases known to ``σ_b`` each, ``N_b`` blocks over a span ``T``, give
+``σ_drift = σ_b / √Σ(t_b − t̄)² ≈ σ_b·√(12/N_b)/T`` — e.g. a weak (−70 dBm, simulator)
+noise-like pilot, 4 × 16384 samples at 2 MS/s: ``σ_drift ≈ 0.7 °/s``, and a shared
+reference (true drift 0) would fail the bare limit in ~20 % of captures. The drift is
+therefore compared against ``max(limit, k·σ_drift)``: false alarms stay below ``2·Q(k)``
+(0.3 % for ``k = 3``), while independent references (drift ``360·f·Δe``, ~10⁴ °/s for
+0.1 ppm at 1 GHz) are still rejected. ``σ_drift`` uses the larger of two block-phase
+variances: the white-noise one from the scatter of sub-block phases inside every block
+(many degrees of freedom) and the between-block residual of the linear fit (also sees LO
+phase wander, but has only ``N_b − 2`` degrees of freedom). When ``k·σ_drift`` exceeds the
+limit the note says that the limit itself could not be verified with this capture (longer
+capture / stronger pilot). All blocks are aligned with ONE delay (median of the per-block
+estimates): per-block delay noise ``δd`` would add block-to-block phase jitter
+``2π·f_bb·δd/fs`` on a wideband pilot — which was the dominant drift error of noise-like
+pilots (rms ≈ 1 °/s at −60 dBm, 4 × 16384 samples) before it was removed.
 
 Phase convention: the measured phase is ``arg(x1 · conj(x0))`` (channel 1 relative to the
 reference channel 0), drift = d/dt of that phase. For a tone at RF ``f`` and reference
@@ -24,9 +42,11 @@ deg/s.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field, fields
 from typing import Any
 
@@ -45,12 +65,21 @@ log = logging.getLogger(__name__)
 DRIFT_LIMIT_DEG_S: float = 1.0
 COHERENCE_MIN: float = 0.9
 PHASE_STD_MAX_DEG: float = 5.0
+#: The drift limit is applied as ``max(DRIFT_LIMIT_DEG_S, DRIFT_K_SIGMA · σ_drift)``.
+DRIFT_K_SIGMA: float = 3.0
 
 _G2_MAX = 0.9999                 # cap of the per-bin magnitude-squared coherence (weights)
 _G2_PFA = 1e-3                   # false-alarm level of the per-bin coherence significance test
 _MIN_PARTICIPATION = 8.0         # effective number of coherent bins for a resolvable delay
 _MIN_RMS_BW_BINS = 2.0           # Gabor bandwidth (segment bins) for a resolvable delay
 _EDGE_GUARD = 8                  # samples dropped at each end after fractional alignment
+_SUB_BLOCKS = 16                 # sub-blocks per block for the white phase-noise estimate
+_SUB_MIN_LEN = 64                # minimum samples per sub-block
+_SUB_MIN_COUNT = 4               # fewer sub-blocks: no within-block estimate
+_DRIFT_REFINE_ITER = 4           # derotation / block-phase slope iterations
+_DRIFT_REFINE_TOL_RAD = 1e-6     # stop when the residual ramp over the span is below this
+
+_REPORT_SINK: ContextVar[list[Any] | None] = ContextVar("eds_coherence_reports", default=None)
 
 
 def _c1d(x: Any, what: str) -> np.ndarray:
@@ -286,6 +315,40 @@ def valid_slice(n: int, delay: float, guard: int = _EDGE_GUARD) -> slice:
 
 
 # ============================================================================ coherence
+def _block_phase_var(blocks: Sequence[np.ndarray], fs: float) -> float:
+    """White-noise variance (rad²) of one block phase ``arg(Σ z)``, from the scatter of
+    sub-block phases inside the (Δf-derotated) blocks ``z``; NaN when the blocks are too short.
+
+    Every block is split into ``M`` equal sub-blocks (sums ``C_m``, ``M`` ≤ 16 and ≥ 64
+    samples each, common to all blocks). The deviations ``δ_m = arg(C_m·conj(Σ C))`` are
+    modelled as ``a_b + β·τ_m`` plus white noise — one offset per block and one common
+    intra-block slope ``β`` (residual frequency left by the Δf derotation), ``τ_m`` the
+    sub-block centre time relative to the block centre. The pooled residual variance
+    ``σ_c²`` of one sub-block phase (``nb·M − nb − 1`` degrees of freedom) gives the block
+    phase variance ``σ_c² / M`` (equal-power sub-blocks, noise uncorrelated between them —
+    true for thermal noise and noise-like pilots, whose correlation time is a few samples).
+    """
+    sizes = [int(z.size) for z in blocks]
+    m = min(_SUB_BLOCKS, min(sizes) // _SUB_MIN_LEN)
+    nb = len(sizes)
+    if m < _SUB_MIN_COUNT or nb * m - nb - 1 < 1:
+        return math.nan
+    dev: list[np.ndarray] = []
+    tau: list[np.ndarray] = []
+    for z in blocks:
+        ln = z.size // m
+        c = np.sum(np.asarray(z[:m * ln]).reshape(m, ln), axis=1)
+        d = np.angle(c * np.conj(np.sum(c)))
+        dev.append(d - d.mean())
+        tau.append((np.arange(m, dtype=np.float64) - 0.5 * (m - 1)) * ln / fs)
+    dv, tv = np.concatenate(dev), np.concatenate(tau)
+    stt = float(np.sum(tv * tv))
+    beta = float(np.sum(tv * dv)) / stt if stt > 0 else 0.0
+    res = dv - beta * tv
+    var_c = float(np.sum(res * res)) / (nb * m - nb - 1)
+    return var_c / m
+
+
 @dataclass
 class CoherenceReport:
     """Coherence of channel ``channel`` relative to ``ref_channel`` (see module docstring).
@@ -295,9 +358,11 @@ class CoherenceReport:
     coherence              mean per-block coherence (delay compensated, no drift removal:
                            what a DF integration over one block sees)
     phase_drift_deg_per_s  d/dt of the phase (fine frequency + block-phase fit)
-    drift_std_deg_per_s    standard error of the drift (from the block-phase fit residuals)
+    drift_std_deg_per_s    standard error of the drift: the larger of the within-block
+                           (sub-block phase scatter) and between-block (fit residual) estimates
     phase_std_deg          std of the block phases after removing the linear drift
-    coherent               all three criteria met
+    coherent               all three criteria met (drift against ``criteria
+                           ["drift_threshold_deg_s"] = max(limit, k·drift_std_deg_per_s)``)
     note                   Turkish one-line verdict / reason
     """
 
@@ -338,10 +403,22 @@ class CoherenceReport:
         return {f.name: clean(getattr(self, f.name)) for f in fields(self)}
 
 
-def _verdict(drift: float, coh: float, pstd: float, lim: dict[str, float], resolvable: bool) -> tuple[bool, str]:
+def drift_threshold(limit_deg_s: float, drift_std_deg_s: float, k_sigma: float = DRIFT_K_SIGMA) -> float:
+    """Effective drift limit ``max(limit, k·σ)`` (``limit`` alone when ``σ`` is not finite)."""
+    lim = float(limit_deg_s)
+    se = float(drift_std_deg_s)
+    return max(lim, float(k_sigma) * se) if math.isfinite(se) else lim
+
+
+def _verdict(drift: float, drift_se: float, coh: float, pstd: float, lim: dict[str, float],
+             resolvable: bool) -> tuple[bool, str]:
     reasons: list[str] = []
-    if not math.isfinite(drift) or abs(drift) >= lim["drift_deg_s"]:
-        reasons.append(f"faz kayması {drift:+.3g} °/s (sınır ±{lim['drift_deg_s']:g}): kanallar ortak referans "
+    thr = lim["drift_threshold_deg_s"]
+    widened = thr > lim["drift_deg_s"]
+    if not math.isfinite(drift) or abs(drift) >= thr:
+        bound = (f"±{thr:.3g} °/s = {lim['drift_k_sigma']:g}σ belirsizlik, sınır ±{lim['drift_deg_s']:g}" if widened
+                 else f"sınır ±{lim['drift_deg_s']:g}")
+        reasons.append(f"faz kayması {drift:+.3g} °/s ({bound}): kanallar ortak referans "
                        "saatini paylaşmıyor ya da referans kilitli değil — ortak 40 MHz referans gerekli")
     if not coh > lim["coherence_min"]:
         reasons.append(f"koherens {coh:.3f} < {lim['coherence_min']:g}: ortak sinyal yok/zayıf ya da faz blok "
@@ -351,6 +428,10 @@ def _verdict(drift: float, coh: float, pstd: float, lim: dict[str, float], resol
     ok = not reasons
     if ok:
         msg = f"Koherent: faz kayması {drift:+.3f} °/s, koherens {coh:.3f}, faz std {pstd:.2f}°"
+        if widened:
+            msg += (f". Kayma belirsizliği σ = {drift_se:.2g} °/s: ±{lim['drift_deg_s']:g} °/s sınırı bu "
+                    f"kayıtla doğrulanamadı (kayma ±{thr:.2g} °/s içinde = {lim['drift_k_sigma']:g}σ); daha uzun "
+                    "yakalama (blok sayısı × örnek) ya da daha güçlü ortak sinyal kullanın")
     else:
         msg = "Koherent DEĞİL: " + "; ".join(reasons)
     if not resolvable:
@@ -362,7 +443,8 @@ def _verdict(drift: float, coh: float, pstd: float, lim: dict[str, float], resol
 def analyze_coherence(x0_blocks: Sequence[Any], x1_blocks: Sequence[Any], fs: float,
                       t_s: Sequence[float] | None = None, *, max_lag: int | None = None,
                       drift_limit_deg_s: float = DRIFT_LIMIT_DEG_S, coherence_min: float = COHERENCE_MIN,
-                      phase_std_max_deg: float = PHASE_STD_MAX_DEG) -> CoherenceReport:
+                      phase_std_max_deg: float = PHASE_STD_MAX_DEG,
+                      drift_k_sigma: float = DRIFT_K_SIGMA) -> CoherenceReport:
     """Coherence report from paired blocks (pure computation behind :func:`check_coherence`).
 
     ``t_s[b]`` is the time (s, sample clock) of the first sample of block ``b``; default
@@ -371,8 +453,16 @@ def analyze_coherence(x0_blocks: Sequence[Any], x1_blocks: Sequence[Any], fs: fl
     ``z = x1·conj(x0)``, coherence, raw phase and the frequency of ``z``
     (:func:`~eds.dsp.peaks.tone_frequency`). The drift is ``2π·Δf`` (median block
     frequency) plus the slope of the unwrapped, Δf-derotated block phases versus time;
-    ``phase_std_deg`` is the residual of that linear fit.
+    ``phase_std_deg`` is the residual of that linear fit. The drift's standard error is
+    ``√(max(σ_res², σ_b²) / Σ(t − t̄)²)`` with ``σ_res²`` the fit residual variance and
+    ``σ_b²`` the white-noise block-phase variance from :func:`_block_phase_var`; the drift
+    criterion is ``|drift| < max(drift_limit_deg_s, drift_k_sigma · σ_drift)``
+    (``criteria["drift_threshold_deg_s"]``; ``drift_k_sigma = 0`` applies the bare limit).
     """
+    if (isinstance(drift_k_sigma, bool) or not isinstance(drift_k_sigma, (int, float))
+            or not (math.isfinite(drift_k_sigma) and drift_k_sigma >= 0.0)):
+        raise ConfigError(f"drift_k_sigma sonlu ve negatif olmayan bir sayı olmalı, {drift_k_sigma!r} geldi")
+    k_sigma = float(drift_k_sigma)
     nb = len(x0_blocks)
     if nb != len(x1_blocks):
         raise ConfigError(f"x0/x1 blok sayıları farklı ({nb} / {len(x1_blocks)})")
@@ -393,14 +483,19 @@ def analyze_coherence(x0_blocks: Sequence[Any], x1_blocks: Sequence[Any], fs: fl
 
     dels = [estimate_delay_ex(a, b, fs, max_lag) for a, b in pairs]
     res_d = [d.delay_samples for d in dels if d.resolvable]
-    fallback = float(np.median(res_d)) if res_d else 0.0
-    d_use = [d.delay_samples if d.resolvable else fallback for d in dels]
+    # One delay for all blocks: the stream delay is constant over a contiguous capture, and
+    # per-block estimates would turn their own noise into block-to-block phase jitter
+    # (2π·f_bb·δd/fs) that masquerades as drift. A delay slip between blocks then shows up as
+    # a coherence / phase-stability failure, which it is for DF.
+    d_common = float(np.median(res_d)) if res_d else 0.0
+    d_blk = [d.delay_samples if d.resolvable else d_common for d in dels]
 
     raw_ph: list[float] = []
     cohs: list[float] = []
     f_blk: list[float] = []
     zs: list[tuple[np.ndarray, int]] = []
-    for (a, b), d in zip(pairs, d_use):
+    d = d_common
+    for a, b in pairs:
         ba = align(b, d) if d != 0.0 else b
         sl = valid_slice(n, d) if d != 0.0 else slice(0, n)
         a_v, b_v = a[sl], ba[sl]
@@ -420,32 +515,41 @@ def analyze_coherence(x0_blocks: Sequence[Any], x1_blocks: Sequence[Any], fs: fl
     finite_f = [f for f in f_blk if math.isfinite(f)]
     dfreq = float(np.median(finite_f)) if finite_f else 0.0
 
-    ph = np.empty(nb)
-    tc = np.empty(nb)
-    for i, ((z, start), t0) in enumerate(zip(zs, ts)):
-        tt = t0 + (start + np.arange(z.size, dtype=np.float64)) / fs
-        ph[i] = float(np.angle(np.sum(z * np.exp(-2j * np.pi * dfreq * tt))))
-        tc[i] = t0 + (start + 0.5 * (z.size - 1)) / fs
-    unw = np.unwrap(ph)
-    slope, icept = np.polyfit(tc - tc[0], unw, 1)
+    tc = np.array([t0 + (start + 0.5 * (z.size - 1)) / fs for (z, start), t0 in zip(zs, ts)])
+    tts = [t0 + (start + np.arange(z.size, dtype=np.float64)) / fs for (z, start), t0 in zip(zs, ts)]
+    # The frequency is refined with the block-phase slope until the derotation leaves no
+    # residual ramp: a block phase arg(Σ z e^{-j2πΔf t}) of a fluctuating-envelope (noise-like)
+    # pilot is the ramp at the block's power centroid, not at its centre, so an uncorrected
+    # Δf error adds block-to-block phase jitter that the within-block scatter does not see.
+    for it in range(_DRIFT_REFINE_ITER):
+        derot = [z * np.exp(-2j * np.pi * dfreq * tt) for (z, _s), tt in zip(zs, tts)]
+        unw = np.unwrap([float(np.angle(np.sum(zd))) for zd in derot])
+        slope, icept = np.polyfit(tc - tc[0], unw, 1)
+        if it == _DRIFT_REFINE_ITER - 1 or abs(slope) * float(tc[-1] - tc[0]) < _DRIFT_REFINE_TOL_RAD:
+            break
+        dfreq += float(slope) / (2.0 * np.pi)
     resid = unw - (slope * (tc - tc[0]) + icept)
     var_res = float(np.sum(resid ** 2)) / (nb - 2)              # 2 fitted parameters, nb >= 3
     pstd = float(np.degrees(math.sqrt(var_res)))
     sxx = float(np.sum((tc - tc.mean()) ** 2))
-    slope_se = float(np.degrees(math.sqrt(var_res / sxx))) if sxx > 0 else math.nan
+    var_white = _block_phase_var(derot, fs)
+    var_slope = max(var_res, var_white) if math.isfinite(var_white) else var_res
+    slope_se = float(np.degrees(math.sqrt(var_slope / sxx))) if sxx > 0 else math.nan
     drift = float(np.degrees(2.0 * np.pi * dfreq + slope))
     coh = float(np.mean(cohs))
     phase_deg = float(np.degrees(np.angle(np.sum(np.exp(1j * np.asarray(raw_ph))))))
     resolvable = bool(res_d)
-    ok, note = _verdict(drift, coh, pstd, lim, resolvable)
+    lim["drift_k_sigma"] = k_sigma
+    lim["drift_threshold_deg_s"] = drift_threshold(lim["drift_deg_s"], slope_se, k_sigma)
+    ok, note = _verdict(drift, slope_se, coh, pstd, lim, resolvable)
     d_std = [d.delay_std_samples for d in dels if d.resolvable and math.isfinite(d.delay_std_samples)]
     return CoherenceReport(
-        delay_samples=float(np.median(d_use)), phase_deg=phase_deg, coherence=coh,
+        delay_samples=d_common, phase_deg=phase_deg, coherence=coh,
         phase_drift_deg_per_s=drift, phase_std_deg=pstd, n_blocks=nb, coherent=ok, note=note,
         drift_std_deg_per_s=slope_se, freq_offset_hz=float(drift / 360.0),
         delay_std_samples=float(np.median(d_std)) if d_std else math.nan,
         delay_resolvable=resolvable, peak_corr=float(np.median([d.peak_corr for d in dels])), fs_hz=fs, n=n,
-        block_phases_deg=[float(v) for v in np.degrees(raw_ph)], block_delays=[float(v) for v in d_use],
+        block_phases_deg=[float(v) for v in np.degrees(raw_ph)], block_delays=[float(v) for v in d_blk],
         block_coherence=[float(v) for v in cohs], criteria=lim,
     )
 
@@ -454,7 +558,7 @@ def check_coherence(device: Any, n: int = 65536, blocks: int = 8, *, ref_channel
                     channels: Sequence[int] | None = None, max_lag: int | None = None,
                     drift_limit_deg_s: float = DRIFT_LIMIT_DEG_S, coherence_min: float = COHERENCE_MIN,
                     phase_std_max_deg: float = PHASE_STD_MAX_DEG, timeout_s: float = 2.0,
-                    max_attempts: int = 3) -> CoherenceReport:
+                    max_attempts: int = 3, drift_k_sigma: float = DRIFT_K_SIGMA) -> CoherenceReport:
     """Measure the coherence of a ≥ 2-channel device (``DeviceGroup`` or coherent receiver).
 
     A common signal must reach every channel (cabled noise source / generator through a
@@ -465,7 +569,8 @@ def check_coherence(device: Any, n: int = 65536, blocks: int = 8, *, ref_channel
     with :func:`analyze_coherence`. The returned report is the worst pair (non-coherent
     first, then lowest coherence) with ``coherent = all pairs coherent``; with more than
     one pair every pair's report is in ``pairs``. The stream is stopped again if it was not
-    running before.
+    running before. Inside :func:`collect_reports` the returned report is also appended to
+    the collector.
     """
     nch = int(device.num_channels)
     if nch < 2:
@@ -512,7 +617,7 @@ def check_coherence(device: Any, n: int = 65536, blocks: int = 8, *, ref_channel
     for c in chans:
         rep = analyze_coherence([b.samples[ref] for b in blks], [b.samples[int(c)] for b in blks], fs, t_s,
                                 max_lag=max_lag, drift_limit_deg_s=drift_limit_deg_s, coherence_min=coherence_min,
-                                phase_std_max_deg=phase_std_max_deg)
+                                phase_std_max_deg=phase_std_max_deg, drift_k_sigma=drift_k_sigma)
         rep.ref_channel, rep.channel, rep.t_ns = ref, int(c), t_ns
         reports.append(rep)
     main = sorted(reports, key=lambda r: (r.coherent, r.coherence))[0]
@@ -520,4 +625,25 @@ def check_coherence(device: Any, n: int = 65536, blocks: int = 8, *, ref_channel
         main.pairs = [r.to_dict() for r in reports]
         main.coherent = all(r.coherent for r in reports)
     log.info("%s: kanal %d↔%d: %s", device.name, main.ref_channel, main.channel, main.note)
+    sink = _REPORT_SINK.get()
+    if sink is not None:
+        sink.append(main)
     return main
+
+
+@contextlib.contextmanager
+def collect_reports() -> Iterator[list[CoherenceReport]]:
+    """Collect every report :func:`check_coherence` returns inside the ``with`` block (same
+    thread / context), for a caller that does not get the report back itself — e.g. the
+    ``eds cal coherence`` exit code (3 = not coherent) set around the subcommand handler::
+
+        with collect_reports() as reports:
+            run_something_that_calls_check_coherence()
+        coherent = bool(reports) and all(r.coherent for r in reports)
+    """
+    sink: list[CoherenceReport] = []
+    token = _REPORT_SINK.set(sink)
+    try:
+        yield sink
+    finally:
+        _REPORT_SINK.reset(token)

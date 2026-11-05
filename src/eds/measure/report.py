@@ -126,14 +126,14 @@ _SPEC_SHORT_KEYS: dict[str, tuple[tuple[str, str], ...]] = {
     "scan_speed": (("start_hz", "aralık"), ("fs_hz", "fs"), ("rbw_hz", "RBW"), ("averages", "ort."),
                    ("repeats", "tekrar")),
     "freq_resolution": (("fc_hz", "fc"), ("rbw_hz", "RBW"), ("window", "pencere"), ("nfft", "N")),
-    "df_rms": (("f_target_hz", "f"), ("baseline_m", "d"), ("angles_deg", "θ"), ("repeats", "tekrar"),
-               ("coherent", "koherent")),
+    "df_rms": (("f_target_hz", "f"), ("baseline_m", "d"), ("angles_deg", "θ"), ("snr_db", "SNR"),
+               ("coherent", "koherent"), ("repeats", "tekrar")),
     "image_rejection": (("fcs_hz", "fc"), ("fs_hz", "fs"), ("offsets_frac", "δ/fs"), ("gain_db", "G")),
     "max_rate": (("duration_s", "süre/hız"), ("buffer_size", "buffer"), ("interface", "arayüz"),
                  ("headline_mode", "mod")),
     "latency": (("headline_mode", "mod"), ("n_events", "olay"), ("transport", "taşıma"), ("fs_hz", "fs")),
 }
-_SPEC_SHORT_MAX = 5
+_SPEC_SHORT_MAX = 6
 _SHORT_HZ_DIGITS = {"rbw_hz": 4}
 _DENSITY_SUFFIXES: tuple[tuple[str, str], ...] = (
     ("_dbm_hz", "dBm/Hz"), ("_dbfs_hz", "dBFS/Hz"), ("_dbc_hz", "dBc/Hz"), ("_db_hz", "dB/Hz"),
@@ -154,6 +154,9 @@ _QUALIFIERS = frozenset({
 })
 _PER_UNITS: dict[str, str] = {"s": "s", "db": "dB", "hz": "Hz", "m": "m", "ms": "ms", "c": "°C", "deg": "°"}
 _PER_RE = re.compile(r"^(.*)_per_(s|db|hz|m|ms|c|deg)$")
+# "<quantity>_<unit>_by_<index>_<unit>" mappings, e.g. mds_dbm_by_bw_hz = {"25000": -104.2}: the
+# values carry the unit before "_by_", the (numeric) keys the unit at the end
+_BY_RE = re.compile(r"^(.+)_by_([a-z0-9_]+)$")
 
 
 # ============================================================================ formatting
@@ -369,6 +372,28 @@ def _format_mapping(key: str, value: Mapping[Any, Any], limit: int | None, hz_di
     return _truncate("; ".join(parts), limit)
 
 
+def _by_parts(key: str) -> tuple[str, str] | None:
+    """``("mds_dbm", "bw_hz")`` for ``"mds_dbm_by_bw_hz"`` when the part before ``_by_`` names
+    the value unit (else ``None``: e.g. ``noise_rbw_by_gain_dbfs`` keeps its trailing unit)."""
+    m = _BY_RE.match(key.lower())
+    if m is None or not _has_unit(m.group(1)):
+        return None
+    return m.group(1), m.group(2)
+
+
+def _format_indexed(value_key: str, index_key: str, value: Mapping[Any, Any], limit: int | None,
+                    hz_digits: int) -> str:
+    """``{"978.723": -118.3, "25000": -104.2}`` → ``"978.7 Hz: -118.3 dBm; 25 kHz: -104.2 dBm"``."""
+    parts = []
+    for k, v in value.items():
+        try:
+            kk = format_condition(index_key, float(k), hz_digits=4) if _has_unit(index_key) else str(k)
+        except (TypeError, ValueError):
+            kk = str(k)
+        parts.append(f"{kk}: {format_condition(value_key, v, limit=None, hz_digits=hz_digits)}")
+    return _truncate("; ".join(parts), limit)
+
+
 def format_condition(key: str, value: Any, *, limit: int | None = 300, hz_digits: int = 9,
                      unit: str | None = None) -> str:
     """Format a condition / extra metric using its key's unit suffix
@@ -382,8 +407,13 @@ def format_condition(key: str, value: Any, *, limit: int | None = 300, hz_digits
         return _DASH
     if isinstance(value, bool):
         return "evet" if value else "hayır"
+    by = _by_parts(key)
     if isinstance(value, Mapping):
+        if by is not None and len(value) <= 12 and all(_is_scalar(x) for x in value.values()):
+            return _format_indexed(by[0], by[1], value, limit, hz_digits)
         return _format_mapping(key, value, limit, hz_digits)
+    if by is not None:
+        key = by[0]                                  # a scalar of an indexed quantity: the value unit
     if isinstance(value, (list, tuple)):
         if value and all(_is_number(_py(x)) for x in value) and len(value) <= 8:
             return ", ".join(format_condition(key, x, hz_digits=hz_digits, unit=unit) for x in value)
@@ -391,7 +421,7 @@ def format_condition(key: str, value: Any, *, limit: int | None = 300, hz_digits
             return _truncate(", ".join(str(x) for x in value), limit)
         return _display_json(value, limit)
     if isinstance(value, str):
-        return _truncate(value, limit)
+        return _truncate(value, limit) if value.strip() else _DASH       # "" = not stated
     if not _is_number(value):
         return str(value)
     v = float(value)
@@ -517,6 +547,8 @@ def _short_value(key: str, c: Mapping[str, Any]) -> str:
     v = _py(c[key])
     if key == "start_hz" and _is_number(v) and _is_number(_py(c.get("stop_hz"))):
         return f"{fmt_hz(float(v), 6)} – {fmt_hz(float(_py(c['stop_hz'])), 6)}"
+    if key == "snr_db" and _finite(v) and _finite(_py(c.get("snr_bw_hz"))):
+        return f"{format_value(float(v), 'dB')} / {fmt_hz(float(_py(c['snr_bw_hz'])), 4)}"
     if key == "configs" and isinstance(v, (list, tuple)) and v and all(
             isinstance(_py(x), (list, tuple)) and len(_py(x)) == 2 for x in v):
         if len(v) > 2:

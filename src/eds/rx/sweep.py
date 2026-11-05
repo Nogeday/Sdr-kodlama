@@ -499,6 +499,11 @@ class Sweeper:
             raise ConfigError(f"dsp.overlap [0, 1) aralığında olmalı, {dsp.overlap!r} geldi")
         if isinstance(cfg.settle_buffers, bool) or int(cfg.settle_buffers) != cfg.settle_buffers:
             raise ConfigError(f"sweep.settle_buffers tamsayı olmalı, {cfg.settle_buffers!r} geldi")
+        pmp = cfg.publish_max_points
+        if (isinstance(pmp, bool) or not isinstance(pmp, (int, float)) or not math.isfinite(float(pmp))
+                or int(pmp) != pmp or int(pmp) < 1):
+            # checked here, not only when publishing: a bad value must fail before the sweep runs
+            raise ConfigError(f"sweep.publish_max_points pozitif tamsayı olmalı, {pmp!r} geldi")
         window = canonical_window_name(cfg.window)
         if float(cfg.rbw_hz) > 0.0:
             nfft = nfft_for_rbw(float(cfg.rbw_hz), fs, window)

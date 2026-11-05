@@ -98,7 +98,8 @@ class FakeMember(RxDevice):
 
     def set_tracking(self, dc=None, rf_dc=None, quadrature=None):
         self.tracking = {"dc": dc, "rf_dc": rf_dc, "quadrature": quadrature}
-        path = "iio" if self.name.endswith("A") else "soapy"
+        # a Pluto has no Soapy DC-offset / IQ-balance API: thin layer ("iio") or nothing
+        path = "iio" if self.name.endswith("A") else "unsupported"
         return {k: path for k, v in self.tracking.items() if v is not None}
 
     def read_sensors(self):
@@ -323,6 +324,29 @@ def test_tracking_and_sensors_fan_out():
     assert s == {"rxA.temperature_c": 41.0, "rxB.temperature_c": 42.0}
     d = g.describe()
     assert len(d["members"]) == 2 and d["num_channels"] == 2 and d["coherent"] is False
+    g.close()
+
+
+@pytest.mark.parametrize("sources, expected", [
+    ((None, None), ""),                                      # simulators: exact, nothing stated
+    (("driver", "driver"), "driver"),
+    (("dma_status", "driver"), "dma_status"),
+    (("dma_status", "dma_status"), "dma_status"),
+    (("dma_status", "none"), "none"),                        # one blind member: losses may go unseen
+    (("none", None), "none"),
+    ((None, "driver"), "driver"),
+])
+def test_overflow_source_is_the_weakest_member(sources, expected):
+    g, a, b = make_group()
+    for m, src in zip((a, b), sources):
+        if src is not None:
+            m.overflow_source = src
+    assert g.overflow_source == expected
+    d = g.describe()
+    assert d["overflow_source"] == expected
+    assert d["overflow_source_members"] == {"rxA": sources[0] or "", "rxB": sources[1] or ""}
+    b.overflow_source = "none"                               # e.g. a member's DMA poll failed mid-stream
+    assert g.overflow_source == "none"
     g.close()
 
 

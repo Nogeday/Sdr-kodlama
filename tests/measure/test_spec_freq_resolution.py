@@ -143,3 +143,37 @@ def test_reference_lock_auto_detection():
         m = FreqResolutionMeasurement(MeasurementContext(app=AppConfig(), devices=[object()], source=src))
         assert m._reference_locked({"reference_locked": None}) is want
         assert m._reference_locked({"reference_locked": True}) is True
+
+
+def test_two_tone_composite_stays_below_rx_ceiling(tmp_path):
+    """Two equal tones carry +3 dB of composite power: the per-tone setting is
+    min(single-tone setting, ceiling − 3 dB) so the RX input never exceeds rx_max_input_dbm."""
+    import dataclasses
+
+    from eds.measure.specs.freq_resolution import TWO_TONE_COMPOSITE_DB
+
+    app = sim_app(tmp_path, fc=FC, fs=FS)
+    with sim_context(app, quick=True) as ctx:
+        dev = ctx.dut
+        dev.profile = dataclasses.replace(dev.profile, rx_max_input_dbm=-56.0)
+        src = ctx.source
+        calls: list[list[float]] = []
+        inner = src.set_tones
+
+        def set_tones(freqs, powers):
+            calls.append([float(p) for p in powers])
+            return inner(freqs, powers)
+
+        src.set_tones = set_tones
+        res = run_measurement("freq_resolution", ctx)
+        m = FreqResolutionMeasurement(ctx)
+        assert m.two_tone_setting(dev, -70.0, -56.0) == -70.0                  # far below: unchanged
+        assert m.two_tone_setting(dev, -57.0, -56.0) == pytest.approx(-56.0 - TWO_TONE_COMPOSITE_DB)
+    check_contract(res, unit="Hz", min_spectrum_figs=1)
+    ex = res.extra
+    assert calls and all(p <= -56.0 - TWO_TONE_COMPOSITE_DB + 1e-9 for c in calls for p in c)
+    assert ex["single_tone_setting_dbm"] <= -56.0 + 1e-9
+    assert ex["two_tone_setting_dbm"] == pytest.approx(min(ex["single_tone_setting_dbm"],
+                                                           -56.0 - TWO_TONE_COMPOSITE_DB))
+    assert ex["two_tone_backoff_db"] == pytest.approx(ex["single_tone_setting_dbm"] - ex["two_tone_setting_dbm"])
+    assert "min_separation_hz" in ex                                             # still resolved

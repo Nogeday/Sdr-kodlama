@@ -13,7 +13,10 @@
     separation above which every separation is resolved is bracketed and refined by
     ``bisect_steps`` geometric bisections. Value = smallest verified resolved separation;
     uncertainty = the final bracket width. Without a multi-tone source the value is the RBW
-    (method says so).
+    (method says so). Per-tone setting = min(single-tone setting, ceiling − 3 dB), the ceiling
+    being the setting that puts ONE tone at the profile's ``rx_max_input_dbm`` (absolute
+    source: that level; relative source: :func:`~eds.measure.stimulus.relative_setting_cap`
+    from the single-tone reading), so the two-tone composite never exceeds it.
 
 (c) Frequency accuracy: a CW tone at a known frequency (the source is the truth — on hardware
     it MUST be locked to a GPSDO/10 MHz reference) at ``fc + accuracy_frac[1]·fs``, measured
@@ -61,12 +64,17 @@ from ..stimulus import (
     as_float_list,
     as_int,
     qparam,
+    relative_setting_cap,
+    rx_max_input_dbm,
     settled_capture,
+    source_power_range,
 )
 
 log = logging.getLogger(__name__)
 
 _CHUNK = 64            # segments per FFT batch of the zero-padded Welch
+#: Two equal tones: composite (mean) power = per-tone power + 3 dB.
+TWO_TONE_COMPOSITE_DB = 10.0 * math.log10(2.0)
 _LINE_ZP = 64          # zero padding of the analytic window line
 
 
@@ -336,8 +344,15 @@ class FreqResolutionMeasurement(Measurement):
             f_cal = float(correct_freq(f_meas, sw))
             acc.update({"ppm_cal": float(cal_ppm), "ppm_cal_software": sw, "freq_error_cal_hz": f_cal - f2,
                         "freq_error_cal_ppm": (f_cal - f2) / f2 * 1e6})
+        # setting that puts ONE tone at the RX input ceiling (absolute: dBm at the input;
+        # relative: extrapolated from this linear reading)
+        if getattr(ctx.source, "absolute_power", False):
+            ceiling = rx_max_input_dbm(dev)
+        else:
+            ceiling = relative_setting_cap(ctx, dev, probe.setting, probe.level_dbfs, None)
         out.update({"accuracy": acc, "line_width_hz": width, "line_spec": line_spec, "line_peak_hz": float(line_spec.f_hz[kp]),
-                    "setting": setting, "e": e, "f1_hz": f1, "probe_offset_db": probe.offset_db})
+                    "setting": setting, "setting_ceiling": float(ceiling), "e": e, "f1_hz": f1,
+                    "probe_offset_db": probe.offset_db})
 
     # ------------------------------------------------------------------ (b)
     def _two_tone_point(self, dev: Any, prm: dict[str, Any], sep: float, center: float, e: float, setting: float,
@@ -364,9 +379,23 @@ class FreqResolutionMeasurement(Measurement):
         return _SepPoint(sep_hz=sep, dip_db=d["dip_db"], resolved=bool(d["two_peaks"] and d["dip_db"] >= prm["dip_db"]),
                          phase=phase, info=d, spec=spec)
 
+    def two_tone_setting(self, dev: Any, single: float, ceiling: float) -> float:
+        """Per-tone setting of the two-tone test: the single-tone setting, lowered so that the
+        composite of two equal tones (+3 dB) stays at or below the RX input ceiling
+        (``ceiling`` = setting of ONE tone at ``rx_max_input_dbm``), within the source range."""
+        lo, hi = source_power_range(self.ctx.source, dev)
+        s = min(float(single), float(ceiling) - TWO_TONE_COMPOSITE_DB, hi)
+        if s < lo:
+            raise MeasurementError(
+                f"İki-ton: ton başına ayar ({s:.1f}) kaynağın en düşük gücünün ({lo:g}) altında kalıyor (RX giriş "
+                "sınırı − 3 dB) — zayıflatıcı ekleyin")
+        return s
+
     def _two_tone(self, dev: Any, prm: dict[str, Any], out: dict[str, Any]) -> None:
         rbw = out["rbw"]
-        e, setting = out["e"], out["setting"]
+        e = out["e"]
+        setting = self.two_tone_setting(dev, out["setting"], out.get("setting_ceiling", math.inf))
+        out["two_tone_setting"] = setting
         center = float(dev.fc) + prm["center_frac"] * float(dev.fs)
         out["two_tone_used"] = True
         seps = np.geomspace(prm["sep_min_rbw"], prm["sep_max_rbw"], prm["sep_points"]) * rbw
@@ -427,6 +456,11 @@ class FreqResolutionMeasurement(Measurement):
         if hi is not None:
             extra.update({"min_separation_hz": hi.sep_hz, "min_separation_rbw": hi.sep_hz / rbw,
                           "dip_at_min_db": hi.dip_db, "captures_per_separation": prm["captures"]})
+        if "two_tone_setting" in out:
+            sfx = "dbm" if getattr(src, "absolute_power", False) else "rel_db"
+            extra[f"two_tone_setting_{sfx}"] = out["two_tone_setting"]
+            extra[f"single_tone_setting_{sfx}"] = out["setting"]
+            extra["two_tone_backoff_db"] = max(0.0, out["setting"] - out["two_tone_setting"])
             if lo is not None:
                 extra.update({"max_unresolved_hz": lo.sep_hz, "dip_at_max_unresolved_db": lo.dip_db})
         if acc is not None:
@@ -444,6 +478,9 @@ class FreqResolutionMeasurement(Measurement):
                  f"{fmt_hz(float(dev.fs))}/{prm['nfft']}, {prm['window']}, {fmt_hz(prm['fc'])})"]
         if hi is not None:
             parts.append(f"≥ {prm['dip_db']:g} dB çukurla en küçük ayrım = {hi.sep_hz / rbw:.2f}×RBW")
+            if extra.get("two_tone_backoff_db", 0.0) > 0.05:
+                parts.append(f"iki-ton ton başına seviye RX giriş sınırı için {extra['two_tone_backoff_db']:.1f} dB "
+                             "düşürüldü (iki tonun toplamı rx_max_input_dbm'i aşmaz)")
         if "line_width_hz" in out:
             parts.append(f"tek ton −3 dB çizgi genişliği {out['line_width_hz']:.0f} Hz")
         if acc is not None:

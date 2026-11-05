@@ -5,19 +5,33 @@ worker process imports them by name (``"tests.hal.fakes.fake_proc:open_fake"``).
 
 * ``script``: list of read events consumed in order by ``_read_raw``; keys ``k`` (samples),
   ``overflow``, ``timeout``, ``hw_time_ns``, ``t_ns``, ``sleep`` (s), ``error`` (class name in
-  ``eds.core.errors`` or ``"KeyError"``), ``exit`` (``os._exit`` code). After the script:
-  a ramp (sample value = absolute index) in chunks of at most ``chunk`` samples.
+  ``eds.core.errors`` or ``"KeyError"``), ``exit`` (``os._exit`` code), ``uncertain``
+  (``RawRead.uncertain_samples``; ``-1`` = the device's ``settle_samples``, like a Pluto DMA
+  overflow), ``dma`` (count one ``dma_overflow_events``), ``ovf_source`` (set
+  ``overflow_source`` before returning, e.g. detection switched off mid-stream). After the
+  script: a ramp (sample value = absolute index) in chunks of at most ``chunk`` samples.
+* ``pluto_like``: the device carries the SoapyRxDevice-like attributes ``overflow_source``
+  (``"dma_status"``), ``dma_overflow_events``, ``thin_serial_verified``, ``stream_mtu`` (set
+  by ``_start`` to ``mtu``) and its ``settle_samples`` follows ``max(buffer_size, stream_mtu)``
+  (``stream:bufflen``); ``round_buffer``: ``_start`` rounds ``buffer_size`` up to a multiple
+  of it (a backend that changes the parent-owned buffer size).
 * ``fixed``: return slices of one preallocated buffer (transport throughput, no synthesis).
 * ``crash_fc`` / ``fail_fc`` / ``hang_bw``: retune kills the worker / raises DeviceError,
   ``set_bandwidth(hang_bw)`` sleeps 30 s.
 * ``open_error`` / ``open_violation``: the opener raises; ``open_wrong_type``: it returns a
   non-``RxDevice``.
 * ``close_error``: ``_close`` raises DeviceError.
+
+:func:`open_fake_pluto` opens a REAL :class:`~eds.hal.soapy_backend.SoapyRxDevice` on the
+SoapySDR / pylibiio fakes (installed into ``sys.modules`` of the calling process), its board's
+RX DMA status register wired to the driver's silent overflows; ``cfg.sim["rx_script"]``
+preloads the fake driver's ``readStream`` script.
 """
 
 from __future__ import annotations
 
 import os
+import sys
 import time
 from typing import Any
 
@@ -47,6 +61,15 @@ class FakeRawDevice(RxDevice):
         self.info.extra = {"pid": str(os.getpid())}
         self.ops = 0
         self.started_with = 0
+        if self.p.get("pluto_like"):
+            self.overflow_source = "dma_status"
+            self.dma_overflow_events = 0
+            self.thin_serial_verified = True
+            self.stream_mtu = 0
+
+    @property
+    def settle_samples(self) -> int:
+        return int(self.settle_buffers * max(int(self.buffer_size), int(getattr(self, "stream_mtu", 0) or 0)))
 
     # ------------------------------------------------------------------ primitives
     def _apply_sample_rate(self, hz: float) -> float:
@@ -77,6 +100,11 @@ class FakeRawDevice(RxDevice):
 
     def _start(self, buffer_size: int) -> None:
         self.started_with = int(buffer_size)
+        step = int(self.p.get("round_buffer", 0))
+        if step:
+            self.buffer_size = -(-int(buffer_size) // step) * step
+        if hasattr(self, "stream_mtu"):
+            self.stream_mtu = int(self.p.get("mtu", 0))
 
     def _stop(self) -> None:
         pass
@@ -99,6 +127,10 @@ class FakeRawDevice(RxDevice):
         if "error" in ev:
             name = ev["error"]
             raise KeyError("boom") if name == "KeyError" else getattr(E, name)(f"{self.name}: senaryo hatası {name}")
+        if "ovf_source" in ev:
+            self.overflow_source = str(ev["ovf_source"])
+        if ev.get("dma"):
+            self.dma_overflow_events += 1
         t_ns = int(ev.get("t_ns", time.time_ns()))
         if ev.get("timeout"):
             return RawRead(samples=np.zeros((1, 0), np.complex64), timeout=True, t_ns=t_ns)
@@ -106,8 +138,9 @@ class FakeRawDevice(RxDevice):
         x = (self.n_next + np.arange(k, dtype=np.float64)).astype(np.complex64).reshape(1, -1)
         x = x + np.complex64(1j) * np.float32(len(self.script))
         self.n_next += k
+        unc = int(ev.get("uncertain", 0))
         return RawRead(samples=x, overflow_before=bool(ev.get("overflow", False)), t_ns=t_ns,
-                       hw_time_ns=ev.get("hw_time_ns"))
+                       hw_time_ns=ev.get("hw_time_ns"), uncertain_samples=self.settle_samples if unc < 0 else unc)
 
     # ------------------------------------------------------------------ optional features
     def set_tracking(self, dc=None, rf_dc=None, quadrature=None) -> dict[str, str]:
@@ -144,6 +177,20 @@ def open_fake(cfg: DeviceConfig, app: AppConfig | None = None) -> RxDevice:
     if cfg.sim.get("open_wrong_type"):
         return object()  # type: ignore[return-value]  # not an RxDevice on purpose
     return FakeRawDevice(cfg)
+
+
+def open_fake_pluto(cfg: DeviceConfig, app: AppConfig | None = None) -> RxDevice:
+    """A real SoapyRxDevice (Pluto) on the fakes; see the module docstring. A test calling it
+    in-process must protect ``sys.modules["SoapySDR"]`` / ``["iio"]`` (monkeypatch)."""
+    from eds.hal.soapy_backend import SoapyRxDevice
+    from tests.hal.fakes import fake_iio, fake_soapy
+
+    board = fake_iio.make_pluto_board(cfg.control_uri)
+    sys.modules["iio"] = fake_iio.make_module([board])
+    sys.modules["SoapySDR"] = fake_soapy.make_module(overflow_hook=board.dma_overflow, overflow_drop=3000)
+    dev = SoapyRxDevice(cfg, load_profile(cfg.profile), overflow_poll_s=0.0)
+    dev._dev.rx_script.extend(cfg.sim.get("rx_script", []))
+    return dev
 
 
 # ---------------------------------------------------------------------------- sources

@@ -79,6 +79,18 @@ def test_inst_bw_tone_stepping_matches_analytic_response(tmp_path):
     assert max(abs(r["f_bb_hz"]) for r in pts) == pytest.approx(0.49 * 20e6, rel=0.01)
     assert min(abs(r["f_bb_hz"]) for r in pts) > 2 * 20e6 / 4096
     assert not left_on
+    # JURY-10b: the screenshot marks the interpolated −3 dB edges (vertical lines); the marker is
+    # the nearest measured tone point and states its own normalized response
+    shots = [f for f in res.figures if f.name.startswith("inst_bw_screenshot_")]
+    assert len(shots) == len(cfgs)
+    for f, c in zip(shots, cfgs):
+        assert [v[1] for v in f.vlines] == ["−3 dB kenarı"] * 2
+        assert sorted(v[0] for v in f.vlines) == pytest.approx([(FC + c["f_lo_3db_hz"]) / 1e6,
+                                                               (FC + c["f_hi_3db_hz"]) / 1e6])
+        (_, _, text), = f.markers
+        assert text.startswith("en yakın ton noktası (−") and text.endswith(" dB)")
+        assert -6.0 <= float(text.split("(")[1].split(" dB")[0].replace("−", "-")) <= 0.0
+        assert f.info["−3 dB BW"] == f"{c['bw_3db_hz'] / 1e6:.2f} MHz"
 
 
 def test_inst_bw_noise_shape_fallback_without_source(tmp_path):

@@ -194,6 +194,8 @@ def test_polar_options_and_suffix(tmp_path):
     (FigureSpec(name="e", title="t", series=[Series(x=[1, 2], y=[1, 2], yerr=[1])]), "yerr"),
     (FigureSpec(name="p", title="t", kind="polar", info={"theta_zero": "X"}), "theta_zero"),
     (FigureSpec(name="y", title="t", ylim=(0.0, float("nan"))), "ylim"),
+    (FigureSpec(name="t", title="t", xticks=[(1.0, 2.0)]), "xticks"),
+    (FigureSpec(name="u", title="t", xticks=[(float("inf"), "a")]), "xticks"),
 ])
 def test_invalid_specs_raise_measurement_error(tmp_path, fig, match):
     with pytest.raises(MeasurementError, match=match):
@@ -362,3 +364,40 @@ def test_axis_label_not_pushed_off_canvas(tmp_path):
                      xlabel="Gerçek açı [°]", ylabel="Hata θ̂ − θ [°]")
     img = imread(render(fig, tmp_path / "e.png"))[..., :3]
     assert not (img[:, :4] < 0.6).any()
+
+
+# ----------------------------------------------------------------------------- legend / categorical axis
+def _drawn_xy(fig: FigureSpec):
+    """Draw an xy spec on an Agg figure (as render() does) and return its main axes."""
+    import matplotlib
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    with matplotlib.rc_context(plots._rc("xy")):
+        f = Figure(figsize=(WIDTH_PX / 128, HEIGHT_PX / 128), dpi=128)
+        FigureCanvasAgg(f)
+        plots._draw_xy(f, fig)
+        f.canvas.draw()
+    return f.axes[0]
+
+
+def test_single_labelled_series_shows_its_legend():
+    """JURY-10c: the only series' label carries the result (e.g. "−3 dB 16.9 MHz") — not hidden."""
+    one = FigureSpec(name="bw", title="t", series=[
+        Series(x=[-8.0, 0.0, 8.0], y=[-3.0, 0.0, -3.0], label="fs 20 MS/s, BW 20 MHz: −3 dB 16.90 MHz")])
+    leg = _drawn_xy(one).get_legend()
+    assert leg is not None and [t.get_text() for t in leg.get_texts()] == ["fs 20 MS/s, BW 20 MHz: −3 dB 16.90 MHz"]
+    unlabelled = FigureSpec(name="n", title="t", series=[Series(x=[1.0, 2.0], y=[1.0, 2.0])])
+    assert _drawn_xy(unlabelled).get_legend() is None
+
+
+def test_xticks_name_the_categorical_bars(tmp_path):
+    fig = FigureSpec(name="bars", title="t", kind="xy", xlim=(0.4, 2.6), xlabel="Tarama konfigürasyonu",
+                     series=[Series(x=[1.0, 2.0], y=[3.0, 5.0], label="tune", style="bar")],
+                     xticks=[(1.0, "#1: 20 MS/s\nRBW 39.15 kHz"), (2.0, "#2: 10 MS/s\nRBW 9.8 kHz")])
+    ax = _drawn_xy(fig)
+    assert list(ax.get_xticks()) == [1.0, 2.0]
+    assert [t.get_text() for t in ax.get_xticklabels()] == ["#1: 20 MS/s\nRBW 39.15 kHz", "#2: 10 MS/s\nRBW 9.8 kHz"]
+    assert len(ax.xaxis.get_minorticklocs()) == 0
+    out = render(fig, tmp_path / "bars.png")
+    assert png_size(out) == (WIDTH_PX, HEIGHT_PX)

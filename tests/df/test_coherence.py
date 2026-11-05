@@ -11,10 +11,13 @@ import pytest
 
 from eds.core.errors import ConfigError
 from eds.df.coherence import (
+    DRIFT_K_SIGMA,
     CoherenceReport,
     align,
     analyze_coherence,
     check_coherence,
+    collect_reports,
+    drift_threshold,
     estimate_delay,
     estimate_delay_ex,
     phase_offset,
@@ -250,3 +253,114 @@ def test_analyze_coherence_validation():
     rep = CoherenceReport(delay_samples=0.0, phase_deg=0.0, coherence=float("nan"), phase_drift_deg_per_s=0.0,
                           phase_std_deg=0.0, n_blocks=3, coherent=False)
     assert rep.to_dict()["coherence"] is None
+
+
+# =========================================================================== drift verdict vs. its uncertainty
+F_PILOT = F0 + 200e3
+
+
+def _short_capture(seed, *, kind, shared, ppm_b=0.48, power_dbm=-70.0, n=1 << 14, blocks=4):
+    """2 × sim Pluto at 2 MS/s, cabled pilot, ``blocks × n`` samples (4 × 16384 = 33 ms)."""
+    em = (Emitter("p", F_PILOT, power_dbm, kind="noise", bw_hz=200e3, cabled=True) if kind == "noise"
+          else Emitter("p", F_PILOT, power_dbm, cabled=True))
+    w = make_world(em, seed=seed)
+    if shared:
+        a = make_device(w, "rxA", fs=2e6, gain=40, shared_clock="ref40")
+        b = make_device(w, "rxB", fs=2e6, gain=40, shared_clock="ref40", time_offset_samples=3)
+    else:
+        a = make_device(w, "rxA", fs=2e6, gain=40, ppm=0.5)
+        b = make_device(w, "rxB", fs=2e6, gain=40, ppm=ppm_b, time_offset_samples=3)
+    with DeviceGroup([a, b]) as g:
+        return check_coherence(g, n=n, blocks=blocks)
+
+
+@pytest.mark.parametrize("kind", ["noise", "cw"])
+def test_short_capture_shared_clock_is_coherent_despite_drift_noise(kind):
+    # weak pilot, 33 ms: σ_drift ≈ 0.7 °/s, so the bare ±1 °/s limit fails some captures of a
+    # shared reference; the verdict compares |drift| with max(1 °/s, 3σ) instead
+    reps = [_short_capture(seed, kind=kind, shared=True) for seed in range(12)]
+    assert all(r.coherent for r in reps), [r.note for r in reps if not r.coherent]
+    drift = np.array([r.phase_drift_deg_per_s for r in reps])
+    se = np.array([r.drift_std_deg_per_s for r in reps])
+    assert np.all((se > 0.2) & (se < 2.0))
+    assert np.all(np.abs(drift) < DRIFT_K_SIGMA * se)
+    for r in reps:
+        assert r.criteria["drift_k_sigma"] == DRIFT_K_SIGMA
+        assert r.criteria["drift_threshold_deg_s"] == pytest.approx(max(1.0, DRIFT_K_SIGMA * r.drift_std_deg_per_s))
+        assert ("doğrulanamadı" in r.note) is (r.criteria["drift_threshold_deg_s"] > 1.0)
+        json.dumps(r.to_dict(), allow_nan=False)
+    if kind == "noise":
+        assert np.any(np.abs(drift) >= 1.0)                       # the bare limit would have failed
+        assert all(r.delay_resolvable and r.delay_samples == pytest.approx(-3.0, abs=0.05) for r in reps)
+
+
+@pytest.mark.parametrize("kind", ["noise", "cw"])
+def test_short_capture_independent_clocks_are_rejected(kind):
+    # Δppm = 1e-4 → 36 °/s: slow enough that the in-block coherence stays ~1, so only the
+    # drift criterion (threshold ≈ 2-3 °/s here) catches the missing common reference
+    e0, e1 = 0.5e-6, 0.4999e-6
+    expected = 360.0 * F_PILOT * (1 / (1 + e1) - 1 / (1 + e0))
+    for seed in range(3):
+        rep = _short_capture(seed, kind=kind, shared=False, ppm_b=0.4999)
+        assert not rep.coherent and "faz kayması" in rep.note and "referans" in rep.note
+        assert rep.coherence > 0.99 and rep.phase_std_deg < 5.0
+        assert rep.phase_drift_deg_per_s == pytest.approx(expected, abs=4 * rep.drift_std_deg_per_s + 0.5)
+        assert abs(rep.phase_drift_deg_per_s) > 5 * rep.criteria["drift_threshold_deg_s"]
+
+
+def test_noise_pilot_short_capture_drift_error_matches_reported_uncertainty():
+    # all blocks aligned with ONE delay: per-block delay noise used to add phase jitter
+    # 2π·f_bb·δd/fs between blocks (drift rms ~0.9 °/s at -60 dBm vs ~0.2 °/s now)
+    reps = [_short_capture(seed, kind="noise", shared=True, power_dbm=-60.0) for seed in range(16)]
+    drift = np.array([r.phase_drift_deg_per_s for r in reps])
+    z = drift / np.array([r.drift_std_deg_per_s for r in reps])
+    assert float(np.sqrt(np.mean(drift ** 2))) < 0.4
+    assert 0.5 < float(np.sqrt(np.mean(z ** 2))) < 1.4 and float(np.max(np.abs(z))) < 3.0
+    for r in reps:
+        assert r.delay_samples == pytest.approx(float(np.median(r.block_delays)))
+
+
+def test_drift_standard_error_is_calibrated_on_synthetic_blocks():
+    # zero true drift, 4 × 8192 samples, 30 dB: σ_drift ≈ 1.2 °/s
+    z, ok3, ok0 = [], 0, 0
+    for seed in range(30):
+        x0b, x1b = _drifting_blocks(np.random.default_rng(seed), 0.0, nb=4, n=8192, snr_db=30.0)
+        rep = analyze_coherence(x0b, x1b, 1e6)
+        z.append(rep.phase_drift_deg_per_s / rep.drift_std_deg_per_s)
+        ok3 += rep.coherent
+        ok0 += analyze_coherence(x0b, x1b, 1e6, drift_k_sigma=0.0).coherent
+    assert 0.6 < float(np.sqrt(np.mean(np.square(z)))) < 1.3
+    assert ok3 >= 29                       # 3σ: false alarms ~0.3 % per capture
+    assert ok0 <= 24                       # bare ±1 °/s limit: a large fraction of false alarms
+
+
+def test_unverifiable_limit_is_reported_and_k0_applies_the_bare_limit():
+    x0b, x1b = _drifting_blocks(np.random.default_rng(0), 2.0, nb=4, n=8192, snr_db=30.0)
+    rep = analyze_coherence(x0b, x1b, 1e6)
+    se = rep.drift_std_deg_per_s
+    assert 0.8 < se < 1.6 and abs(rep.phase_drift_deg_per_s) < 3 * se
+    assert rep.coherent and rep.criteria["drift_threshold_deg_s"] == pytest.approx(3 * se)
+    assert "doğrulanamadı" in rep.note and "daha uzun" in rep.note
+    bare = analyze_coherence(x0b, x1b, 1e6, drift_k_sigma=0.0)
+    assert not bare.coherent and bare.criteria["drift_threshold_deg_s"] == 1.0 and "sınır ±1" in bare.note
+    # a precise capture keeps the ±1 °/s limit and rejects 2 °/s
+    x0b, x1b = _drifting_blocks(np.random.default_rng(0), 2.0, snr_db=40.0)
+    rep = analyze_coherence(x0b, x1b, 1e6)
+    assert rep.criteria["drift_threshold_deg_s"] == 1.0 and not rep.coherent
+    assert rep.phase_drift_deg_per_s == pytest.approx(2.0, abs=0.05)
+    for bad in (-1.0, float("nan"), True, "3"):
+        with pytest.raises(ConfigError):
+            analyze_coherence(x0b, x1b, 1e6, drift_k_sigma=bad)
+    assert drift_threshold(1.0, float("nan")) == 1.0 and drift_threshold(1.0, 0.5, 3.0) == 1.5
+
+
+def test_collect_reports_sees_every_check():
+    w = make_world(Emitter("t", F0 + 120e3, -55.0, cabled=True))
+    a = make_device(w, "rxA", fs=1e6, gain=40, shared_clock="r")
+    b = make_device(w, "rxB", fs=1e6, gain=40, shared_clock="r")
+    with DeviceGroup([a, b]) as g:
+        with collect_reports() as reps:
+            rep = check_coherence(g, n=1 << 13, blocks=3)
+        assert reps == [rep]
+        check_coherence(g, n=1 << 13, blocks=3)                       # outside: not collected
+    assert len(reps) == 1

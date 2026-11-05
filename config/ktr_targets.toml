@@ -3,7 +3,7 @@
 # =============================================================================
 # !!! BURADAKİ SAYILAR ÖRNEKTİR !!!  Takımın Kritik Tasarım Raporu'nda (KTR) taahhüt
 # edilen değerlerle değiştirin. Her tablo bir ölçüm kimliğidir (eds.measure.base.SPEC_IDS)
-# ve tam olarak şu anahtarları taşır:
+# ve şu anahtarları taşır (+ isteğe bağlı [<ölçüm>.require] koşul tablosu, aşağıda):
 #
 #   target = <sayı>          ölçüm biriminde (birim = ölçümün 'unit' alanı, aşağıda yazılı)
 #   op     = "<=" | ">="     geçme koşulu:  ölçülen <op> target
@@ -11,12 +11,33 @@
 #
 # Bir hedefin "koşulları" (RBW, Pfa, frekans, kazanç...) ölçüm raporunda ayrıca yazılır;
 # hedefi KTR'de hangi koşulla taahhüt ettiyseniz ölçümü o koşulla çalıştırın.
+#
+# İSTEĞE BAĞLI KOŞUL TABLOSU  [<ölçüm>.require]
+# -----------------------------------------------------------------------------
+# Hedefin taahhüt edildiği koşulları yazarsanız, bu koşulları sağlamayan bir sonuç
+# hedefle KARŞILAŞTIRILMAZ (rapor: "KARŞILAŞTIRILMADI" + neden). Her anahtar önce
+# sonucun `conditions` sözlüğünde, yoksa `extra` sözlüğünde aranır (adlar rapordaki
+# "Koşullar" / "Ek" tablolarındaki anahtarlardır):
+#
+#   <ad>_min       = <sayı>   kayıtlı değer >= sayı  (liste ise EN KÖTÜ öğe, yani en küçüğü)
+#   <ad>_max       = <sayı>   kayıtlı değer <= sayı  (liste ise en büyüğü)
+#   <ad>_count_min = <sayı>   liste koşulunun öğe sayısı >= sayı (tekil değer 1 sayılır)
+#   <ad>           = <metin | true/false | sayı>   eşitlik
+#
+# Sonuç anahtarı son ekiyle birlikte aynen kaydediyorsa son ek ayrıştırılmaz, eşitlik aranır.
+# Sonuçta kayıtlı olmayan koşul doğrulanamaz = SAĞLANMAMIŞ sayılır (karar yok).
+# Hatalı tür/değer dosya yüklenirken hata verir. Örnek taahhüt koşulları aşağıda yorum
+# satırı olarak verilmiştir; KTR'nizdeki koşullarla doldurup başındaki "#" işaretlerini kaldırın.
 # =============================================================================
 
 [sensitivity]                     # birim: dBm  (daha negatif = daha iyi)
 target = -100.0
 op = "<="
 note = "ÖRNEK — KTR değeriyle değiştirin. Pd = 0.9 @ CFAR Pfa = 1e-6, belirtilen RBW'de giriş gücü."
+
+# [sensitivity.require]
+# rbw_hz_max = 1000.0             # hedef ≤ 1 kHz RBW'de taahhüt edildi
+# pfa_max = 1e-6                  # dedektör yanlış alarm olasılığı en fazla 1e-6
 
 [dynamic_range]                   # birim: dB
 target = 60.0
@@ -33,6 +54,10 @@ target = 5.0
 op = ">="
 note = "ÖRNEK — KTR değeriyle değiştirin. 325 MHz–3.8 GHz taranan açıklık / duvar saati süresi."
 
+# [scan_speed.require]
+# span_hz_min = 3.475e9           # taranan açıklık tüm resmî bant (325 MHz–3.8 GHz)
+# rbw_hz_max = 50000.0            # hız en fazla 50 kHz RBW ile ölçülmüş olmalı
+
 [freq_resolution]                 # birim: Hz  (küçük = daha iyi)
 target = 10000.0
 op = "<="
@@ -48,10 +73,17 @@ target = 40.0
 op = ">="
 note = "ÖRNEK — KTR değeriyle değiştirin. P(+δ) − P(−δ), bant boyunca en kötü değer, quadrature tracking açık."
 
+# [image_rejection.require]
+# fcs_hz_count_min = 3            # en az 3 merkez frekansında ölçülmüş olmalı
+
 [max_rate]                        # birim: MS/s
 target = 4.0
 op = ">="
 note = "ÖRNEK — KTR değeriyle değiştirin. T saniye sürekli akışta sıfır overflow + sıfır örnek kaybı (USB 2.0)."
+
+# [max_rate.require]
+# headline_mode = "pipeline"      # sistem düzeyi (DSP hattı açık) değer; yalnız taşıma değil
+# duration_s_min = 60.0           # her hızda en az 60 s sürekli akış
 
 [latency]                         # birim: ms  (p95 önerilir)
 target = 100.0

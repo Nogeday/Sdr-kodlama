@@ -121,6 +121,27 @@ def test_apply_ppm_to_device_paths():
         apply_ppm_to_device(dev, cal, "bogus")
 
 
+def test_missing_ppm_warning_is_logged_once_per_serial(monkeypatch, caplog):
+    import logging
+
+    import eds.calib.apply as apply_mod
+
+    monkeypatch.setattr(apply_mod, "_NO_PPM_WARNED", set())
+    w = make_world()
+    devs = [make_device(w, "rxA", fs=1e6, serial="SER-1"), make_device(w, "rxA2", fs=1e6, serial="SER-1"),
+            make_device(w, "rxB", fs=1e6, serial="SER-2")]
+    with caplog.at_level(logging.DEBUG, logger="eds.calib.apply"):
+        for _ in range(3):
+            for d in devs:                                  # e.g. one RxNode per measurement
+                assert apply_ppm_to_device(d, None, "auto") == "off"
+                assert apply_ppm_to_device(d, DeviceCalibration(serial=d.info.serial), "auto") == "off"
+    msgs = [r for r in caplog.records if "PPM kalibrasyonu yok" in r.getMessage()]
+    warned = [r.getMessage() for r in msgs if r.levelno == logging.WARNING]
+    assert len(warned) == 2 and warned[0].startswith("rxA:") and warned[1].startswith("rxB:")
+    assert len(msgs) == 18 and sum(r.levelno == logging.DEBUG for r in msgs) == 16
+    assert apply_mod._NO_PPM_WARNED == {"serial:SER-1", "serial:SER-2"}
+
+
 def test_apply_ppm_without_hardware_support():
     dev = make_device(make_world(), fs=1e6, hw_xo_correction=False)
     cal = DeviceCalibration(serial=dev.info.serial, ppm=_ppm(5.0))

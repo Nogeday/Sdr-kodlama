@@ -29,6 +29,28 @@ what the ADC clips, and the fraction of clipped samples).
   overshoots: the signal part of the peak scales with the gain while the gain-independent
   ADC noise does not, so the new peak is at most the target.
 
+Front-end compression (``too_strong``)
+-------------------------------------
+Clipping is not the only overload: the AD936x LNA/mixer compress near 0 dBm input at low
+gain, where their output saturates *below* ADC full scale — a too-strong input then reads a
+normal peak (e.g. -4 dBFS at minimum gain in the simulator) and would pass as a good
+settle. Compression is detected from a gain change between two unclipped captures of a
+strong signal (higher-gain capture peak >= ``target_peak_dbfs``, lower-gain one above
+-50 dBFS RMS, change >= :data:`LINEARITY_MIN_STEP_DB`): a linear receiver moves the level
+by the gain change, a compressed one by clearly less. The *slope* ``ΔL / ΔG`` (the larger
+of the RMS and the peak slope) below :data:`COMPRESSION_SLOPE_MAX` flags compression. In
+the simulator's model the slope tends to 0.73 in deep compression (the input P1dB rises
+with falling gain, so part of a gain step acts before the compressing stage) and is
+~0.88 at 1 dB compression; 0.85 separates ≳ 2 dB of compression from a linear receiver
+with margin for gain-step and level-estimate errors. :meth:`GainController.settle` checks
+every gain change it makes and, when an attack ends in the window without such a check,
+spends one *probe* capture :data:`PROBE_STEP_DB` lower (or at least
+:data:`LINEARITY_MIN_STEP_DB` higher when the band minimum is too close) and restores the
+gain; compressed → minimum gain and
+``last_settle_status = "too_strong"``. :meth:`GainController.update` evaluates the natural
+pairs of its own attacks only (no probing of a running stream) and sets
+:attr:`GainController.compressed`.
+
 The new gain is clamped/quantized to the **band-dependent** range of the device
 (:meth:`~eds.hal.base.RxDevice.gain_range`, e.g. AD9363 -3..71 dB above 1.3 GHz) and applied
 with :meth:`~eds.hal.base.RxDevice.set_gain`, which marks the following
@@ -63,6 +85,15 @@ log = logging.getLogger(__name__)
 LEVEL_CLASSES: tuple[str, ...] = ("attack", "low", "ok")
 
 _GAIN_EQ_TOL_DB = 1e-6
+
+#: Level change / gain change below this between two valid captures = front-end compression.
+COMPRESSION_SLOPE_MAX: float = 0.85
+#: Smallest gain change (dB) evaluated for compression (gain-step errors dominate below).
+LINEARITY_MIN_STEP_DB: float = 3.0
+#: Gain step (dB) of the verification probe in :meth:`GainController.settle`.
+PROBE_STEP_DB: float = 6.0
+_PROBE_HEADROOM_DB = 1.0          # upward probe: linear peak kept this far below FS when the step allows
+_LINEARITY_FLOOR_DBFS = -50.0     # lower-gain capture RMS must exceed this (ADC floor negligible)
 
 
 def validate_agc_config(cfg: AgcConfig) -> None:
@@ -112,6 +143,31 @@ def gain_delta_db(levels: IQLevels, cfg: AgcConfig, *, one_shot: bool = False) -
     return 0.0
 
 
+def gain_slope(levels_a: IQLevels, gain_a_db: float, levels_b: IQLevels, gain_b_db: float,
+               cfg: AgcConfig) -> float | None:
+    """Level change per dB of gain change between two captures of the same scene, or
+    ``None`` when the pair cannot tell compression: gain change below
+    :data:`LINEARITY_MIN_STEP_DB`, a capture clipping (``clip_fraction >
+    max_clip_fraction``), the higher-gain capture weaker than ``target_peak_dbfs`` (peak) or
+    the lower-gain one near the ADC floor (RMS < -50 dBFS). The larger of the RMS-based and
+    peak-based slopes is returned (both must drop for a compression verdict, which keeps a
+    noise-like signal's random peak from faking one); 1.0 = linear."""
+    (g_hi, hi), (g_lo, lo) = sorted(((float(gain_a_db), levels_a), (float(gain_b_db), levels_b)),
+                                    key=lambda t: t[0], reverse=True)
+    dg = g_hi - g_lo
+    if dg < LINEARITY_MIN_STEP_DB - _GAIN_EQ_TOL_DB:
+        return None
+    lim = float(cfg.max_clip_fraction)
+    if hi.clip_fraction > lim or lo.clip_fraction > lim:
+        return None
+    if hi.peak_dbfs < float(cfg.target_peak_dbfs) or lo.rms_dbfs < _LINEARITY_FLOOR_DBFS:
+        return None
+    vals = [(hi.rms_dbfs - lo.rms_dbfs) / dg, (hi.peak_dbfs - lo.peak_dbfs) / dg]
+    if not all(math.isfinite(v) for v in vals):
+        return None
+    return float(max(vals))
+
+
 class GainController:
     """Software AGC acting on ``device`` (manual gain mode) — see the module docstring.
 
@@ -129,6 +185,9 @@ class GainController:
         self._last_levels: IQLevels | None = None
         self._history: deque[tuple[int, float]] = deque(maxlen=int(history_len))
         self._mode_warned = False
+        self._compressed = False
+        self._last_slope: float | None = None
+        self._pending: tuple[IQLevels, float] | None = None    # (levels, gain) before the last change
         self.last_settle_status: str = ""
 
     # ------------------------------------------------------------------ properties
@@ -163,12 +222,42 @@ class GainController:
         """Current device gain (channel 0; the controller sets all channels together)."""
         return float(self._dev.gains[0])
 
+    @property
+    def compressed(self) -> bool:
+        """The last evaluated gain change showed front-end compression (input too strong:
+        an external attenuator is needed); cleared by a later linear one or :meth:`reset`."""
+        with self._lock:
+            return self._compressed
+
+    @property
+    def last_gain_slope(self) -> float | None:
+        """Slope ``ΔL/ΔG`` of the last evaluated gain change (:func:`gain_slope`), or None."""
+        with self._lock:
+            return self._last_slope
+
     def reset(self) -> None:
-        """Forget the hold counter, last levels and history (e.g. after a retune)."""
+        """Forget the hold counter, last levels, history and the compression state (e.g.
+        after a retune)."""
         with self._lock:
             self._low_count = 0
             self._last_levels = None
             self._history.clear()
+            self._compressed = False
+            self._last_slope = None
+            self._pending = None
+
+    def _record_slope(self, slope: float | None) -> bool:
+        """Store a pair's slope; True if it shows compression. Caller holds the lock."""
+        if slope is None:
+            return False
+        was = self._compressed
+        self._last_slope = slope
+        self._compressed = slope < COMPRESSION_SLOPE_MAX
+        if self._compressed and not was:
+            log.warning("%s: RF ön uç sıkışması: seviyenin kazanca eğimi %.2f dB/dB (doğrusal alıcıda 1.00, "
+                        "eşik %.2f) — giriş çok güçlü, harici zayıflatıcı gerekli",
+                        self._dev.name, slope, COMPRESSION_SLOPE_MAX)
+        return self._compressed
 
     # ------------------------------------------------------------------ decision
     def propose(self, levels: IQLevels, gain_db: float, *, one_shot: bool = False) -> float | None:
@@ -210,6 +299,9 @@ class GainController:
         lv = iq_levels(block.samples, block.clip_level)
         with self._lock:
             self._last_levels = lv
+            if self._pending is not None:              # first evaluated block after our change
+                self._record_slope(gain_slope(self._pending[0], self._pending[1], lv, float(gains[0]), self._cfg))
+                self._pending = None
             kind = classify_levels(lv, self._cfg)
             if kind == "ok":
                 self._low_count = 0
@@ -224,6 +316,7 @@ class GainController:
                 return None
             applied = float(self._dev.set_gain(new))
             self._history.append((int(block.seq), applied))
+            self._pending = (lv, float(gains[0]))
         log.debug("%s: AGC %s → %.1f dB (tepe %.1f dBFS, kırpma %.2e)", self._dev.name, kind, applied,
                   lv.peak_dbfs, lv.clip_fraction)
         return applied
@@ -235,9 +328,15 @@ class GainController:
 
         ``last_settle_status`` tells how it ended: ``"ok"`` (in window), ``"at_max_gain"``
         (still below the window at the band's maximum gain — best possible sensitivity),
-        ``"at_min_gain"`` (still too strong at the minimum gain: an attenuator is needed) or
-        ``"max_iter"`` (not converged within ``max_iter`` captures). The last two are logged
-        as warnings. Raises :class:`ConfigError` if the device is not in manual gain mode.
+        ``"at_min_gain"`` (still clipping / too high at the minimum gain: an attenuator is
+        needed), ``"too_strong"`` (the front end is compressed — see the module docstring;
+        the gain is set to the band minimum, an attenuator is needed) or ``"max_iter"`` (not
+        converged within ``max_iter`` captures). All but the first two are logged as
+        warnings. An attack that ends in the window without a compression check costs one
+        extra probe capture (gain restored afterwards; :attr:`last_levels` stay those of the
+        settled capture; probe gain changes are not recorded in :attr:`history`) and the
+        ``too_strong`` path one capture at the minimum gain.
+        Raises :class:`ConfigError` if the device is not in manual gain mode.
         """
         if isinstance(max_iter, bool) or int(max_iter) != max_iter or int(max_iter) < 1:
             raise ConfigError(f"max_iter pozitif tamsayı olmalı, {max_iter!r} geldi")
@@ -246,6 +345,12 @@ class GainController:
         if self._dev.gain_mode != "manual":
             raise ConfigError(
                 f"{self._dev.name}: yazılım AGC'si yalnız manuel kazanç modunda çalışır (şu an: {self._dev.gain_mode!r})")
+        with self._lock:
+            self._compressed = False
+            self._last_slope = None
+            self._pending = None
+        prev: tuple[IQLevels, float] | None = None
+        attacked = verified = False
         for _ in range(int(max_iter)):
             blk = self._dev.capture(int(n), timeout_s)
             lv = iq_levels(blk.samples, blk.clip_level)
@@ -254,7 +359,15 @@ class GainController:
             with self._lock:
                 self._last_levels = lv
                 self._low_count = 0
+                slope = gain_slope(prev[0], prev[1], lv, g, self._cfg) if prev is not None else None
+                compressed = self._record_slope(slope)
+            if compressed:
+                return self._too_strong(g, int(n), timeout_s, int(blk.seq))
+            verified = verified or slope is not None
             if kind == "ok":
+                if attacked and not verified and lv.peak_dbfs >= float(self._cfg.target_peak_dbfs) \
+                        and self._probe_compressed(g, lv, int(n), timeout_s):
+                    return self._too_strong(g, int(n), timeout_s, int(blk.seq))
                 self.last_settle_status = "ok"
                 return g
             new = self.propose(lv, g, one_shot=True)
@@ -267,9 +380,59 @@ class GainController:
                     log.warning("%s: en düşük kazançta (%.1f dB) bile tepe %.1f dBFS / kırpma %.2e — "
                                 "harici zayıflatıcı gerekli", self._dev.name, g, lv.peak_dbfs, lv.clip_fraction)
                 return g
+            attacked = attacked or new < g
             applied = float(self._dev.set_gain(new))
             with self._lock:
                 self._history.append((int(blk.seq), applied))
+            prev = (lv, g)
         self.last_settle_status = "max_iter"
         log.warning("%s: AGC %d denemede yakınsamadı; kazanç %.1f dB", self._dev.name, int(max_iter), self.gain_db)
         return self.gain_db
+
+    def _probe_compressed(self, g: float, lv: IQLevels, n: int, timeout_s: float) -> bool:
+        """One capture :data:`PROBE_STEP_DB` below ``g`` — or, when the band minimum is
+        closer than :data:`LINEARITY_MIN_STEP_DB`, above it (as far as 1 dB headroom of a
+        linear signal allows, but at least that minimum step: a linear signal that then clips
+        only makes the probe inconclusive, a compressed one cannot reach full scale) —
+        compared with the settled capture ``lv``; the gain is restored to ``g``. True if the
+        pair shows compression; inconclusive pairs → False."""
+        gr = self._dev.gain_range()
+        pg = gr.clamp(g - PROBE_STEP_DB)
+        if g - pg < LINEARITY_MIN_STEP_DB - _GAIN_EQ_TOL_DB:
+            step = gr.step_db if gr.step_db > 0 else 1.0
+            room = max(LINEARITY_MIN_STEP_DB, min(PROBE_STEP_DB, -lv.peak_dbfs - _PROBE_HEADROOM_DB))
+            pg = gr.clamp(g + math.ceil(room / step - 1e-9) * step)
+            if pg - g < LINEARITY_MIN_STEP_DB - _GAIN_EQ_TOL_DB:
+                log.debug("%s: AGC sıkışma kontrolü yapılamadı (kazanç %.1f dB, tepe %.1f dBFS)",
+                          self._dev.name, g, lv.peak_dbfs)
+                return False
+        try:                                    # probe and restore: not recorded in the history
+            self._dev.set_gain(pg)
+            blk = self._dev.capture(n, timeout_s)
+            plv = iq_levels(blk.samples, blk.clip_level)
+            slope = gain_slope(lv, g, plv, float(blk.gain_db[0]), self._cfg)
+        finally:
+            self._dev.set_gain(g)
+            with self._lock:
+                self._last_levels = lv
+        with self._lock:
+            return self._record_slope(slope)
+
+    def _too_strong(self, g: float, n: int, timeout_s: float, seq: int) -> float:
+        """End a settle on detected compression: band-minimum gain (least compression; one
+        capture there for :attr:`last_levels`), status ``"too_strong"``."""
+        gmin = self._dev.gain_range().min_db
+        if g > gmin + _GAIN_EQ_TOL_DB:
+            applied = float(self._dev.set_gain(gmin))
+            with self._lock:
+                self._history.append((seq, applied))
+            blk = self._dev.capture(n, timeout_s)
+            with self._lock:
+                self._last_levels = iq_levels(blk.samples, blk.clip_level)
+            g = float(blk.gain_db[0])
+        self.last_settle_status = "too_strong"
+        slope = self.last_gain_slope
+        log.warning("%s: giriş çok güçlü (RF ön uç sıkışmada, eğim %.2f dB/dB): kazanç en düşükte (%.1f dB), "
+                    "ölçüm seviyesi doğrusal değil — harici zayıflatıcı gerekli", self._dev.name,
+                    slope if slope is not None else math.nan, g)
+        return g

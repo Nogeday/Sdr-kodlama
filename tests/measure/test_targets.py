@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from eds.core.errors import ConfigError
@@ -306,3 +307,87 @@ mode = [1, 2]
     with pytest.raises(ConfigError, match="hedef koşulu"):
         Target(1.0, "<=", require={"rbw_hz_max": "x"})
     assert Target(1.0, "<=", require={"rbw_hz_max": 2e3}).require == (("rbw_hz_max", 2e3),)
+
+
+# ----------------------------------------------------------------------------- bound values
+@pytest.mark.parametrize(("spec_id", "bound", "op", "target", "value", "passed", "word"), [
+    # lower bound (true value ≥ X)
+    ("inst_bw", "lower", ">=", 18.0, 16.9, None, "değer alt sınırdır (≥ 16.9 MHz) ve hedefin altında — sonuçsuz"),
+    ("inst_bw", "lower", ">=", 18.0, 18.0, True, ""),             # X ≥ target: the bound proves GEÇTİ
+    ("inst_bw", "lower", ">=", 18.0, 19.5, True, ""),
+    ("dynamic_range", "lower", "<=", 60.0, 55.0, None, "değer alt sınırdır (≥ 55 dB)"),
+    ("dynamic_range", "lower", "<=", 60.0, 60.0, None, "aşabilir — sonuçsuz"),
+    ("dynamic_range", "lower", "<=", 60.0, 61.0, False, ""),      # X > target: the bound proves KALDI
+    # upper bound (true value ≤ X)
+    ("freq_resolution", "upper", "<=", 1000.0, 1200.0, None,
+     "değer üst sınırdır (≤ 1200 Hz) ve hedefin üstünde — sonuçsuz"),
+    ("freq_resolution", "upper", "<=", 1000.0, 1000.0, True, ""),  # X ≤ target: GEÇTİ
+    ("freq_resolution", "upper", "<=", 1000.0, 489.0, True, ""),
+    ("freq_resolution", "upper", ">=", 1000.0, 1000.0, None, "değer üst sınırdır (≤ 1000 Hz)"),
+    ("freq_resolution", "upper", ">=", 1000.0, 1500.0, None, "altında olabilir — sonuçsuz"),
+    ("freq_resolution", "upper", ">=", 1000.0, 999.0, False, ""),  # X < target: KALDI
+    # exact values / unknown flags are compared normally
+    ("inst_bw", "", ">=", 18.0, 16.9, False, ""),
+    ("inst_bw", "garip", ">=", 18.0, 16.9, False, ""),
+])
+def test_bound_values_get_a_verdict_only_when_the_bound_decides(spec_id, bound, op, target, value, passed, word):
+    from eds.measure.report import NOT_COMPARED, no_verdict_reason, verdict
+    from eds.measure.targets import VERDICT_NOTE_KEY, bound_reason
+
+    r = _res(spec_id, value)
+    r.extra["value_bound"] = bound
+    apply_targets([r], {spec_id: Target(target, op)})
+    assert r.passed is passed
+    if passed is None:
+        assert word in r.extra[VERDICT_NOTE_KEY] and r.extra[VERDICT_NOTE_KEY].endswith("hedefle karşılaştırılmadı")
+        assert verdict(r) == NOT_COMPARED and word in no_verdict_reason(r)
+        assert bound_reason(r) == bound_reason(r, Target(target, op)) != ""      # from the result's own target
+    else:
+        assert VERDICT_NOTE_KEY not in r.extra and bound_reason(r) == ""
+
+
+def test_bound_reason_without_target_or_value():
+    from eds.measure.targets import bound_reason
+
+    r = _res("inst_bw", 16.9)
+    r.extra["value_bound"] = "lower"
+    assert bound_reason(r) == ""                                   # no target
+    r.value = None
+    assert bound_reason(r, Target(18.0, ">=")) == ""
+    r.value = np.float32(16.9)
+    assert bound_reason(r, Target(18.0, ">=")).startswith("değer alt sınırdır (≥ 16.9")
+
+
+def test_commented_require_examples_in_repository_file_are_valid():
+    """The commented ``[<spec>.require]`` examples of config/ktr_targets.toml parse once
+    uncommented and name conditions the measurements really record."""
+    import re
+    import sys
+
+    if sys.version_info >= (3, 11):
+        import tomllib
+    else:  # pragma: no cover
+        import tomli as tomllib
+
+    p = resolve_targets_path(None)
+    if not p.is_file():
+        pytest.skip("config/ktr_targets.toml yok")
+    lines, active = [], False
+    for ln in p.read_text(encoding="utf-8").splitlines():
+        if re.match(r"^# \[\w+\.require\]", ln):
+            active = True
+        elif not ln.startswith("# "):
+            active = False
+        lines.append(ln[2:] if active else ln)
+    t = parse_targets(tomllib.loads("\n".join(lines)))
+    req = {k: dict(v.require) for k, v in t.items() if v.require}
+    assert set(req) >= {"sensitivity", "scan_speed", "image_rejection", "max_rate"}
+    assert req["max_rate"]["headline_mode"] == "pipeline" and req["max_rate"]["duration_s_min"] >= 60
+    recorded = {   # condition keys written by the specs (see their base_conditions calls)
+        "sensitivity": {"rbw_hz", "pfa"}, "scan_speed": {"span_hz", "rbw_hz"}, "image_rejection": {"fcs_hz"},
+        "max_rate": {"headline_mode", "duration_s"},
+    }
+    from eds.measure.targets import _split_require_key
+
+    for spec_id, keys in recorded.items():
+        assert {_split_require_key(k)[0] for k in req[spec_id]} <= keys, spec_id

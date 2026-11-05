@@ -8,7 +8,8 @@ Global options (accepted before or after the subcommand)::
     -v/--verbose         more log output (-vv: debug) and tracebacks on errors
 
 Exit codes: 0 success, 1 error (configuration / device / bus — Turkish message on stderr),
-2 a measurement (``measure``) or a command acknowledgement (``bus send``) failed, 130 Ctrl-C.
+2 a measurement (``measure``) or a command acknowledgement (``bus send``) failed, 3 ``cal
+coherence`` measured channels that are NOT coherent (scripts gate DF runs on it), 130 Ctrl-C.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from ..core.errors import EDSError
 log = logging.getLogger("eds.cli")
 
 EXIT_OK, EXIT_ERROR, EXIT_FAILED, EXIT_INTERRUPTED = 0, 1, 2, 130
+EXIT_NOT_COHERENT = 3
 _HANDLER_FLAG = "_eds_cli_handler"
 
 DESCRIPTION = """\
@@ -188,12 +190,19 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--publish", action="store_true", help="cal.result mesajı yayınla")
     sp.set_defaults(func=cmd_cal.cmd_cal_power)
 
-    sp = _sub(cal_subs, "coherence", "çok kanallı grubun (2× Pluto) koherens kontrolü; depoya kaydet, cal.result yayınla")
+    sp = _sub(cal_subs, "coherence", "çok kanallı grubun (2× Pluto) koherens kontrolü; depoya kaydet, cal.result yayınla",
+              description="Çok kanallı grubun (2× Pluto) koherens kontrolü (ortak kablolu sinyal gerekir);\n"
+                          "rapor depoya kaydedilir ve cal.result olarak yayınlanır.\n\n"
+                          "Çıkış kodları:\n"
+                          "  0  kanallar koherent\n"
+                          f"  {EXIT_NOT_COHERENT}  kanallar koherent DEĞİL (rapor yine kaydedilir/yayınlanır); DF ölçümünü\n"
+                          "     başlatan betikler bu kodla durmalı\n"
+                          "  1  konfigürasyon / cihaz hatası")
     sp.add_argument("--n", type=positive_int, default=65536, metavar="N", help="blok başına örnek (vars. 65536)")
     sp.add_argument("--blocks", type=positive_int, default=8, metavar="N", help="blok sayısı (vars. 8)")
     sp.add_argument("--no-save", action="store_true", help="kalibrasyon deposuna kaydetme")
     sp.add_argument("--no-publish", action="store_true", help="cal.result yayınlama")
-    sp.set_defaults(func=cmd_cal.cmd_cal_coherence)
+    sp.set_defaults(func=_cal_coherence_exit_code)
 
     # ---------------------------------------------------------------- measure
     sp = _sub(subs, "measure", "KTR nicel spesifikasyon ölçümleri + rapor (tablo, grafik, ekran görüntüsü)",
@@ -251,6 +260,22 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--src", default="cli", metavar="AD", help="zarf 'src' alanı (vars. cli)")
     sp.set_defaults(func=cmd_bus.cmd_bus_send)
     return p
+
+
+def _cal_coherence_exit_code(args: argparse.Namespace) -> int:
+    """``eds cal coherence``: run the subcommand (report printed, stored, published), then
+    return :data:`EXIT_NOT_COHERENT` if the measured channels are not coherent."""
+    from ..df.coherence import collect_reports
+    from .cmd_cal import cmd_cal_coherence
+
+    with collect_reports() as reports:
+        rc = int(cmd_cal_coherence(args))
+    if rc == EXIT_OK and reports and not all(r.coherent for r in reports):
+        print(f"KOHERENT DEĞİL (çıkış kodu {EXIT_NOT_COHERENT}): kanallar arasında faz koherensi yok — bu kurulumla "
+              "DF/kerteriz ölçümü yapmayın; ortak 40 MHz referansı ve kablolu kalibrasyon sinyalini kontrol edin.",
+              file=sys.stderr)
+        return EXIT_NOT_COHERENT
+    return rc
 
 
 def _setup_logging(verbosity: int) -> tuple[logging.Handler, int]:

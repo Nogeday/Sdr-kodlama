@@ -221,17 +221,19 @@ def test_cal_power_against_sim_level_model(tmp_path, capsys):
     assert pts[30] == pytest.approx(5.0 - 30.0, abs=0.5) and pts[50] == pytest.approx(5.0 - 50.0, abs=0.5)
 
 
-def test_cal_coherence_shared_clock_pair(tmp_path, capsys):
+def _dual_config(tmp_path: Path, *, shared: bool) -> Path:
+    clock_a = 'ppm = 5.0, shared_clock = "ref"' if shared else "ppm = 5.0"
+    clock_b = 'shared_clock = "ref"' if shared else "ppm = 5.0001"        # 1e-4 ppm: ~36 °/s at 1 GHz
     cfg = tmp_path / "dual.toml"
     cfg.write_text(f"""
 [[device]]
 name = "rx0"
 backend = "sim"
-sim = {{ ppm = 5.0, shared_clock = "ref", realtime = false, serial = "SIM-A" }}
+sim = {{ {clock_a}, realtime = false, serial = "SIM-A" }}
 [[device]]
 name = "rx1"
 backend = "sim"
-sim = {{ shared_clock = "ref", realtime = false, serial = "SIM-B", position_m = [0.15, 0.0] }}
+sim = {{ {clock_b}, realtime = false, serial = "SIM-B", position_m = [0.15, 0.0] }}
 [rx]
 center_freq_hz = 999.5e6
 sample_rate_hz = 2e6
@@ -247,15 +249,39 @@ bw_hz = 200e3
 power_dbm = -60.0
 cabled = true
 """, encoding="utf-8")
-    # 8 blocks: with a noise pilot the drift estimate's realization spread at 4 blocks (~1 °/s
-    # rms over world seeds) equals the ±1 °/s limit; 8 blocks bring it to ~0.2 °/s
-    assert main(["-c", str(cfg), "cal", "coherence", "--n", "16384", "--blocks", "8", "--no-publish"]) == 0
-    out = capsys.readouterr().out
-    assert "KOHERENT" in out and "DEĞİL" not in out
+    return cfg
+
+
+@pytest.mark.parametrize("blocks", ["4", "8"])
+def test_cal_coherence_shared_clock_pair(tmp_path, capsys, blocks):
+    # 4 blocks of 16384: the noise-pilot drift spread (once ~1 °/s rms, as large as the ±1 °/s
+    # limit) is ~0.2 °/s with one common delay, and the limit is widened to 3σ when needed
+    cfg = _dual_config(tmp_path, shared=True)
+    assert main(["-c", str(cfg), "cal", "coherence", "--n", "16384", "--blocks", blocks, "--no-publish"]) == 0
+    cap = capsys.readouterr()
+    assert "KOHERENT" in cap.out and "DEĞİL" not in cap.out and "DEĞİL" not in cap.err
     files = list((tmp_path / "cal").glob("SIM-A_SIM-B-*.json"))
     assert len(files) == 1
     coh = json.loads(files[0].read_text(encoding="utf-8"))["coherence"]
     assert coh["coherent"] is True and coh["coherence"] > 0.9
+
+
+def test_cal_coherence_not_coherent_exits_3_and_still_saves(tmp_path, capsys):
+    cfg = _dual_config(tmp_path, shared=False)
+    rc = main(["-c", str(cfg), "cal", "coherence", "--n", "16384", "--blocks", "4", "--no-publish"])
+    cap = capsys.readouterr()
+    assert rc == 3
+    assert "KOHERENT DEĞİL" in cap.out and "faz kayması" in cap.out
+    assert "çıkış kodu 3" in cap.err and "DF" in cap.err
+    files = list((tmp_path / "cal").glob("SIM-A_SIM-B-*.json"))
+    assert len(files) == 1                                   # the failed check is still recorded
+    assert json.loads(files[0].read_text(encoding="utf-8"))["coherence"]["coherent"] is False
+    # a usage/config error stays 1, not 3
+    assert main(["-c", str(cfg), "cal", "coherence", "--n", "100", "--no-save", "--no-publish"]) == 1
+    capsys.readouterr()
+    assert main(["cal", "coherence", "--help"]) == 0
+    out = capsys.readouterr().out
+    assert "Çıkış kodları" in out and "3  kanallar koherent DEĞİL" in out
 
 
 # --------------------------------------------------------------------------- measure

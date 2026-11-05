@@ -14,7 +14,13 @@ Mode B — RF event latency (stimulus source present; the KTR value)
     and contains a detection within ``±max(2·RBW, 5 kHz)`` of the tone (plus the TCXO
     tolerance when the node does not correct the reference) → ``L = t_recv − t_RF``. The
     tone level is set adaptively from the SNR the pipeline itself reports, so absolute and
-    relative sources work alike.
+    relative sources work alike. The level never drives the RX input above the profile's
+    ``rx_max_input_dbm``: an absolute source is capped by
+    :func:`~eds.measure.stimulus.source_power_range`, a relative one by
+    :func:`~eds.measure.stimulus.relative_setting_cap` extrapolated from every reading of the
+    tone (its band power as published by the node: dBm when calibrated, else dBFS through
+    the nominal level model). The setting is recorded with its unit
+    (``tone_power_dbm`` / ``tone_power_rel_db``).
 
     RF-on instant ``t_RF`` (the source call is bracketed by host times ``t_before`` /
     ``t_after``; ``t_ret`` is the time the call returns):
@@ -68,7 +74,8 @@ from ...core.errors import ConfigError, EDSError, MeasurementError
 from ...core.timeutil import iso_utc, mono, now_ns
 from ...core.units import fmt_hz
 from ..base import FigureSpec, Measurement, MeasurementResult, Series, register
-from ..common import base_conditions
+from ..common import LevelRef, base_conditions
+from ..stimulus import relative_setting_cap, rx_max_input_dbm, source_power_range
 from ..targets import REASON_NONREALTIME
 
 log = logging.getLogger(__name__)
@@ -434,25 +441,45 @@ class LatencyMeasurement(Measurement):
                 return msg, r
         return None
 
-    def _initial_power(self, src: Any, last_spec: Message | None, gain_db: float, snr_db: float) -> float:
-        lo, hi = (float(v) for v in getattr(src, "power_range_db", (-140.0, 0.0)))
+    @staticmethod
+    def _initial_power(last_spec: Message | None, gain_db: float, snr_db: float, lo: float, hi: float) -> float:
+        """First tone setting within ``[lo, hi]``: the pipeline's noise floor + ``snr_db``
+        (dBm when the node is calibrated, else through the nominal level model); the middle of
+        the range when no spectrum was seen yet."""
         if last_spec is None:
             guess = lo + 0.5 * (hi - lo)
         else:
             d = last_spec.data
             target = float(d["noise_floor"]) + snr_db
             guess = target if d["unit"] == "dBm" else target - gain_db - _LEVEL_MODEL_OFFSET_DB
-            if not getattr(src, "absolute_power", False):
-                guess = min(guess, hi)
         return float(np.clip(guess, lo, hi))
+
+    @staticmethod
+    def setting_unit(src: Any) -> str:
+        """Unit of the source's power setting: ``"dBm"`` (absolute) or ``"dB (bağıl)"``."""
+        return "dBm" if getattr(src, "absolute_power", False) else "dB (bağıl)"
+
+    @staticmethod
+    def setting_key(src: Any, stem: str = "tone_power") -> str:
+        """Condition / extra key of a source setting carrying its unit (``<stem>_dbm`` for an
+        absolute source, ``<stem>_rel_db`` for a relative one)."""
+        return f"{stem}_dbm" if getattr(src, "absolute_power", False) else f"{stem}_rel_db"
+
+    def _setting_cap(self, dev: Any, setting: float, det: dict[str, Any], unit: str) -> float:
+        """Highest setting of a relative source that keeps the RX input at or below the
+        profile ceiling, extrapolated from the tone's band power as published by the node
+        (``inf`` for an absolute source, already capped by ``source_power_range``)."""
+        ref = LevelRef(0.0, "RX düğümü (kalibrasyonlu)", True, "dBm") if unit == "dBm" else None
+        return relative_setting_cap(self.ctx, dev, setting, float(det["band_power_db"]), ref)
 
     def _set_level(self, sub: Subscriber, node: Any, prm: dict[str, Any], last_spec: Message | None,
                    f_src: float, tol: float, margin_ns: int) -> dict[str, Any]:
-        """Adaptive tone level: SNR (as reported by the pipeline) → ``snr_db`` target."""
+        """Adaptive tone level: SNR (as reported by the pipeline) → ``snr_db`` target, never
+        above the RX input ceiling (module doc)."""
         src = self.ctx.source
         dev = node.device
-        lo, hi = (float(v) for v in getattr(src, "power_range_db", (-140.0, 0.0)))
-        p = self._initial_power(src, last_spec, float(dev.gains[0]), prm["snr_db"])
+        lo, hi = source_power_range(src, dev)              # absolute source: capped at rx_max_input_dbm
+        p = self._initial_power(last_spec, float(dev.gains[0]), prm["snr_db"], lo, hi)
         src.set_frequency(f_src)
         snr = math.nan
         history: list[tuple[float, float]] = []
@@ -460,6 +487,7 @@ class LatencyMeasurement(Measurement):
             p_set = float(src.set_power(p))
             t_on = self._switch(True)[2]                    # latest possible RF-on instant
             snrs: list[float] = []
+            best: tuple[dict[str, Any], str] | None = None  # strongest reading of the tone (+ its unit)
             end = mono() + prm["event_timeout_s"]
             while len(snrs) < _SNR_FRAMES and (remaining := end - mono()) > 0:
                 msg = sub.recv(remaining)
@@ -467,25 +495,37 @@ class LatencyMeasurement(Measurement):
                     continue
                 det = self._near(msg, f_src, tol)
                 snrs.append(float(det["snr_db"]) if det is not None else -math.inf)
+                if det is not None and (best is None or det["snr_db"] > best[0]["snr_db"]):
+                    best = (det, str(msg.data.get("unit", "")))
             self._switch(False)
             snr = max(snrs) if snrs else -math.inf
             history.append((p_set, snr))
-            if not math.isfinite(snr):
+            if not math.isfinite(snr) or best is None:
                 if p_set >= hi:
                     raise MeasurementError(
-                        f"Mod B: kaynak tonu ({fmt_hz(f_src)}) en yüksek kaynak gücünde ({hi:g}) bile tespit edilemedi "
-                        "— kablo/zayıflatıcı/kaynak bağlantısını kontrol edin")
+                        f"Mod B: kaynak tonu ({fmt_hz(f_src)}) izin verilen en yüksek kaynak seviyesinde ({hi:g} "
+                        f"{self.setting_unit(src)}; kaynak aralığı ve RX giriş sınırı) bile tespit edilemedi — "
+                        "kablo/zayıflatıcı/kaynak bağlantısını kontrol edin")
                 p = min(p_set + _LEVEL_STEP_UP_DB, hi)
                 continue
-            if abs(snr - prm["snr_db"]) <= _SNR_TOLERANCE_DB:
+            # relative source: never above the RX input limit, extrapolated from this reading
+            hi = max(lo, min(hi, self._setting_cap(dev, p_set, *best)))
+            if abs(snr - prm["snr_db"]) <= _SNR_TOLERANCE_DB and p_set <= hi:
                 break
             new = float(np.clip(p_set + (prm["snr_db"] - snr), lo, hi))
             if abs(new - p_set) < 0.05:
-                break                                   # at the source's limit
+                break                                   # at the source's limit / the RX ceiling
             p = new
         if not math.isfinite(snr):
             raise MeasurementError(f"Mod B: kaynak tonu ({fmt_hz(f_src)}) seviye ayarında tespit edilemedi")
-        return {"power": float(history[-1][0]), "snr_db": float(snr),
+        p_last = history[-1][0]
+        if p_last > hi + 0.05:                          # iteration limit reached above the ceiling
+            p_new = float(src.set_power(hi))
+            snr -= p_last - p_new                       # linear regime: the SNR follows the level
+            history.append((p_new, snr))
+        key, cap_key = self.setting_key(src, "power"), self.setting_key(src, "power_max")
+        return {key: float(history[-1][0]), cap_key: float(hi), "power_unit": self.setting_unit(src),
+                "rx_max_input_dbm": rx_max_input_dbm(dev), "snr_db": float(snr),
                 "absolute": bool(getattr(src, "absolute_power", False)), "iterations": len(history)}
 
     def _mode_b(self, sub: Subscriber, node: Any, prm: dict[str, Any],
@@ -629,7 +669,10 @@ class LatencyMeasurement(Measurement):
         )
         if events:
             conditions.update({"f_tone_hz": level["f_src_hz"], "tone_snr_db": level["snr_db"],
-                               "tone_power": level["power"], "freq_tolerance_hz": level["tolerance_hz"],
+                               self.setting_key(src): level[self.setting_key(src, "power")],
+                               self.setting_key(src, "tone_power_max"): level[self.setting_key(src, "power_max")],
+                               "rx_max_input_dbm": level["rx_max_input_dbm"],
+                               "freq_tolerance_hz": level["tolerance_hz"],
                                "source_timing": TIMING_LABELS.get(timing_kind, timing_kind),
                                "source_timing_unc_ms": timing_unc_ms,
                                "source_queue_correction_ms": extra["source_timing"]["correction_ms"]})
@@ -677,8 +720,8 @@ class LatencyMeasurement(Measurement):
         method = (
             "Yarışma boru hattının kendisi ölçülür: RxNode (akış → Welch PSD → CFAR → ZMQ yayını) DUT üzerinde "
             f"özel bir {prm['transport']} uç noktasına yayın yapar, ölçüm bir ZMQ abonesidir. Mod B (RF olayı): kaynak "
-            "kapalı → sessiz kare doğrulaması → rastgele bekleme → kaynak açık → tonu (fc + 0.15·fs, ≥ 25 dB SNR) "
-            "içeren ve penceresi en erken olası RF açılma anından sonra biten ilk rx.detections mesajının aboneye "
+            "kapalı → sessiz kare doğrulaması → rastgele bekleme → kaynak açık → tonu (fc + 0.15·fs, ≥ 25 dB SNR; "
+            "seviye RX giriş sınırı rx_max_input_dbm'i aşmayacak biçimde sınırlanır) içeren ve penceresi en erken olası RF açılma anından sonra biten ilk rx.detections mesajının aboneye "
             "ulaştığı an; L = t_recv − t_RF. t_RF: simülatörde sahne geçiş anı; akışlı TX'te (Pluto) çağrı dönüşü + "
             "sürücü kuyruğu gecikmesi (± çeyreği); diğer kaynaklarda (SCPI: :OUTP ON + *OPC?) komut süresinin ortası "
             "(± yarısı). Mod A (host tarafı): her rx.detections mesajı için t_recv − t_acq_end; t_acq_end blok "
@@ -686,7 +729,7 @@ class LatencyMeasurement(Measurement):
             "sınır; döküm: işleme = kuyruk + DSP, yayın, iletim). Mod B dökümünde edinim/işleme ayrımı da aynı "
             "nedenle yaklaşıktır (toplam L bundan etkilenmez). Tüm zaman damgaları aynı host'ta time.time_ns() (duvar saati). "
             + stat_txt)
-        res = self.new_result(round(headline.p95, 3), summary=summary, method=method, conditions=conditions,
+        res = self.new_result(float(headline.p95), summary=summary, method=method, conditions=conditions,
                               extra=extra, uncertainty=unc)
         if nonrt:
             res.blockers.append(REASON_NONREALTIME)
@@ -748,21 +791,25 @@ class LatencyMeasurement(Measurement):
         # itself and every visible slice one component; the analysed window is NOT a component
         figs.append(self._breakdown_figure(
             "latency_mode_a_breakdown", "Gecikme dökümü — Mod A (host tarafı, ortalama; FIFO/USB hariç)",
+            f"Mod A — host tarafı ({st_a.n} kare)",
             [("İşleme (kuyruk + DSP)", bd_a["processing_ms"]), ("Yayın (serileştirme)", bd_a["publish_ms"]),
              ("İletim (ZMQ)", bd_a["transport_ms"])], info))
         bd_b = extra.get("mode_b_breakdown_mean_ms")
         if st_b is not None and bd_b:
             figs.append(self._breakdown_figure(
                 "latency_mode_b_breakdown", "Gecikme dökümü — Mod B (RF olayı → ZMQ, ortalama, olay başına)",
+                f"Mod B — RF olayı → ZMQ ({st_b.n} olay)",
                 [("Edinim (olay → pencere sonu)", bd_b["acquisition_ms"]),
                  ("İşleme (kuyruk + DSP)", bd_b["processing_ms"]), ("Yayın (serileştirme)", bd_b["publish_ms"]),
                  ("İletim (ZMQ)", bd_b["transport_ms"])], info))
         return figs
 
     @staticmethod
-    def _breakdown_figure(name: str, title: str, comps: list[tuple[str, float]], info: dict[str, str]) -> FigureSpec:
+    def _breakdown_figure(name: str, title: str, bar_label: str, comps: list[tuple[str, float]],
+                          info: dict[str, str]) -> FigureSpec:
         """Single stacked bar: cumulative sums drawn largest first, so the visible slice of the
-        bar is one component and its top is the total (= the mean latency of the mode)."""
+        bar is one component and its top is the total (= the mean latency of the mode). The
+        bar is named on the categorical x axis (``xticks``)."""
         vals = [(lab, float(v) if math.isfinite(v) and v > 0 else 0.0) for lab, v in comps]
         cum = np.cumsum([v for _, v in vals]).tolist()
         series = [Series(x=[1.0], y=[cum[i]], label=f"{lab}: {v:.2f} ms", style="bar")
@@ -771,4 +818,5 @@ class LatencyMeasurement(Measurement):
         return FigureSpec(
             name=name, title=title, kind="xy", series=series,
             markers=[(1.0, total, f"toplam {total:.2f} ms")], xlabel="yığılmış çubuk (bileşenler alttan üste)",
-            ylabel="Süre [ms]", xlim=(0.4, 1.6), ylim=(0.0, 1.3 * total if total > 0 else 1.0), info=dict(info))
+            ylabel="Süre [ms]", xlim=(0.4, 1.6), ylim=(0.0, 1.3 * total if total > 0 else 1.0), info=dict(info),
+            xticks=[(1.0, bar_label)])

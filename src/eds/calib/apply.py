@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from collections.abc import Mapping
 from typing import Any
 
@@ -33,6 +34,29 @@ log = logging.getLogger(__name__)
 PPM_MODES: tuple[str, ...] = ("auto", "hardware", "software", "off")
 CAL_KINDS: tuple[str, ...] = ("ppm", "power", "image_rejection", "coherence", "iq")
 _HW_AGC_MODES = frozenset({"hw_slow", "hw_fast", "hw_hybrid"})
+
+# Devices (by serial) already warned about a missing PPM calibration in this process: a suite
+# run opens the same receiver many times (one RxNode / measurement each), one warning is enough.
+_NO_PPM_WARNED: set[str] = set()
+_NO_PPM_LOCK = threading.Lock()
+
+
+def _device_key(device: Any, cal: DeviceCalibration | None) -> str:
+    serial = str(getattr(getattr(device, "info", None), "serial", "") or "")
+    if not serial and cal is not None:
+        serial = str(cal.serial or "")
+    return f"serial:{serial}" if serial else f"name:{getattr(device, 'name', '?')}"
+
+
+def _warn_no_ppm(device: Any, cal: DeviceCalibration | None) -> None:
+    """Log the missing-PPM warning once per device serial and process (later: DEBUG)."""
+    key = _device_key(device, cal)
+    with _NO_PPM_LOCK:
+        first = key not in _NO_PPM_WARNED
+        _NO_PPM_WARNED.add(key)
+    log.log(logging.WARNING if first else logging.DEBUG,
+            "%s: PPM kalibrasyonu yok — frekanslar düzeltilmeyecek (önce `eds cal ppm`).",
+            getattr(device, "name", "?"))
 
 
 def _check_mode(ppm_mode: str) -> str:
@@ -132,14 +156,14 @@ def apply_ppm_to_device(device: Any, cal: DeviceCalibration | None, ppm_mode: st
     (the device compensates; ``IQBlock.meta['ppm_hw']`` then carries the value).
     ``hardware`` mode raises :class:`CalibrationError` when the device cannot correct; a
     group whose members end up with different mechanisms (``"mixed"``) is reset to 0 and
-    handled in software under ``auto``.
+    handled in software under ``auto``. The "no PPM calibration" warning is logged once per
+    device serial and process (repeats at DEBUG level).
     """
     _check_mode(ppm_mode)
     if ppm_mode == "off":
         return "off"
     if cal is None or cal.ppm is None:
-        log.warning("%s: PPM kalibrasyonu yok — frekanslar düzeltilmeyecek (önce `eds cal ppm`).",
-                    getattr(device, "name", "?"))
+        _warn_no_ppm(device, cal)
         return "off"
     if ppm_mode == "software":
         return "software"

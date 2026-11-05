@@ -585,20 +585,38 @@ def test_hardware_ppm_resets_previous_soapy_correction(monkeypatch, board):
 
 
 # ----------------------------------------------------------------------------- tracking
-def test_tracking_paths_soapy_and_iio(monkeypatch, board):
-    sdr = fake_soapy.install(monkeypatch, has_dc_offset_mode=True, has_iq_balance_mode=True)
+def test_pluto_tracking_goes_through_the_thin_layer(monkeypatch, board):
+    """SoapyPlutoSDR has no DC-offset / IQ-balance API (hasDCOffsetMode / hasIQBalanceMode are
+    SoapySDR's false defaults): every tracking loop is set through libiio."""
+    sdr = fake_soapy.install(monkeypatch)
     dev = make_dev(control_uri=IP)
+    fk = sdr.state.last()
+    assert not fk.hasDCOffsetMode(RX, 0) and not fk.hasIQBalanceMode(RX, 0)
     res = dev.set_tracking(dc=True, rf_dc=False, quadrature=True)
-    assert res == {"dc": "soapy", "rf_dc": "iio", "quadrature": "soapy"}
+    assert res == {"dc": "iio", "rf_dc": "iio", "quadrature": "iio"}
+    assert fk.called("setDCOffsetMode") == [] and fk.called("setIQBalanceMode") == []
+    assert board.value(f"{P}/in/voltage0/bb_dc_offset_tracking_en") == "1"
+    assert board.value(f"{P}/in/voltage0/rf_dc_offset_tracking_en") == "0"
+    assert board.value(f"{P}/in/voltage0/quadrature_tracking_en") == "1"
+
+
+def test_tracking_soapy_path_for_drivers_with_the_api(monkeypatch, no_iio):
+    """Drivers that implement DC-offset / IQ-balance modes (UHD ...) use them; RF-DC has no Soapy
+    API and no thin layer exists for them."""
+    sdr = fake_soapy.install(monkeypatch, driver_key="UHD", hardware_key="B210", has_iq_balance_mode=True,
+                             devices=[{"driver": "uhd", "label": "B210 3141", "serial": "3141"}],
+                             hardware_info={"serial": "3141"})
+    dev = make_dev(args={"driver": "uhd"}, profile=load_profile("usrp_b210"))
+    res = dev.set_tracking(dc=True, rf_dc=False, quadrature=True)
+    assert res == {"dc": "soapy", "rf_dc": "unsupported", "quadrature": "soapy"}
     fk = sdr.state.last()
     assert fk.called("setDCOffsetMode")[-1][0] == (RX, 0, True)
     assert fk.called("setIQBalanceMode")[-1][0] == (RX, 0, True)
-    assert board.writes == [(f"{P}/in/voltage0/rf_dc_offset_tracking_en", "0")]
+    dev.close()
 
 
 def test_tracking_old_binding_goes_through_iio(monkeypatch, board):
-    fake_soapy.install(monkeypatch, has_dc_offset_mode=False,
-                       missing_methods=("hasIQBalanceMode", "setIQBalanceMode", "getIQBalanceMode"))
+    fake_soapy.install(monkeypatch, missing_methods=("hasIQBalanceMode", "setIQBalanceMode", "getIQBalanceMode"))
     dev = make_dev(control_uri=IP)
     assert dev.set_tracking(dc=False, rf_dc=True, quadrature=False) == {
         "dc": "iio", "rf_dc": "iio", "quadrature": "iio"}
@@ -607,8 +625,7 @@ def test_tracking_old_binding_goes_through_iio(monkeypatch, board):
 
 
 def test_tracking_unsupported_warns(monkeypatch, no_iio):
-    fake_soapy.install(monkeypatch, has_dc_offset_mode=False,
-                       missing_methods=("hasIQBalanceMode", "setIQBalanceMode", "getIQBalanceMode"))
+    fake_soapy.install(monkeypatch, missing_methods=("hasIQBalanceMode", "setIQBalanceMode", "getIQBalanceMode"))
     dev = make_dev(control_uri="none")
     dev.configure(rxcfg())                                   # configure() requests all three
     assert dev.set_tracking(dc=True, rf_dc=True, quadrature=True) == {
@@ -899,9 +916,10 @@ def test_dma_poll_is_rate_limited(monkeypatch):
     dev = make_dev(control_uri=IP, overflow_poll_s=3600.0)
     dev.configure(rxcfg())
     dev.start_stream()
+    n0 = len(sys_board(dev).reg_log)                        # the open probed the register once
     for _ in range(20):
         dev.read(1024)
-    reads = [e for e in sys_board(dev).reg_log if e[0] == "r"]
+    reads = [e for e in sys_board(dev).reg_log[n0:] if e[0] == "r"]
     assert len(reads) == 1                                   # first read polls, then the interval blocks
     dev.close()
 
@@ -939,12 +957,61 @@ def test_old_board_without_register_access(monkeypatch):
     dev.close()
 
 
+def test_overflow_source_is_known_from_the_open(monkeypatch):
+    """A Pluto never claims "driver" (SoapyPlutoSDR reports no overflow): before any stream the
+    value already says whether the thin layer can read the DMA status register."""
+    sdr, board = pluto_with_dma(monkeypatch)
+    dev = make_dev(control_uri=IP)
+    assert not dev.streaming and dev.thin_layer() is not None
+    assert dev.overflow_source == "dma_status" and dev.describe()["overflow_source"] == "dma_status"
+    assert board.reg_log == [("r", "cf-ad9361-lpc", 0x80000088, None)]   # probed, not cleared
+    dev.close()
+    board.reg_error = (110, "Connection timed out")         # register unreadable
+    dev = make_dev(control_uri=IP)
+    assert dev.overflow_source == "none"
+    dev.close()
+    fake_iio.install(monkeypatch, fake_iio.make_pluto_board(IP, dma_regs=False))
+    dev = make_dev(control_uri=IP)                           # old board: no register access
+    assert dev.overflow_source == "none"
+    dev.close()
+    dev = make_dev(control_uri="none")                       # no thin layer at all
+    assert dev.overflow_source == "none" and dev.thin_layer() is None
+    dev.close()
+
+
+def test_unexpected_thin_layer_error_at_open_releases_everything(monkeypatch, sdr):
+    def boom(self):
+        raise RuntimeError("hata")
+
+    monkeypatch.setattr(SoapyRxDevice, "_open_thin", boom)
+    with pytest.raises(DeviceError, match="ince katmanı açılırken"):
+        make_dev(control_uri=IP)
+    assert sb.open_pluto_owners() == []
+    gc.collect()
+    assert len(sdr.state.unmade) == 1 and sdr.state.double_unmake == 0
+
+
+def test_devices_probe_shows_the_overflow_source(monkeypatch, capsys, no_iio):
+    """``eds devices --probe`` opens the Pluto without the thin layer (control_uri none):
+    sample loss is NOT detectable there, and the probe must say so."""
+    import json
+
+    from eds.cli.main import main
+
+    fake_soapy.install(monkeypatch)
+    assert main(["devices", "--backend", "soapy", "--args", "driver=plutosdr", "--probe"]) == 0
+    out = capsys.readouterr().out
+    js = json.loads(out[out.index("{"):])
+    assert js["describe"]["overflow_source"] == "none"
+
+
 def test_non_pluto_driver_overflow_source_is_driver(monkeypatch, no_iio):
     fake_soapy.install(monkeypatch, num_channels=1, driver_key="UHD", hardware_key="B210",
                        devices=[{"driver": "uhd", "label": "B210 3141", "serial": "3141"}],
                        hardware_info={"serial": "3141"}, reports_overflow=True, native_format_api="struct",
                        native_full_scale=32768.0, cs16_full_scale=32768.0)
     dev = make_dev(args={"driver": "uhd"}, profile=load_profile("usrp_b210"))
+    assert dev.overflow_source == "driver"                   # from the open on
     dev.configure(rxcfg())
     dev.start_stream()
     assert dev.overflow_source == "driver"

@@ -425,21 +425,23 @@ class ScanSpeedMeasurement(Measurement):
     @staticmethod
     def _breakdown_figure(runs: list[ConfigRun], start: float, stop: float) -> FigureSpec:
         """Stacked bars per configuration: drawn as cumulative bars, largest first, so the
-        visible slice of each bar is one timing component."""
+        visible slice of each bar is one timing component. Every bar is named on the
+        categorical x axis by its configuration (fs, actual RBW / N, averages)."""
         x = [float(r.cfg.index + 1) for r in runs]
         per = [r.per_step_ms() for r in runs]
         cum = np.cumsum([[m[k] for k in TIMING_KEYS] for m in per], axis=1)      # (n_cfg, 4)
         series = [Series(x=x, y=cum[:, i].tolist(), label=TIMING_LABELS[k], style="bar")
                   for i, k in reversed(list(enumerate(TIMING_KEYS)))]
-        markers = [(xi, float(c[-1]), f"{r.label} — {c[-1]:.2f} ms/adım, {r.rate_ghz:.3f} GHz/s")
+        markers = [(xi, float(c[-1]), f"{c[-1]:.2f} ms/adım, {r.rate_ghz:.3f} GHz/s")
                    for xi, c, r in zip(x, cum, runs)]
         top = float(np.max(cum[:, -1])) if cum.size else 1.0
         return FigureSpec(
             name="scan_speed_step_breakdown",
             title="Tarama hızı — adım başına süre dökümü (tune / settle / yakalama / işleme)",
-            kind="xy", series=series, xlabel="Tarama konfigürasyonu [#]", ylabel="Adım başına ortalama süre [ms]",
-            markers=markers, xlim=(0.4, len(runs) + 0.6 if runs else 1.6), ylim=(0.0, 1.35 * top if top > 0 else 1.0),
+            kind="xy", series=series, xlabel="Tarama konfigürasyonu", ylabel="Adım başına ortalama süre [ms]",
+            markers=markers, xlim=(0.4, max(x, default=1.0) + 0.6), ylim=(0.0, 1.35 * top if top > 0 else 1.0),
             info={"Aralık": f"{fmt_hz(start, 4)} – {fmt_hz(stop, 4)}", "Gösterim": "yığılmış çubuk"},
+            xticks=[(xi, r.label.replace(", ", "\n")) for xi, r in zip(x, runs)],
         )
 
     @staticmethod

@@ -147,13 +147,26 @@ def test_rbw_overrides_nfft_and_sets_capture_and_buffer():
     ({"gain_mode": "agc"}, ConfigError),
     ({"averages": 0}, ConfigError),
     ({"nfft": 32}, ConfigError),
+    ({"publish_max_points": 0}, ConfigError),
+    ({"publish_max_points": -5}, ConfigError),
+    ({"publish_max_points": 100.5}, ConfigError),
+    ({"publish_max_points": True}, ConfigError),
+    ({"publish_max_points": float("nan")}, ConfigError),
 ])
 def test_invalid_sweep_configs_are_rejected(kw, exc):
     dev = make_device()
     base = {"start_hz": 400e6, "stop_hz": 500e6}
     base.update(kw)
-    with pytest.raises(exc):
+    with pytest.raises(exc) as ei:
         Sweeper(dev, SweepConfig(**base), DspConfig(), DetectConfig())
+    if "publish_max_points" in kw:
+        assert "sweep.publish_max_points pozitif tamsayı olmalı" in str(ei.value)
+
+
+def test_publish_max_points_accepts_one_and_integral_floats():
+    dev = make_device()
+    for v in (1, 8192, 2000.0):
+        Sweeper(dev, SweepConfig(start_hz=400e6, stop_hz=500e6, publish_max_points=v), DspConfig(), DetectConfig())
 
 
 # --------------------------------------------------------------------------- spectrum content

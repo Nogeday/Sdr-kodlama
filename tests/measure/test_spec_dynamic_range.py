@@ -156,6 +156,13 @@ def test_dynamic_range_p_max_is_the_1db_compression_point_when_the_front_end_com
     assert ex["p_max_in_gmin_dbm"] == pytest.approx(input_p1db_dbm(dev, g_min), abs=0.6)
     assert "1 dB sıkışma" in res.summary and "DR_toplam ≥" not in res.summary
     assert not run.source_left_on
+    # input levels carry their unit (absolute simulator source → dBm)
+    assert ex["p_max_input_unit"] == ex["p1db_input_unit"] == ex["clip_input_unit"] == "dBm"
+    # linearity figure: compression / clipping markers and the ideal line have fixed semantic roles
+    fig = next(f for f in res.figures if f.name == "dynamic_range_linearity")
+    roles = {s.label: s.role for s in fig.series}
+    assert roles["İdeal 1:1"] == "ref" and roles["≥ 1 dB sıkışma"] == "warn" and roles["Ölçülen ton gücü"] == ""
+    assert roles.get("Kırpma", "fail") == "fail"
 
 
 def _record_powers(src) -> list[float]:

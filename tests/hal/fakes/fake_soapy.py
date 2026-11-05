@@ -20,7 +20,10 @@ Mirrors the real binding where EDS depends on it:
   ``getBandwidthRange`` lists of ``Range``.
 * SoapyPlutoSDR behaviour: driver key "PlutoSDR", native CS16 full scale 2048, ``bufflen``
   stream arg = MTU, ``kernel_buffers × MTU`` stale (old-frequency) samples after a retune
-  while streaming, CS16 tone of ``tone_counts`` counts, constant ``getGainRange(RX)`` 0..73.
+  while streaming, CS16 tone of ``tone_counts`` counts, constant ``getGainRange(RX)`` 0..73,
+  no DC-offset / IQ-balance / frequency-correction API (``hasDCOffsetMode`` /
+  ``hasIQBalanceMode`` / ``hasFrequencyCorrection`` false: SoapySDR's defaults, not overridden
+  by SoapyPlutoSDR; ``FakeConfig.has_dc_offset_mode = None`` follows the driver key).
   ``find`` returns ``{device, driver, uri, label="PlutoSDR #i <uri>"}`` — **no serial**
   (``FakeConfig.enumerate_serial = False``; an entry's ``serial`` key is the hidden
   ``hw_serial`` of that board, reported only by ``getHardwareInfo``). ``find``/``make``
@@ -221,7 +224,9 @@ class FakeConfig:
     bw_list: tuple[float, ...] = (200e3, 56e6)
     rx_gain_range: tuple[float, float] = (0.0, 73.0)
     tx_gain_range: tuple[float, float] = (0.0, 89.0)
-    has_dc_offset_mode: bool = True
+    #: None = like the real driver: SoapyPlutoSDR does NOT override ``hasDCOffsetMode`` /
+    #: ``setDCOffsetMode`` (SoapySDR's default: false / no-op), other drivers (UHD ...) have it
+    has_dc_offset_mode: bool | None = None
     has_iq_balance_mode: bool = False
     has_frequency_correction: bool = False
     native_format_api: str = "typeerror"      # "typeerror" (0.8.1) | "struct" (0.9) | "list"
@@ -310,6 +315,11 @@ def make_module(config: FakeConfig | None = None, **overrides: Any) -> types.Mod
     cfg = dataclasses.replace(config or FakeConfig(), **overrides)
     state = FakeState(cfg)
     mod = types.ModuleType("SoapySDR")
+
+    def _dc_offset_mode() -> bool:
+        if cfg.has_dc_offset_mode is not None:
+            return bool(cfg.has_dc_offset_mode)
+        return cfg.driver_key != "PlutoSDR"        # SoapyPlutoSDR: SoapySDR::Device default (false)
 
     class Device:
         def __new__(cls, *args: Any, **kwargs: Any):
@@ -515,11 +525,11 @@ def make_module(config: FakeConfig | None = None, **overrides: Any) -> types.Mod
             return bool(self._ch(direction, channel)["gain_mode"])
 
         def hasDCOffsetMode(self, direction: int, channel: int) -> bool:  # noqa: N802
-            return cfg.has_dc_offset_mode
+            return _dc_offset_mode()
 
         def setDCOffsetMode(self, direction: int, channel: int, automatic: bool) -> None:  # noqa: N802
             self._rec("setDCOffsetMode", direction, channel, automatic)
-            if not cfg.has_dc_offset_mode:
+            if not _dc_offset_mode():
                 raise RuntimeError("setDCOffsetMode not supported")
             self._ch(direction, channel)["dc_mode"] = bool(automatic)
 

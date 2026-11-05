@@ -29,9 +29,11 @@ Error policy
   Nothing is swallowed: consumers see ``running == False`` and :meth:`RxStreamer.check`
   re-raises the failure as a :class:`~eds.core.errors.StreamError`.
 
-Stopping never hangs: :meth:`RxStreamer.stop` sets a stop event (checked between reads),
-waits for at most ``read_timeout_s`` (+ margin) for the in-flight read, and — if the
-streamer started the device stream — stops it, which unblocks a read stuck in the driver.
+Stopping never hangs on the reader: :meth:`RxStreamer.stop` sets a stop event (checked
+between reads), waits for at most ``read_timeout_s`` (+ margin) for the in-flight read, and —
+if the streamer started the device stream — stops it, which unblocks a read stuck in the
+driver. Stopping the device stream itself may block up to libiio's context timeout (~5 s) on
+SoapyPlutoSDR while an ``iio_buffer_refill`` is in flight (see :meth:`RxStreamer.stop`).
 
 Thread safety: :meth:`get`, :meth:`drain`, :attr:`stats` and the counters may be used from
 any thread; :meth:`start` / :meth:`stop` are serialized. ``on_block`` runs in the reader
@@ -216,10 +218,20 @@ class RxStreamer:
                 raise StreamError(f"{self._dev.name}: okuyucu thread başlatılamadı: {e}") from e
 
     def stop(self, timeout_s: float | None = None) -> None:
-        """Stop the reader (never hangs) and the device stream if this streamer started it.
+        """Stop the reader and the device stream if this streamer started it.
 
         ``timeout_s`` bounds the wait for the in-flight read (default ``read_timeout_s + 1``).
         Queued blocks stay available to :meth:`get` / :meth:`drain`.
+
+        The reader thread itself is never waited for longer than that, but stopping the device
+        stream may take longer: on SoapyPlutoSDR ``readStream`` holds the driver's RX mutex
+        during ``iio_buffer_refill`` and ignores its timeout, so ``deactivateStream`` /
+        ``closeStream`` (``RxDevice.stop_stream``) wait for an in-flight refill to finish —
+        at worst until libiio's context timeout (~5 s by default; SoapyPlutoSDR offers no
+        argument to change it). A read that returns after the stream was stopped raises
+        :class:`~eds.core.errors.StreamError` (its data is discarded by the backend's stream
+        generation check); the reader ignores it once stopping was requested, so it is neither
+        logged nor stored in :attr:`error`.
         """
         self._stop_evt.set()
         t = self._thread

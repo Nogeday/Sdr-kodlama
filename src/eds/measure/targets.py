@@ -27,7 +27,13 @@ gets ``passed = None`` and a Turkish reason in ``extra['verdict_note']`` when
 * it comes from a non-real-time simulator (``extra['realtime'] is False``) or from channels
   that are not coherent (``extra['coherent'] is False``),
 * its unit differs from the spec's unit, or a dBm target meets an uncalibrated value,
-* a ``require`` condition of the target is not met or not recorded by the result.
+* a ``require`` condition of the target is not met or not recorded by the result,
+* the value is only a bound (``extra['value_bound']``) that cannot decide the comparison:
+  a lower bound ``≥ X`` proves a ``>=`` target only when ``X >= target`` and disproves a
+  ``<=`` target only when ``X > target``; an upper bound ``≤ X`` proves a ``<=`` target
+  only when ``X <= target`` and disproves a ``>=`` target only when ``X < target``. Every
+  other case is inconclusive (no verdict, :func:`bound_reason`); a bound that decides is
+  compared normally (e.g. a lower bound above a ``>=`` target → GEÇTİ).
 """
 
 from __future__ import annotations
@@ -53,6 +59,7 @@ VALID_OPS: tuple[str, ...] = ("<=", ">=")
 TARGET_NOTE_KEY = "target_note"           # MeasurementResult.extra key carrying Target.note
 VERDICT_NOTE_KEY = "verdict_note"         # why no pass/fail verdict was given (unit / calibration)
 TARGET_REQUIRE_KEY = "target_require"     # MeasurementResult.extra key carrying Target.require
+VALUE_BOUND_KEY = "value_bound"           # MeasurementResult.extra: "lower" (≥ value) | "upper" (≤ value) | ""
 _ALLOWED_KEYS = frozenset({"target", "op", "note", "require"})
 _NUMERIC_SUFFIXES: tuple[str, ...] = ("_count_min", "_min", "_max")
 
@@ -215,7 +222,9 @@ def verdict_blockers(r: MeasurementResult, target: Target | None = None) -> list
       ``conditions`` / ``extra`` for results that did not list them as blockers);
     * a unit different from the spec's canonical unit (e.g. dBFS against a dBm target), or
       an uncalibrated result (``extra['calibrated'] is False``) against a dBm target;
-    * ``target.require`` conditions that the result does not meet or does not record.
+    * ``target.require`` conditions that the result does not meet or does not record;
+    * a bound value (``extra['value_bound']``) that cannot decide the comparison
+      (:func:`bound_reason`; uses ``target``, else the result's own target).
     """
     from .base import MEASUREMENTS
 
@@ -239,7 +248,49 @@ def verdict_blockers(r: MeasurementResult, target: Target | None = None) -> list
     if target is not None:
         for reason in unmet_requirements(r, target.require):
             add(reason)
+    bound = bound_reason(r, target)
+    if bound:
+        add(bound)
     return reasons
+
+
+def bound_reason(r: MeasurementResult, target: Target | None = None) -> str:
+    """Turkish reason when ``r.value`` is only a bound (``extra['value_bound']`` =
+    ``"lower"``: true value ≥ value, ``"upper"``: true value ≤ value) that cannot decide the
+    comparison with the target (``target``, else the result's own ``target`` /
+    ``target_op``); ``""`` when the value is exact or the bound proves the verdict.
+
+    =========  ====  ===================  ============================
+    bound      op    inconclusive when    otherwise
+    =========  ====  ===================  ============================
+    lower ≥ X  >=    X < target           GEÇTİ (X ≥ target)
+    lower ≥ X  <=    X <= target          KALDI (X > target)
+    upper ≤ X  <=    X > target           GEÇTİ (X ≤ target)
+    upper ≤ X  >=    X >= target          KALDI (X < target)
+    =========  ====  ===================  ============================
+    """
+    kind = str(r.extra.get(VALUE_BOUND_KEY) or "").strip().lower()
+    if kind not in ("lower", "upper"):
+        return ""
+    t, op = (target.target, target.op) if target is not None else (r.target, r.target_op)
+    x, t = _finite_float(r.value), _finite_float(t)
+    if x is None or t is None or op not in VALID_OPS:
+        return ""
+    unit = f" {r.unit}" if r.unit else ""
+    sym_t = "≤" if op == "<=" else "≥"
+    if kind == "lower":
+        if op == ">=" and x < t:
+            return f"değer alt sınırdır (≥ {x:g}{unit}) ve hedefin altında — sonuçsuz"
+        if op == "<=" and x <= t:
+            return (f"değer alt sınırdır (≥ {x:g}{unit}): gerçek değer hedefi ({sym_t} {t:g}{unit}) aşabilir "
+                    "— sonuçsuz")
+    else:
+        if op == "<=" and x > t:
+            return f"değer üst sınırdır (≤ {x:g}{unit}) ve hedefin üstünde — sonuçsuz"
+        if op == ">=" and x >= t:
+            return (f"değer üst sınırdır (≤ {x:g}{unit}): gerçek değer hedefin ({sym_t} {t:g}{unit}) altında "
+                    "olabilir — sonuçsuz")
+    return ""
 
 
 def _verdict_blocker(r: MeasurementResult) -> str:
@@ -256,6 +307,17 @@ def _split_require_key(key: str) -> tuple[str, str]:
         if key.endswith(suffix) and len(key) > len(suffix):
             return key[: -len(suffix)], {"_count_min": "count", "_min": "min", "_max": "max"}[suffix]
     return key, "eq"
+
+
+def _finite_float(v: Any) -> float | None:
+    """``float(v)`` for a finite real number (numpy scalars included), else ``None``."""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
 
 
 def _is_number(v: Any) -> bool:

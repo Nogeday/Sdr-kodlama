@@ -634,7 +634,8 @@ class SensitivityMeasurement(Measurement):
             "fa_trials": nf.fa_trials, "fa_detections": nf.fa_detections, "fa_captures_with_detection": nf.fa_captures_hit,
             "pfa_empirical": pfa_emp, "pfa_empirical_upper95": pfa_up95, "fa_bins_tested": fa_total_bins,
             "pfa_design": float(app.detect.pfa),
-            "mds": {f"{r['bandwidth_hz']:.6g}": r["mds"] for r in mds_rows},
+            # MDS(B) per evaluation bandwidth B [Hz] (RBW, mds_bandwidths), in the result's unit
+            f"mds_{unit.lower()}_by_bw_hz": {f"{r['bandwidth_hz']:.6g}": r["mds"] for r in mds_rows},
             "scalloping_worst_db": scallop_worst, "scalloping_mean_db": scallop_mean,
             "mds_rbw_worst_case": mds_rbw + scallop_worst, "bin_offset": prm["bin_offset"],
             "level_uncertainty_budget": u_text,

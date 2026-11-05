@@ -5,7 +5,9 @@ module turns them into jury-facing images:
 
 * ``"xy"``       generic plot — series styles ``line | marker | step | bar`` (+ ``yerr``),
                  labelled reference lines (``hlines`` / ``vlines``), annotated ``markers``,
-                 log axes, limits, grid, legend (≥ 2 labelled series).
+                 log axes, limits, grid, legend (every labelled series, even a single one:
+                 its label may carry the result, e.g. a measured bandwidth), categorical x
+                 axis from ``xticks`` (``(x, label)`` pairs; multi-line labels allowed).
 * ``"spectrum"`` spectrum-analyzer "screenshot": dark screen (``#0b0f14``), bright trace,
                  top info bar (Ref, scale, RBW, VBW/Avg, Span, Center and any other
                  ``fig.info`` entries), marker table under the info bar (``Mkr1 f level``,
@@ -207,6 +209,14 @@ def _validate(fig: FigureSpec) -> None:
     for lim, name in ((fig.xlim, "xlim"), (fig.ylim, "ylim")):
         if lim is not None and (len(lim) != 2 or not all(math.isfinite(float(v)) for v in lim)):
             raise MeasurementError(f"{fig.name}: {name} iki sonlu sayı olmalı (geldi: {lim!r})")
+    for t in fig.xticks:
+        ok = isinstance(t, (tuple, list)) and len(t) == 2 and isinstance(t[1], str) and not isinstance(t[0], bool)
+        try:
+            ok = ok and math.isfinite(float(t[0]))
+        except (TypeError, ValueError):
+            ok = False
+        if not ok:
+            raise MeasurementError(f"{fig.name}: xticks öğeleri (sonlu x, etiket metni) olmalı (geldi: {t!r})")
     if fig.kind == "polar":
         _polar_options(fig)
 
@@ -372,14 +382,19 @@ def _header(f: Any, fig: FigureSpec, subtitle: str = "", dark: bool = False) -> 
     return bottom
 
 
+#: Bottom band (px) kept free for the footer (flags / traceability line) under the x axis.
+FOOTER_BAND_PX = 26.0
+
+
 def _fit_axes(f: Any, ax: Any, twin: Any = None, pad_px: float = 6.0) -> None:
-    """Move/shrink ``ax`` (and its twin) horizontally so that the y tick labels and axis
-    labels stay on the canvas (long tick labels such as ``−0.006`` must not push the
-    axis label off the image)."""
+    """Move/shrink ``ax`` (and its twin) so that the tick and axis labels stay on the canvas:
+    horizontally for the y axis (long tick labels such as ``−0.006`` must not push the axis
+    label off the image), vertically for the x axis (multi-line categorical ``xticks`` must
+    not push the x label into the footer band)."""
     renderer = f.canvas.get_renderer()
-    w_px, _ = _canvas_px(f)
+    w_px, h_px = _canvas_px(f)
     pos = ax.get_position()
-    x0, x1 = pos.x0, pos.x1
+    x0, x1, y0 = pos.x0, pos.x1, pos.y0
     bb = ax.yaxis.get_tightbbox(renderer)
     if bb is not None and bb.x0 < pad_px:
         x0 += (pad_px - bb.x0) / w_px
@@ -387,10 +402,13 @@ def _fit_axes(f: Any, ax: Any, twin: Any = None, pad_px: float = 6.0) -> None:
         bb2 = twin.yaxis.get_tightbbox(renderer)
         if bb2 is not None and bb2.x1 > w_px - pad_px:
             x1 -= (bb2.x1 - (w_px - pad_px)) / w_px
-    if (x0, x1) != (pos.x0, pos.x1) and x1 - x0 > 0.3:
+    bbx = ax.xaxis.get_tightbbox(renderer)
+    if bbx is not None and bbx.y0 < FOOTER_BAND_PX:
+        y0 += (FOOTER_BAND_PX - bbx.y0) / h_px
+    if (x0, x1, y0) != (pos.x0, pos.x1, pos.y0) and x1 - x0 > 0.3 and pos.y1 - y0 > 0.3:
         for a in (ax, twin):
             if a is not None:
-                a.set_position((x0, pos.y0, x1 - x0, pos.height))
+                a.set_position((x0, y0, x1 - x0, pos.y1 - y0))
 
 
 def _subtitle(fig: FigureSpec, prefix: str = "") -> str:
@@ -459,7 +477,7 @@ def _bar_geometry(x: np.ndarray, logx: bool) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _apply_axes(ax: Any, fig: FigureSpec) -> None:
-    from matplotlib.ticker import FuncFormatter, NullFormatter
+    from matplotlib.ticker import FuncFormatter, NullFormatter, NullLocator
 
     # mathtext is disabled (Turkish text safety), so log axes need plain-number labels
     plain = FuncFormatter(lambda v, _pos: f"{v:g}")
@@ -471,6 +489,9 @@ def _apply_axes(ax: Any, fig: FigureSpec) -> None:
         ax.set_yscale("log")
         ax.yaxis.set_major_formatter(plain)
         ax.yaxis.set_minor_formatter(NullFormatter())
+    if fig.xticks:                                   # categorical x axis (bar plots)
+        ax.set_xticks([float(x) for x, _ in fig.xticks])
+        ax.set_xticklabels([str(lab) for _, lab in fig.xticks], fontsize=9.5)
     if fig.xlim is not None:
         ax.set_xlim(*fig.xlim)
     if fig.ylim is not None:
@@ -479,6 +500,8 @@ def _apply_axes(ax: Any, fig: FigureSpec) -> None:
     if fig.logx or fig.logy:
         ax.minorticks_on()
         ax.grid(True, which="minor", alpha=0.35, lw=0.5, zorder=0)
+    if fig.xticks:
+        ax.xaxis.set_minor_locator(NullLocator())    # categories only: no minor ticks between them
     ax.set_axisbelow(True)
     ax.set_xlabel(fig.xlabel)
     ax.set_ylabel(fig.ylabel)
@@ -530,7 +553,7 @@ def _draw_xy(f: Any, fig: FigureSpec) -> None:
     _apply_axes(ax, fig)
     if not data:
         _no_data(ax)
-    _legend(ax, loc="best")
+    _legend(ax, loc="best", min_entries=1)          # a single label may carry the result (JURY-10c)
     _fit_axes(f, ax)
 
 

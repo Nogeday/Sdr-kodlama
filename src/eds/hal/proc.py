@@ -23,7 +23,16 @@ What
   (``_apply_*``, ``_start``, ``_read_raw``, ``_stop``, ``_close``) and the optional features
   (``set_tracking``, ``set_ppm_correction``, ``read_sensors``, ``runtime_limits``,
   ``describe``) as RPCs. ``info`` and the device state (fc, fs, bw, gains, gain mode, ppm,
-  new warnings) are mirrored from the child after every control call.
+  new warnings) are mirrored from the child after every control call, together with the
+  settling window (the child's ``settle_samples`` for the ``buffer_size`` / ``settle_buffers``
+  it was computed with: a Soapy device's window follows the driver's actual ``bufflen``;
+  ``buffer_size`` / ``settle_buffers`` themselves are adopted only when the backend changed
+  them). The backend-specific attributes in :data:`MIRRORED_ATTRS` (``overflow_source``,
+  ``dma_overflow_events``, ``thin_serial_verified`` ...) are mirrored as plain attributes when
+  the child's device has them — after every control call AND with the read reply in which
+  they changed (e.g. a Pluto DMA overflow counted or detection switched off mid-stream) — so
+  the RX node, measurements and reports see the same values as in-process. A device without
+  them (simulator) leaves them absent on the proxy too.
 * :class:`ProcessSignalSource` — a :class:`~eds.hal.tx.SignalSource` proxy running any
   source class (default use: ``eds.hal.tx_hw:SoapyTxSource``) in a child process. Method
   calls (including ``set_lo_offset``) are forwarded; ``name``, ``absolute_power``,
@@ -40,11 +49,17 @@ in-process driver):
 * **control**: pickled ``(op, args, sync)`` requests (``sync`` = the parent's
   ``buffer_size`` / ``settle_buffers``, which the sim's stale-buffer model reads), pickled
   ``("ok" | "err", payload, state)`` replies.
-* **data**: request ``struct <qd`` (n, timeout_s); reply header ``struct <BBxxiqqq``
-  (status, flags overflow_before|timeout|has_hw_time, n_channels, k, t_ns, hw_time_ns)
-  followed by the channel gains (float64, mirrored in hardware-AGC modes) and then the raw
-  complex64 buffer of shape (n_channels, k) via ``send_bytes`` / ``recv_bytes_into`` (no
-  array pickling). An error reply (status 1) is followed by a pickled error record.
+* **data**: request ``struct <qd`` (n, timeout_s); reply header ``struct <BBHiqqqq``
+  (status, flags overflow_before|timeout|has_hw_time|attrs, n_gains, n_channels, k, t_ns,
+  hw_time_ns, uncertain_samples) followed, in the same message, by the channel gains
+  (float64, mirrored in hardware-AGC modes) and — flag ``attrs`` — the pickled
+  ``(version, {name: value})`` of the changed :data:`MIRRORED_ATTRS`; then the raw complex64
+  buffer of shape (n_channels, k) via ``send_bytes`` / ``recv_bytes_into`` (no array
+  pickling). ``uncertain_samples`` is ``RawRead.uncertain_samples`` (a Pluto DMA overflow's
+  uncertain span, flagged ``settling`` by the parent exactly as in-process). An error reply
+  (status 1) is followed by a pickled error record. Attribute snapshots carry a version
+  number (taken under one lock in the child), so the newest one wins whichever pipe
+  delivers it first.
 
 Errors raised in the child are re-raised in the parent as the same
 :mod:`eds.core.errors` class with the same message (``ProfileViolation`` with the same
@@ -74,10 +89,11 @@ Costs / limits
   time on the control pipe (each with its own lock). A call interrupted while waiting for
   its reply (Ctrl-C) leaves the pipes in step (:class:`_Pipe`); the samples of an
   interrupted read are dropped and the next block is flagged ``overflow`` (gap before it).
-* Only the :class:`RxDevice` interface crosses the process boundary; backend-specific
-  extras (``SoapyRxDevice.thin_layer()``, ``SimRxDevice.true_ppm`` ...) are not reachable
-  (their values appear in :meth:`ProcessRxDevice.describe`). ``backend_name`` is
-  ``"proc"``; ``info.backend`` is the child's backend.
+* Only the :class:`RxDevice` interface and the :data:`MIRRORED_ATTRS` values cross the
+  process boundary; other backend-specific extras (``SoapyRxDevice.thin_layer()``,
+  ``SimRxDevice.true_ppm`` ...) are not reachable (their values appear in
+  :meth:`ProcessRxDevice.describe`). ``backend_name`` is ``"proc"``; ``info.backend`` is the
+  child's backend.
 * A ``sim`` device forced into a subprocess builds its OWN ``SimWorld`` from ``app.sim``:
   the shared scene is lost (no common geometry / emitter switching with other devices or a
   ``sim`` source in the parent, every isolated device registers as the world's first device
@@ -92,6 +108,7 @@ import importlib
 import logging
 import multiprocessing
 import os
+import pickle
 import signal
 import struct
 import threading
@@ -101,7 +118,7 @@ import typing
 from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from multiprocessing import util as mp_util
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 
@@ -118,12 +135,22 @@ log = logging.getLogger(__name__)
 _CTX = multiprocessing.get_context("spawn")
 
 _READ_REQ = struct.Struct("<qd")           # n, timeout_s
-_READ_HDR = struct.Struct("<BBxxiqqq")     # status, flags, n_channels, k, t_ns, hw_time_ns
-_F_OVERFLOW, _F_TIMEOUT, _F_HWTIME = 1, 2, 4
+_READ_HDR = struct.Struct("<BBHiqqqq")     # status, flags, n_gains, n_channels, k, t_ns, hw_time_ns, uncertain
+_F_OVERFLOW, _F_TIMEOUT, _F_HWTIME, _F_ATTRS = 1, 2, 4, 8
 _POLL_S = 0.25                             # liveness check period while waiting for a reply
 _EXIT_PRIORITY = 10                        # Finalize: before multiprocessing kills daemons
 
 DEFAULT_OPENER = "eds.hal.factory:open_device"
+
+#: Backend-specific device attributes mirrored onto :class:`ProcessRxDevice` when the worker's
+#: device has them (the documented ``SoapyRxDevice`` state: what the RX node, the measurements
+#: and the reports read with ``getattr``). Values must be plain data (str/int/float/bool/None
+#: or tuples of those); anything else is skipped.
+MIRRORED_ATTRS: tuple[str, ...] = (
+    "overflow_source", "dma_overflow_events", "thin_serial_verified", "ts_gap_events", "agc_mode_actual",
+    "stream_format", "native_format", "native_format_source", "stream_mtu", "xo_correction_hz", "xo_boot_hz",
+)
+_PLAIN = (str, int, float, bool, type(None))
 
 
 class RemoteTraceback(Exception):
@@ -251,6 +278,48 @@ def pluto_tx_isolated(args: Mapping[str, Any] | None) -> bool:
     raise ConfigError(f"measure.source_args.isolate true/false olmalı (geldi: {v!r})")
 
 
+_NOT_PLAIN = object()
+
+
+def _plain_value(v: Any) -> Any:
+    """``v`` as plain picklable data (lists become tuples), or ``_NOT_PLAIN``."""
+    if isinstance(v, _PLAIN):
+        return v
+    if isinstance(v, (tuple, list)) and all(isinstance(x, _PLAIN) for x in v):
+        return tuple(v)
+    return _NOT_PLAIN
+
+
+def backend_attrs(dev: Any) -> dict[str, Any]:
+    """The :data:`MIRRORED_ATTRS` that ``dev`` has, as plain data (absent / non-plain skipped)."""
+    out: dict[str, Any] = {}
+    for k in MIRRORED_ATTRS:
+        try:
+            v = _plain_value(getattr(dev, k))
+        except AttributeError:
+            continue
+        except Exception as e:  # a property raising: leave it out of this snapshot
+            log.debug("öznitelik %s okunamadı: %s", k, e)
+            continue
+        if v is not _NOT_PLAIN:
+            out[k] = v
+    return out
+
+
+class _ReadReply(NamedTuple):
+    """One parsed read reply (parent side)."""
+
+    status: int
+    flags: int
+    k: int
+    t_ns: int
+    hw_time_ns: int
+    uncertain: int
+    gains: tuple[float, ...]
+    attrs: tuple[int, dict[str, Any]] | None
+    body: Any                       # complex64 (n_channels, k) | error record
+
+
 def _log_level() -> int:
     return logging.getLogger("eds").getEffectiveLevel()
 
@@ -375,13 +444,44 @@ class _RxServer:
         self.data = data
         self._warn_sent = 0
         self._info_sent: dict[str, Any] | None = None
+        self._attrs_lock = threading.Lock()
+        self._attrs_cur: dict[str, Any] | None = None
+        self._attrs_ver = 0
+        self._attrs_sent = {"ctl": 0, "data": 0}
 
-    def state(self) -> dict[str, Any]:
+    def attrs_update(self, pipe: str) -> tuple[int, dict[str, Any]] | None:
+        """``(version, attrs)`` if the mirrored attributes changed since ``pipe`` last sent
+        them, else None. The snapshot is taken under the lock, so versions follow time order
+        across the control and data threads."""
+        with self._attrs_lock:
+            cur = backend_attrs(self.dev)
+            if cur != self._attrs_cur:
+                self._attrs_cur = cur
+                self._attrs_ver += 1
+            if self._attrs_ver <= self._attrs_sent[pipe]:
+                return None
+            self._attrs_sent[pipe] = self._attrs_ver
+            return self._attrs_ver, dict(cur)
+
+    def state(self, synced: tuple[int, int] | None = None) -> dict[str, Any]:
+        """Device state for the parent. ``synced`` = the ``(buffer_size, settle_buffers)``
+        the parent sent with this request: they are reported back only if the backend
+        changed them (the parent owns them; echoing them could undo a concurrent change)."""
         d = self.dev
         st: dict[str, Any] = {
             "fc": float(d.fc), "fs": float(d.fs), "bw": float(d.bw), "gains": [float(g) for g in d.gains],
             "gain_mode": str(d.gain_mode), "ppm_hw": float(d.ppm_hw), "ppm_hw_via": str(d.ppm_hw_via),
         }
+        bs, sb = int(d.buffer_size), int(d.settle_buffers)
+        try:
+            st["settle"] = (bs, sb, int(d.settle_samples))
+        except Exception as e:  # pragma: no cover - backend property failing
+            log.debug("settle_samples okunamadı: %s", e)
+        if synced is not None and (bs, sb) != tuple(synced):
+            st["buffer"] = (bs, sb)
+        upd = self.attrs_update("ctl")
+        if upd is not None:
+            st["attrs"] = upd
         if len(d.warnings) < self._warn_sent:
             self._warn_sent = 0
         if len(d.warnings) > self._warn_sent:
@@ -471,19 +571,22 @@ class _RxServer:
                 op, args, sync = conn.recv()
             except (EOFError, OSError):
                 return False
+            synced: tuple[int, int] | None = None
             try:
                 if sync:
                     d.buffer_size = int(sync.get("buffer_size", d.buffer_size))
                     d.settle_buffers = int(sync.get("settle_buffers", d.settle_buffers))
-                reply = ("ok", self._dispatch(op, tuple(args)), self.state())
+                    synced = (int(d.buffer_size), int(d.settle_buffers))
+                reply = ("ok", self._dispatch(op, tuple(args)), self.state(synced))
             except Exception as e:
-                reply = ("err", pack_error(e), self.state())
+                reply = ("err", pack_error(e), self.state(synced))
             try:
                 conn.send(reply)
             except (EOFError, OSError):
                 return op == "close"
             except Exception as e:  # unpicklable result
-                conn.send(("err", pack_error(DeviceError(f"{d.name}: {op} yanıtı aktarılamadı: {e}")), self.state()))
+                conn.send(("err", pack_error(DeviceError(f"{d.name}: {op} yanıtı aktarılamadı: {e}")),
+                           self.state(synced)))
             if op == "close":
                 return True
 
@@ -501,14 +604,18 @@ class _RxServer:
                 if x.ndim == 1:
                     x = x.reshape(1, -1)
                 nch, k = int(x.shape[0]), int(x.shape[1])
+                upd = self.attrs_update("data")
                 flags = ((_F_OVERFLOW if r.overflow_before else 0) | (_F_TIMEOUT if r.timeout else 0)
-                         | (_F_HWTIME if r.hw_time_ns is not None else 0))
+                         | (_F_HWTIME if r.hw_time_ns is not None else 0) | (_F_ATTRS if upd else 0))
                 gains = [float(g) for g in d.gains]
-                head = (_READ_HDR.pack(0, flags, nch, k, int(r.t_ns), int(r.hw_time_ns or 0))
-                        + struct.pack(f"<{len(gains)}d", *gains))
+                head = (_READ_HDR.pack(0, flags, len(gains), nch, k, int(r.t_ns), int(r.hw_time_ns or 0),
+                                       max(int(r.uncertain_samples), 0))
+                        + struct.pack(f"<{len(gains)}d", *gains) + (pickle.dumps(upd) if upd else b""))
             except Exception as e:
                 try:
-                    conn.send_bytes(_READ_HDR.pack(1, 0, 0, 0, 0, 0))
+                    upd = self.attrs_update("data")
+                    conn.send_bytes(_READ_HDR.pack(1, _F_ATTRS if upd else 0, 0, 0, 0, 0, 0, 0)
+                                    + (pickle.dumps(upd) if upd else b""))
                     conn.send(pack_error(e))
                 except (EOFError, OSError):
                     return
@@ -564,6 +671,11 @@ class ProcessRxDevice(RxDevice):
         self._dead: str | None = None
         self._closed = False
         self._pending_gap = False           # samples of an interrupted read were dropped
+        self._pending_uncertain = 0         # ... and the uncertain span one of them announced
+        self._child_settle = (-1, -1, 0)    # worker's (buffer_size, settle_buffers, settle_samples)
+        self._attrs_lock = threading.Lock()
+        self._attrs_ver = 0
+        self._attr_names: set[str] = set()
         self.child_backend = ""
         self.child_class = ""
         self.opener = target_path(opener) if opener is not None else DEFAULT_OPENER
@@ -608,6 +720,32 @@ class ProcessRxDevice(RxDevice):
     def alive(self) -> bool:
         return not self._closed and self._dead is None and self._proc.is_alive()
 
+    @property
+    def settle_samples(self) -> int:
+        """The worker device's settling window when it was computed for the current
+        ``buffer_size`` / ``settle_buffers`` (e.g. a Soapy device's actual ``bufflen``), else
+        the base formula until the next control call refreshes it."""
+        bs, sb, n = self._child_settle
+        if (bs, sb) == (int(self.buffer_size), int(self.settle_buffers)):
+            return int(n)
+        return int(self.settle_buffers * self.buffer_size)
+
+    def _apply_attrs(self, upd: Any) -> None:
+        """Mirror a ``(version, {name: value})`` snapshot of :data:`MIRRORED_ATTRS` (newest wins)."""
+        if not upd:
+            return
+        ver, attrs = upd
+        with self._attrs_lock:
+            if int(ver) <= self._attrs_ver:
+                return
+            self._attrs_ver = int(ver)
+            names = {k for k in attrs if k in MIRRORED_ATTRS}
+            for k in self._attr_names - names:      # the worker's device no longer has it
+                self.__dict__.pop(k, None)
+            for k in names:
+                setattr(self, k, attrs[k])
+            self._attr_names = names
+
     def _mirror(self, st: Mapping[str, Any] | None) -> None:
         if not st:
             return
@@ -616,6 +754,12 @@ class ProcessRxDevice(RxDevice):
             self.gains[i] = float(g)
         self.gain_mode = str(st["gain_mode"])
         self.ppm_hw, self.ppm_hw_via = float(st["ppm_hw"]), str(st["ppm_hw_via"])
+        if "buffer" in st:                          # the backend changed them itself
+            self.buffer_size, self.settle_buffers = (int(v) for v in st["buffer"])
+        if "settle" in st:
+            bs, sb, n = st["settle"]
+            self._child_settle = (int(bs), int(sb), int(n))
+        self._apply_attrs(st.get("attrs"))
         for w in st.get("warnings", ()):
             self.warnings.append(str(w))
         info = st.get("info")
@@ -683,21 +827,22 @@ class ProcessRxDevice(RxDevice):
             return payload
         _raise_remote(payload)
 
-    def _recv_read_reply(self) -> tuple[Any, ...]:
+    def _recv_read_reply(self) -> _ReadReply:
         """One complete read reply: header [+ samples | error record] (one :meth:`_Pipe.io`)."""
         conn = self._data.conn
         head = conn.recv_bytes()
-        status, flags, nch, k, t_ns, hw = _READ_HDR.unpack_from(head)
-        if status:
-            return status, flags, k, t_ns, hw, (), conn.recv()
-        n_g = (len(head) - _READ_HDR.size) // 8
+        status, flags, n_g, nch, k, t_ns, hw, unc = _READ_HDR.unpack_from(head)
         gains = struct.unpack_from(f"<{n_g}d", head, _READ_HDR.size)
+        off = _READ_HDR.size + 8 * n_g
+        attrs = pickle.loads(head[off:]) if flags & _F_ATTRS else None
+        if status:
+            return _ReadReply(status, flags, k, t_ns, hw, unc, gains, attrs, conn.recv())
         out = np.empty((nch, k), dtype=np.complex64)
         if k:
             got = conn.recv_bytes_into(out.reshape(-1).view(np.uint8))
             if got != out.nbytes:
                 raise OSError(f"örnek yükü {got} bayt, beklenen {out.nbytes}")
-        return status, flags, k, t_ns, hw, gains, out
+        return _ReadReply(status, flags, k, t_ns, hw, unc, gains, attrs, out)
     # ------------------------------------------------------------------ primitives
     def _apply_sample_rate(self, hz: float) -> float:
         return float(self._rpc("apply_sample_rate", float(hz)))
@@ -730,28 +875,34 @@ class ProcessRxDevice(RxDevice):
             try:
                 while p.owed:               # reply of an interrupted read: its samples are a gap
                     p.wait(p.owed[0])
-                    st, fl, k_old = p.io(self._recv_read_reply, settle=True)[:3]
-                    if st == 0 and (k_old or fl & _F_OVERFLOW):
+                    old = p.io(self._recv_read_reply, settle=True)
+                    self._apply_attrs(old.attrs)
+                    if old.status == 0 and (old.k or old.flags & _F_OVERFLOW):
                         self._pending_gap = True
+                        # conservative: the announced uncertain span started at the dropped samples
+                        self._pending_uncertain = max(self._pending_uncertain, int(old.uncertain))
                 p.request(p.conn.send_bytes, _READ_REQ.pack(int(n), float(timeout_s)), wait_s)
                 p.wait(wait_s)
-                status, flags, k, t_ns, hw, gains, body = p.io(self._recv_read_reply, settle=True)
+                r = p.io(self._recv_read_reply, settle=True)
             except _WorkerHung:
                 raise StreamError(self._kill_hung("okuma", wait_s)) from None
             except (EOFError, OSError) as e:
                 self._mark_dead(f"okuma: {e or type(e).__name__}")
                 raise StreamError(self._dead_message()) from None
-        if status:
-            _raise_remote(body)
+        self._apply_attrs(r.attrs)
+        if r.status:
+            _raise_remote(r.body)
         if self.gain_mode != "manual":  # hardware AGC moves the gain inside the worker
-            for i, g in enumerate(gains[: len(self.gains)]):
+            for i, g in enumerate(r.gains[: len(self.gains)]):
                 self.gains[i] = float(g)
-        timeout = bool(flags & _F_TIMEOUT)
-        overflow = bool(flags & _F_OVERFLOW)
+        timeout = bool(r.flags & _F_TIMEOUT)
+        overflow = bool(r.flags & _F_OVERFLOW)
+        uncertain = int(r.uncertain)
         if self._pending_gap and not timeout:
             overflow, self._pending_gap = True, False
-        return RawRead(samples=body, overflow_before=overflow, timeout=timeout, t_ns=int(t_ns),
-                       hw_time_ns=int(hw) if flags & _F_HWTIME else None)
+            uncertain, self._pending_uncertain = max(uncertain, self._pending_uncertain), 0
+        return RawRead(samples=r.body, overflow_before=overflow, timeout=timeout, t_ns=int(r.t_ns),
+                       hw_time_ns=int(r.hw_time_ns) if r.flags & _F_HWTIME else None, uncertain_samples=uncertain)
 
     def _close(self) -> None:
         if self._closed:

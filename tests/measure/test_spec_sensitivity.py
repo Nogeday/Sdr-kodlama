@@ -114,6 +114,7 @@ def test_sensitivity_pd_curve_matches_level_equation(tmp_path):
     assert f"Pfa tasarım {app.detect.pfa:g}, ölçülen ≤ {ex['pfa_empirical_upper95']:.1e}" in res.summary
     # MDS formula consistent with its own definition and with the Pd curve
     assert ex["mds_rbw_dbm"] == pytest.approx(ex["danl_dbm_hz"] + 10.0 * math.log10(RBW) + ex["snr_req_db"], abs=1e-6)
+    assert ex["mds_dbm_by_bw_hz"][f"{RBW:.6g}"] == pytest.approx(ex["mds_rbw_dbm"])
     assert ex["snr_req_db"] == pytest.approx(snr_truth, abs=1.0)
     assert abs(ex["sens_minus_mds_db"]) < 1.5
     # the tone sits on a bin centre and the in-situ ppm equals the simulated TCXO error
@@ -155,6 +156,11 @@ def test_sensitivity_without_source_reports_uncalibrated_mds(tmp_path):
     assert ex["danl_dbfs_hz"] == pytest.approx(dev.noise_density_dbfs_hz(g), abs=0.5)
     assert "kalibrasyonsuz" in res.summary and "MDS" in res.summary
     assert res.uncertainty is None
+    # MDS(B) per bandwidth B: the key names its unit and its index (B in Hz); MDS(RBW) is the value
+    assert "mds" not in ex and "mds_dbm_by_bw_hz" not in ex
+    by_bw = ex["mds_dbfs_by_bw_hz"]
+    assert by_bw[f"{RBW:.6g}"] == pytest.approx(res.value) == pytest.approx(ex["mds_rbw_dbfs"])
+    assert by_bw["25000"] == pytest.approx(ex["danl_dbfs_hz"] + 10.0 * math.log10(25e3) + ex["snr_req_db"])
 
 
 def test_sensitivity_with_power_calibration_table(tmp_path):

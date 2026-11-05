@@ -215,7 +215,7 @@ class InstBwMeasurement(Measurement):
                 setup_rx(dev, fc=prm["fc"], fs=fs, bw=bw, gain=gain,
                          tracking={"dc": True, "rf_dc": True, "quadrature": True})
             except ProfileViolation as e:
-                msg = f"fs {fmt_hz(fs)} / BW {fmt_hz(bw)} atlandı (profil ihlali: {e})"
+                msg = f"fs {fs / 1e6:g} MS/s / BW {fmt_hz(bw)} atlandı (profil ihlali: {e})"
                 log.warning(msg)
                 skipped.append(msg)
                 continue
@@ -421,12 +421,21 @@ class InstBwMeasurement(Measurement):
         for i, c in enumerate(results):
             if c.shot is None:
                 continue
+            fc_shot = float(c.shot.fc)
             mk = []
             if c.shot_f_hz is not None:
+                # the captured tone point nearest to the upper edge — NOT the edge itself: its own
+                # normalized response is stated; the interpolated edges are the vertical lines
                 kk = int(np.argmin(np.abs(c.shot.f_hz - c.shot_f_hz)))
-                mk.append((c.shot_f_hz, float(c.shot.p_db[kk]), "üst −3 dB kenarı"))
+                r_pt = float(np.interp(c.shot_f_hz - fc_shot, c.f_hz, c.resp_db))
+                mk.append((c.shot_f_hz, float(c.shot.p_db[kk]),
+                           f"en yakın ton noktası ({r_pt:.1f} dB)".replace("-", "−")))
             title = (f"Bant kenarı (fs {c.fs / 1e6:g} MS/s, BW {c.bw / 1e6:g} MHz)" if c.method == "ton"
                      else f"Gürültü şekli (fs {c.fs / 1e6:g} MS/s, BW {c.bw / 1e6:g} MHz)")
-            figs.append(spectrum_screenshot(c.shot, f"inst_bw_screenshot_{i}", title, markers=mk,
-                                            max_points=c.shot.n_bins))
+            fig = spectrum_screenshot(c.shot, f"inst_bw_screenshot_{i}", title, markers=mk, max_points=c.shot.n_bins)
+            e3 = c.edges[-3.0]
+            edge_label = "−3 dB kenarı" if not e3.limited else "−3 dB kenarı (açıklıkta bulunamadı, ≥)"
+            fig.vlines = [((fc_shot + f) / 1e6, edge_label) for f in (e3.lo_hz, e3.hi_hz)]
+            fig.info["−3 dB BW"] = f"{'≥ ' if e3.limited else ''}{e3.width_hz / 1e6:.2f} MHz"
+            figs.append(fig)
         return figs

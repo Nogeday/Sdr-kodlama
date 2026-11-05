@@ -121,10 +121,13 @@ yoksa SCPI için 10 ms, sim/manuel için 0. Beklenen süre `conditions`'a yazıl
 `stimulus.source_power_range(src, dev)` mutlak kaynağın ayarını, `relative_setting_cap` bağıl
 kaynağın ayarını doğrusal bir okumadan ekstrapole ederek sınırlar; `adjust_tone` ikisini de
 uygular (sensitivity, dynamic_range, inst_bw, freq_resolution, image_rejection), `df_rms`
-seviyelerini tavanla kırpar. Tavan ya da kaynağın üst gücü bir aramayı durdurursa sonuç
-**sınır** (≥) olarak işaretlenir. İstisna: `latency`'nin uyarlamalı ton seviyesi (tespit
-yoksa +20 dB adımlar) şu an yalnızca kaynağın kendi `power_range_db`'siyle sınırlıdır — TX→RX
-yolundaki **≥ 30 dB sabit zayıflatıcı** (HARDWARE §8) bu yüzden her durumda zorunludur.
+seviyelerini tavanla kırpar, `freq_resolution` iki-ton testinde ton başına ayarı
+`min(tek ton ayarı, tavan − 3 dB)` yapar (iki eşit tonun toplamı +3 dB), `latency`'nin
+uyarlamalı ton seviyesi aynı iki sınırı kullanır (bağıl kaynakta tavan, düğümün yayınladığı ton
+bant gücünden her okumada yeniden ekstrapole edilir). Tavan ya da kaynağın üst gücü bir aramayı
+durdurursa sonuç **sınır** (≥) olarak işaretlenir. Görünmeyen tona +20 dB adım okumasızdır
+(yalnız kaynak aralığı ve mutlak kaynakta tavanla sınırlı) — TX→RX yolundaki **≥ 30 dB sabit
+zayıflatıcı** (HARDWARE §8) bu yüzden her durumda zorunludur.
 
 ### 0.5 Raporlanan her sonuçta
 
@@ -153,8 +156,11 @@ desteklemeyen kaynak (`NotSupported`: sim, SCPI, manuel) için ofset `None`'dır
 
 `config/ktr_targets.toml`: `[<spec_id>] target`, `op` (`"<="` | `">="`), `note` ve isteğe
 bağlı `[<spec_id>.require]` (`<koşul>_min`, `<koşul>_max` (liste koşulunda en kötü öğe),
-`<koşul>_count_min`, diğerleri eşitlik; ör. `rbw_hz_max = 2000`, `headline_mode = "pipeline"`).
-Hedef dosyası tek doğruluk kaynağıdır; bilinmeyen anahtar/işlem hatadır.
+`<koşul>_count_min`, diğerleri eşitlik; anahtar önce `conditions`'ta, yoksa `extra`'da aranır;
+ör. `rbw_hz_max = 2000`, `headline_mode = "pipeline"`). Dosyada her ölçüm için yorum satırı
+olarak örnek taahhüt koşulları vardır (`scan_speed`: `span_hz_min` / `rbw_hz_max`, `max_rate`:
+`headline_mode` / `duration_s_min`, `image_rejection`: `fcs_hz_count_min`, `sensitivity`:
+`rbw_hz_max`). Hedef dosyası tek doğruluk kaynağıdır; bilinmeyen anahtar/işlem hatadır.
 
 Bir sonuç hedefini korur ama **karar verilmez** (`passed = None`, rapor
 **KARŞILAŞTIRILMADI** + Türkçe neden, `extra["verdict_note"]`) eğer:
@@ -166,12 +172,19 @@ Bir sonuç hedefini korur ama **karar verilmez** (`passed = None`, rapor
 * `extra["realtime"] is False` ya da `extra["coherent"] is False`,
 * birim spesifikasyonunkinden farklı (ör. kalibrasyonsuz `dBFS` duyarlılık) ya da dBm hedefi
   kalibrasyonsuz değerle karşılaşıyor,
-* bir `require` koşulu sağlanmıyor ya da sonuçta kayıtlı değil.
+* bir `require` koşulu sağlanmıyor ya da sonuçta kayıtlı değil,
+* değer bir **sınırdır** (özette “≥”/“≤”, `extra["value_bound"]` = `"lower"`/`"upper"`) ve
+  sınır kararı belirlemiyor (`targets.bound_reason`; neden: “değer alt sınırdır (≥ X) ve
+  hedefin altında — sonuçsuz” vb.):
 
-Sınır değerler (özette “≥”/“≤”, `extra["value_bound"]` = `"lower"`/`"upper"`) şu an karar
-mantığında ayrıca ele **alınmaz**: hedefe göre normal karşılaştırılır. Bir **alt sınırın**
-`≥` hedefinin altında kalması (ya da üst sınırın `≤` hedefinin üstünde kalması) “KALDI” değil
-**sonuçsuz** demektir — raporu okurken özet/`value_bound`'a bakın.
+  | Sınır | `op` | Karar yok (sonuçsuz) | Aksi halde |
+  |---|---|---|---|
+  | alt (gerçek ≥ X) | `>=` | X < hedef | GEÇTİ (X ≥ hedef) |
+  | alt (gerçek ≥ X) | `<=` | X ≤ hedef | KALDI (X > hedef) |
+  | üst (gerçek ≤ X) | `<=` | X > hedef | GEÇTİ (X ≤ hedef) |
+  | üst (gerçek ≤ X) | `>=` | X ≥ hedef | KALDI (X < hedef) |
+
+  Kararı belirleyen sınır normal karşılaştırılır (ör. `inst_bw` ≥ 19.5 MHz, hedef ≥ 18 → GEÇTİ).
 
 Simülatör sonuçları raporda “SİMÜLASYON VERİSİ” bandı ve şekil etiketiyle işaretlenir;
 `ad9364_pluto_ext` profiliyle alınan sonuçlar “SPESİFİKASYON DIŞI MOD” bandı taşır.
@@ -253,7 +266,7 @@ başarısız)”). Belirsizlik = %95 aralığın büyük yarısı ⊕ seviye bel
 (`sensitivity_worst_case`, pencerenin taraklanma kaybından) ayrıca verilir. Özet Pfa'yı
 “Pfa tasarım 1e-06, ölçülen ≤ x (%95, N bin)” biçiminde yazar.
 
-**Raporlanan.** Ek: DANL (birim/Hz), NF, N_RBW, MDS(B) tablosu, `snr_req_db` ve kaynağı,
+**Raporlanan.** Ek: DANL (birim/Hz), NF, N_RBW, MDS(B) (`mds_<birim>_by_bw_hz` = {B [Hz]: MDS}), `snr_req_db` ve kaynağı,
 `cfar_alpha_db`, `n_eff`, `pfa_pass`, ampirik Pfa ve üst sınırı, `snr_ci95_db`,
 `sensitivity_ci95`, `pd_fit_sigma_db`, `pd_fit_deviance`, deneme sayıları, `in_situ_ppm`,
 taraklanma kaybı, seviye belirsizliği bütçesi. Koşullar: dedektör türü/Pfa/guard/train/
@@ -333,7 +346,8 @@ spur'ları SFDR'yi sınırlayabilir → raporda kaynak belirtilir.
 **Değer ve belirsizlik.** Değer: `DR_anlık` (dB); belirsizlik = `bisect_db` (kaynaklı ölçümde).
 `extra["value_bound"] = "lower"` P_max tavan/kaynakla sınırlandıysa.
 
-**Raporlanan.** Ek: `p_max_dbfs`, `p_max_criterion`, `p1db_input`, `compression_at_p_max_db`,
+**Raporlanan.** Ek: `p_max_dbfs`, `p_max_criterion`, `p_max_input` / `p1db_input` / `clip_input` (+ birimleri
+`*_unit`: dBm ya da dBFS), `compression_at_p_max_db`,
 `small_signal_gain_db`, `clip_input`, SFDR dBc/dBFS, imaj hariç SFDR, baskın spur frekansı/
 imaj mı/ayrık mı, `close_in_max_dbc`, `source_artifacts`, `source_lo_offset_hz`,
 `dr_total_db` (+ yöntem, alt sınır mı, `p_max_gmin_criterion`, `p1db_input_gmin_dbm`,
@@ -392,7 +406,10 @@ sınırdır (≥, `value_bound = "lower"`).
 
 **Raporlanan.** Ek: −1 dB genişliği, düzlük, kenar frekansları, konfigürasyon başına sonuçlar,
 yöntem, `in_situ_ppm`, profil sınırı uygulandı mı. Şekiller: normalize yanıt eğrisi (−1/−3 dB
-çizgileri), konfigürasyon başına bant kenarı spektrum ekran görüntüsü.
+çizgileri; tek konfigürasyonda da açıklamada ölçülen −3 dB genişliği), konfigürasyon başına bant
+kenarı spektrum ekran görüntüsü: enterpole −3 dB kenarları dikey çizgi (“−3 dB kenarı”), işaretçi
+kenara en yakın ölçülen ton noktasıdır ve kendi normalize yanıtını yazar (“en yakın ton noktası
+(−x.x dB)”), bilgi kutusunda −3 dB genişliği.
 
 **Donanım notları.** 20 MS/s'de RX bayat tampon penceresi Pluto TX kuyruk gecikmesinden çok
 kısadır → her nokta kaynağın bekleme süresini bekler (yavaş ama doğru). Analog BW > fs ise −3
@@ -440,8 +457,9 @@ yeniden ziyaret süresi (açıklık küçükse ölçülen hızla ekstrapole).
 **Karar engeli.** Gerçek zamanlı olmayan simülatörde (`sim.realtime = false`) zamanlama
 anlamsızdır → `REASON_NONREALTIME` blocker.
 
-**Raporlanan.** Şekiller: adım dökümü (yığılmış çubuk), taramanın max-hold spektrum ekran
-görüntüsü (en güçlü tespitler işaretli).
+**Raporlanan.** Şekiller: adım dökümü (konfigürasyon başına yığılmış çubuk; x ekseninde
+konfigürasyon etiketi: fs, gerçek RBW / N, ortalama; çubuk üstünde ms/adım ve GHz/s), taramanın
+max-hold spektrum ekran görüntüsü (en güçlü tespitler işaretli).
 
 **Donanım notları.** Pluto'da adım süresine retune maliyeti hâkimdir: USB üzerinden libiio
 öznitelik yazımı, PLL kilidi ve her retune'dan sonra atılması gereken bayat tamponlar
@@ -476,7 +494,9 @@ birleştirici. Frekans doğruluğu: **referansa (GPSDO/10 MHz) kilitli** ürete�
 1. RBW hesaplanır; tek tonun −3 dB çizgi genişliği ×8 sıfır dolgulu Welch spektrumunda
    enterpolasyonla ölçülür (tonun binler arasındaki konumundan bağımsız).
 2. **İki-ton:** tonlar `fc + center_frac·fs ± Δf/2` (0.2·fs; yerinde `e` ile görünen
-   frekansa), ton başına `tone_dbfs` (−20 dBFS). Her ayrımda `captures` (4; hızlı 2) bağımsız
+   frekansa), ton başına `tone_dbfs` (−20 dBFS) için ayarlanan tek ton ayarı; iki tonun toplamı
+   (+3 dB) RX tavanını aşmasın diye ton başına ayar `min(tek ton ayarı, tavan − 3 dB)`
+   (`two_tone_setting_*`, `two_tone_backoff_db`). Her ayrımda `captures` (4; hızlı 2) bağımsız
    settled yakalamanın sıfır dolgulu spektrumları ortalanır (farklı göreli fazlar → evre-dışı
    ortalama); her gerçek frekansın ±RBW içinde birer yerel tepe ve aralarında ≥ `dip_db`
    (3 dB) çukur aranır. Δf, `sep_min_rbw … sep_max_rbw` × RBW (0.5…6) aralığında `sep_points`
@@ -695,8 +715,13 @@ kablo, `buffer_size` rapora yazılır.
    olarak raporlanır, değer olarak asla); `refine` (hızlı modda kapalı) ile son geçiş–ilk
    başarısızlık aralığı `refine_steps` (3) kez ikiye bölünür (1 kS/s ızgara).
 6. **Ayar matrisi:** `buffer_sizes = [...]` taşıma aramasını her tampon boyu için tekrarlar
-   (`extra["matrix"]`). Yalnız açılışta etkili cihaz argümanları çalışan ölçümle değiştirilemez:
-   her `[[device]].args` varyantı için ayrı koşun; etkin argümanlar `conditions["device_args"]`.
+   (`extra["matrix"]`); Pluto'da tampon boyu (akış argümanı `bufflen`) sürücünün okuduğu tek akış
+   ayarıdır. SoapyPlutoSDR cihaz argümanlarından yalnız `uri`, `hostname`, `label` okunur
+   (`serial` EDS'te `uri`'ye çözülür); `usb_direct`, `timeout`, `loopback`, `timestamp_every` gibi
+   diğerleri **yok sayılır**: ölçüm koşulu değildir, `conditions["device_args_ignored"]`'da
+   listelenir ve özette yazılır; `conditions["device_args"]` yalnız etkin argümanlardır. Sürücünün
+   yalnız açılışta okuduğu argümanlar (başka backend) çalışan ölçümle değiştirilemez: her
+   `[[device]].args` varyantı için ayrı koşun.
 
 **Raporlanan.** Değer: pipeline `fs_max` (MS/s; `extra["headline_mode"]`), özetin ilk cümlesi
 modu adlandırır (“Sistem düzeyi (DSP hattı açık: RxNode …)”); taşıma değeri, MB/s, USB 2.0
@@ -705,8 +730,15 @@ muhasebe yöntemi). Şekiller: overflow/kayıp – fs, MB/s – fs (USB2 sınır
 matrisi (varsa), en yüksek geçen hızda spektrum ekran görüntüsü. Gerçek zamanlı simülatörde özet, taşıma sınırının yapılandırılmış USB
 modelinden (`usb_bytes_per_s`) geldiğini yazar.
 
+**Karar engeli (overflow).** `conditions["overflow_source"]` cihazın kendi beyanıdır
+(`dma_status` / `driver` / `none`; beyan yoksa boş). Gerçek donanımda `none` (Pluto'da ince
+katman `control_uri` yok) ise örnek kaybı cihazca bildirilmez, yalnız sayımla aranır:
+`BLOCKER_NO_OVERFLOW` (“örnek kaybı algılanamaz: overflow sayacı bildirilmiyor …”), özette
+yazılır, hedef kararı verilmez. Şekillerde GEÇTİ/KALDI yeşil/kırmızı, sayım izni ve gerekli veri
+hızı gri (referans), overflow/zaman aşımı/host drop olayları amber (`Series.role`).
+
 **Donanım notları.** Pluto'da ince katman (`control_uri`) yoksa `overflow_source = "none"`:
-overflow algılanamaz, kayıp yalnız sayımla yakalanır. SoapyPlutoSDR yalnızca `uri`,
+overflow algılanamaz, kayıp yalnız sayımla yakalanır (karar engeli, yukarıda). SoapyPlutoSDR yalnızca `uri`,
 `hostname`, `label` ve akış argümanı `bufflen`'i okur; `usb_direct`, `timestamp_every`,
 `loopback`, `timeout` gibi argümanlar **yok sayılır** (EDS uyarır) — ölçüm koşulu değildir.
 KTR değeri için `duration_s = 60` önerilir (kısa T aralıklı overflow'u gizler); paylaşılan USB
@@ -740,7 +772,11 @@ soket yolu; `"inproc"`: yalnız süreç içi) ve tüketiciyi oynayan bir `Subscr
 
 * **Mod B — RF olayı gecikmesi** (kaynak varsa; KTR değeri). Ton `fc + offset_frac·fs`
   (0.15·fs), seviyesi hattın kendi raporladığı SNR'den uyarlanır (`snr_db` = 30, en az
-  `min_snr_db` = 25; mutlak/bağıl kaynak fark etmez). `n_events` (100; hızlı 6) kez: kaynak
+  `min_snr_db` = 25; mutlak/bağıl kaynak fark etmez) ve RX girişini `rx_max_input_dbm`'in üstüne
+  sürmez (mutlak kaynak: `source_power_range`; bağıl kaynak: `relative_setting_cap`, düğümün
+  yayınladığı ton bant gücünden — kalibrasyonlu düğümde dBm, değilse nominal seviye modeli). Ayar
+  birimiyle kaydedilir: `tone_power_dbm` (mutlak) / `tone_power_rel_db` (bağıl), üst sınırı
+  `tone_power_max_*`. `n_events` (100; hızlı 6) kez: kaynak
   kapalı → sessiz kare (kapamadan sonra başlayan, ton yakınında tespit içermeyen pencere;
   `quiet_timeout_s`) → rastgele bekleme (`hold_max_s`, 0 = 2 blok süresi; blok sınırlarıyla
   korelasyonu kırar, `seed` ile tekrarlanabilir) → kaynak açık → penceresi en erken olası
@@ -771,7 +807,8 @@ Gerçek zamanlı olmayan simülatörde `REASON_NONREALTIME` blocker.
 `source_timing` (tür, düzeltme, belirsizlik), Mod A dökümü, `usb_transfer_min_ms`, blok/kuyruk/fs/
 `spectrum_rate_hz`. Tablo: olay başına `t_rf_ns`, `t_rf_unc_ms`, gecikme. Şekiller: Mod B ve Mod A
 histogram/CDF (`kind = "hist"`, p50/p95(/p99) çizgileri), mod başına tek yığılmış döküm çubuğu
-(tepesi ortalama gecikme).
+(tepesi ortalama gecikme; x ekseninde mod ve örnek sayısı). Değer yuvarlanmadan saklanır (rapor
+basamakları biçimler).
 
 **Donanım notları.** Kuramsal alt sınır blok süresidir (65536 / 4 MS/s = 16.4 ms; ortalama
 ≈ 1.5 blok + işleme) → `block_size` gecikme–verim dengesi; Pluto TX kuyruğu (`4 × buffer_len / fs`)

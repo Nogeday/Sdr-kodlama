@@ -111,6 +111,35 @@ def test_expected_config_files_exist():
 
 
 # =============================================================================== every app config
+def _check_source_args(app: AppConfig, where: str) -> None:
+    """``measure.source_args`` are exactly what the stimulus class (via ``open_source``) takes."""
+    kind = app.measure.source
+    if kind == "none":
+        assert app.measure.source_args == {}
+        return
+    extra: set[str] = set()
+    if kind == "sim":
+        from eds.hal.sim.source import SimSignalSource as cls
+        implicit = {"world"}
+    elif kind == "pluto_tx":
+        from eds.hal.tx_hw import SoapyTxSource as cls
+        implicit = set()
+        extra = {"isolate"}                        # popped by open_source (process isolation)
+    elif kind == "scpi":
+        from eds.hal.tx_hw import ScpiSignalGenerator as cls
+        implicit = set()
+    else:
+        from eds.hal.tx_hw import ManualSource as cls
+        implicit = {"prompt"}
+    params = inspect.signature(cls.__init__).parameters
+    accepted = (set(params) - {"self"} - implicit) | extra
+    assert set(app.measure.source_args) <= accepted, (
+        f"{where}: unknown source_args {set(app.measure.source_args) - accepted}")
+    required = {n for n, p in params.items() if n != "self" and p.default is inspect.Parameter.empty
+                and p.kind not in (p.VAR_KEYWORD, p.VAR_POSITIONAL)}
+    assert required - implicit <= set(app.measure.source_args)
+
+
 @pytest.mark.parametrize("path", APP_CONFIGS, ids=_ids(APP_CONFIGS))
 class TestEveryAppConfig:
     def test_loads_strictly(self, path):
@@ -164,30 +193,7 @@ class TestEveryAppConfig:
         assert (CONFIG_DIR / app.measure.targets_file).resolve() == TARGETS_FILE.resolve()
 
     def test_source_args_match_source_constructor(self, path):
-        app = load_config(path)
-        kind = app.measure.source
-        if kind == "none":
-            assert app.measure.source_args == {}
-            return
-        if kind == "sim":
-            from eds.hal.sim.source import SimSignalSource as cls
-            implicit = {"world"}
-        elif kind == "pluto_tx":
-            from eds.hal.tx_hw import SoapyTxSource as cls
-            implicit = set()
-        elif kind == "scpi":
-            from eds.hal.tx_hw import ScpiSignalGenerator as cls
-            implicit = set()
-        else:
-            from eds.hal.tx_hw import ManualSource as cls
-            implicit = {"prompt"}
-        params = inspect.signature(cls.__init__).parameters
-        accepted = set(params) - {"self"}
-        assert set(app.measure.source_args) <= accepted - implicit, (
-            f"{path.name}: unknown source_args {set(app.measure.source_args) - accepted}")
-        required = {n for n, p in params.items() if n != "self" and p.default is inspect.Parameter.empty
-                    and p.kind not in (p.VAR_KEYWORD, p.VAR_POSITIONAL)}
-        assert required - implicit <= set(app.measure.source_args)
+        _check_source_args(load_config(path), path.name)
 
     def test_sim_scene_inside_official_band(self, path):
         app = load_config(path)
@@ -320,6 +326,14 @@ class TestRxPluto:
         # 20 MS/s = 80 MB/s exceeds USB2: valid only as settled bursts -> the profile warns
         _, warn = prof.check_rx(sample_rate_hz=app.sweep.sample_rate_hz)
         assert warn and "teorik" in warn[0]
+
+    def test_isolate_source_arg_is_accepted(self):
+        # documented in rx_pluto.toml: open_source pops "isolate" before SoapyTxSource(**args)
+        for v in (True, False):
+            _check_source_args(load_config(CONFIG_DIR / "rx_pluto.toml", {"measure.source_args.isolate": v}),
+                               "rx_pluto.toml + isolate")
+        with pytest.raises(AssertionError, match="unknown source_args"):
+            _check_source_args(load_config(CONFIG_DIR / "rx_pluto.toml", {"measure.source_args.bogus": 1}), "x")
 
     def test_tx_source(self, app):
         assert app.measure.source == "pluto_tx"

@@ -25,7 +25,7 @@ interface = "usb2"
 interface_max_bytes_per_s = 53.248e6
 interface_practical_bytes_per_s = 24e6
 bytes_per_sample = 4
-kernel_buffers = 4
+kernel_buffers = 4                         # retune sonrası bayat kalabilecek libiio çekirdek tamponu
 # Ölçüm prosedürlerinin RX girişine uygulayabileceği en yüksek uyaran seviyesi. AD936x RX
 # mutlak maksimum girişi ≈ +2.5 dBm; marj + düşük kazançta sıkışma (P1dB) için -5 dBm.
 rx_max_input_dbm = -5.0

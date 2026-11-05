@@ -210,3 +210,39 @@ def test_bearing_payload_validates_against_schema():
         with pytest.raises(ConfigError):
             edge.to_bus_payload(**bad)
     assert wrap_deg(p["phase_deg"]) == pytest.approx(p["phase_deg"])
+
+
+def test_non_finite_bearing_is_never_published_as_null():
+    pytest.importorskip("jsonschema")
+    from eds.bus import topics as T
+    from eds.bus.validate import validate_data
+
+    nan, inf = float("nan"), float("inf")
+    for kw in ({"az_deg": nan}, {"az_deg": inf}, {"az_deg": 10.0, "phase_deg": nan},
+               {"az_deg": 10.0, "ambiguous_deg": [30.0, -inf]}):
+        br = Bearing(**{"phase_deg": 5.0, "f_hz": 1e9, **kw})
+        with pytest.raises(MeasurementError, match="sonlu"):
+            br.to_bus_payload("a")
+    ok = Bearing(az_deg=10.0, phase_deg=5.0, coherence=nan, quality=inf, f_hz=1e9)
+    p = ok.to_bus_payload("a")
+    validate_data(T.DF_BEARING, p)
+    assert p["coherence"] == 0.0 and p["quality"] == 0.0
+
+
+def test_bearing_rejects_non_finite_samples_clearly():
+    rng = np.random.default_rng(3)
+    x0, x1 = _pair(rng, 10.0, 0.15)
+    ifm = Interferometer2(0.15)
+    for bad0, bad1 in ((np.nan, None), (None, np.inf)):
+        y0, y1 = x0.copy(), x1.copy()
+        if bad0 is not None:
+            y0[100] = bad0
+        if bad1 is not None:
+            y1[7] = complex(0.0, bad1)
+        with pytest.raises(MeasurementError, match="Kerteriz.*NaN/sonsuz"):
+            ifm.bearing(y0, y1, F)
+        with pytest.raises(MeasurementError, match="kalibrasyonu.*NaN/sonsuz"):
+            ifm.calibrate(y0, y1, F)
+    with pytest.raises(MeasurementError, match="sonlu değil"):
+        ifm.bearing(x0 * 1e300, x1 * 1e300, F)                  # finite samples, overflowing sums
+    assert math.isfinite(ifm.bearing(x0, x1, F).az_deg)

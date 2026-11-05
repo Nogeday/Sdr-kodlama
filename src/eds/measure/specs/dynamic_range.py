@@ -592,12 +592,13 @@ class DynamicRangeMeasurement(Measurement):
             extra.update({"clip_input": cs.ok.p_in, "clip_input_unit": unit_in, "clip_peak_dbfs": cs.ok.peak_dbfs,
                           "p_max_lower_bound": cs.limited, "p_max_criterion": cs.criterion,
                           "value_bound": "lower" if cs.limited else "",
-                          "p_max_input": cs.ok.p_in, "compression_at_p_max_db": cs.ok.compression_db,
+                          "p_max_input": cs.ok.p_in, "p_max_input_unit": unit_in,
+                          "compression_at_p_max_db": cs.ok.compression_db,
                           "small_signal_gain_db": cs.small_signal_gain_db})
             if cs.clip is not None:
-                extra["first_clip_input"] = cs.clip.p_in
+                extra.update({"first_clip_input": cs.clip.p_in, "first_clip_input_unit": unit_in})
             if cs.p1db_input is not None:
-                extra["p1db_input"] = cs.p1db_input
+                extra.update({"p1db_input": cs.p1db_input, "p1db_input_unit": unit_in})
         if sf is not None:
             spur, spur_ex = sf["spur"], sf["spur_ex_image"]
             extra.update({
@@ -645,7 +646,7 @@ class DynamicRangeMeasurement(Measurement):
         crit = f"; {cs.criterion}" if cs is not None and cs.ok is not None else ""
         lb_inst = "≥ " if cs is not None and cs.ok is not None and cs.limited else ""
         parts = [f"DR_anlık {lb_inst}{dr_inst:.1f} dB (G = {out['g_fix']:g} dB, RBW {fmt_hz(rbw, 4)}, "
-                 f"{fmt_hz(prm['fc'])}, fs {fmt_hz(prm['fs'])}; P_max {p_max:.1f} dBFS{crit}, N_RBW {n_rbw:.1f} dBFS)"]
+                 f"{fmt_hz(prm['fc'])}, fs {prm['fs'] / 1e6:g} MS/s; P_max {p_max:.1f} dBFS{crit}, N_RBW {n_rbw:.1f} dBFS)"]
         if sf is not None:
             what = "imaj" if sf["spur"]["is_image"] else "spur"
             bound = "≥ " if sf["spur"]["noise_limited"] else ""
@@ -720,15 +721,15 @@ class DynamicRangeMeasurement(Measurement):
             gain_ref = float(np.median(lin)) if lin else float(np.median([b - a for a, b in zip(x, y)]))
             xs = [min(x), max(x)]
             series = [Series(x=x, y=y, label="Ölçülen ton gücü", style="marker"),
-                      Series(x=xs, y=[v + gain_ref for v in xs], label="İdeal 1:1", style="line")]
+                      Series(x=xs, y=[v + gain_ref for v in xs], label="İdeal 1:1", style="line", role="ref")]
             clipped = [p for p in pts if self._is_clip(p, prm)]
             if clipped:
                 series.append(Series(x=[p.p_in for p in clipped], y=[p.tone_dbfs for p in clipped],
-                                     label="Kırpma", style="marker"))
+                                     label="Kırpma", style="marker", role="fail"))
             compressed = [p for p in pts if p.limit == COMPRESSION]
             if compressed:
                 series.append(Series(x=[p.p_in for p in compressed], y=[p.tone_dbfs for p in compressed],
-                                     label=f"≥ {prm['compression_db']:g} dB sıkışma", style="marker"))
+                                     label=f"≥ {prm['compression_db']:g} dB sıkışma", style="marker", role="warn"))
             markers = []
             if cs.ok is not None:
                 markers.append((cs.ok.p_in, cs.ok.tone_dbfs, f"P_max {cs.ok.tone_dbfs:.1f} dBFS ({cs.criterion})"))

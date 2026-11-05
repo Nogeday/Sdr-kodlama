@@ -55,6 +55,22 @@ def _clip01(v: float) -> float:
     return float(min(max(v, 0.0), 1.0)) if math.isfinite(v) else 0.0
 
 
+def _is_finite(v: Any) -> bool:
+    try:
+        return math.isfinite(float(v))
+    except (TypeError, ValueError):
+        return False
+
+
+def _checked_pair(x0: Any, x1: Any, what: str) -> tuple[np.ndarray, np.ndarray]:
+    """:func:`~eds.df.coherence._pair` with the operation named in the error (non-finite
+    samples — e.g. a corrupt block — would otherwise give a NaN bearing)."""
+    try:
+        return _pair(x0, x1)
+    except MeasurementError as e:
+        raise MeasurementError(f"{what} hesaplanamaz: {e} (bozuk blok: overflow / dönüşüm hatası?)") from e
+
+
 @dataclass
 class Bearing:
     """One interferometer bearing (degrees; see module docstring for conventions).
@@ -98,7 +114,18 @@ class Bearing:
 
     def to_bus_payload(self, array_name: str, t_acq_ns: int | None = None,
                        method: str = "interferometer2") -> dict[str, Any]:
-        """``df.bearing`` payload (contracts/schemas/df.bearing.schema.json)."""
+        """``df.bearing`` payload (contracts/schemas/df.bearing.schema.json).
+
+        Raises :class:`MeasurementError` when ``az_deg``, ``phase_deg`` or an
+        ``ambiguous_deg`` entry is not finite: the schema requires numbers there and the bus
+        would turn NaN into ``null`` (non-finite ``coherence`` / ``quality`` map to 0).
+        """
+        bad = [k for k, v in (("az_deg", self.az_deg), ("phase_deg", self.phase_deg)) if not _is_finite(v)]
+        if not all(_is_finite(a) for a in self.ambiguous_deg):
+            bad.append("ambiguous_deg")
+        if bad:
+            raise MeasurementError(f"Kerteriz yayınlanamaz: {', '.join(bad)} sonlu bir sayı değil (NaN/sonsuz); "
+                                   "df.bearing şeması sayı gerektirir")
         if not isinstance(array_name, str) or not array_name:
             raise ConfigError("Dizi adı (array_name) boş olmayan bir metin olmalı")
         if not isinstance(method, str) or not method:
@@ -225,7 +252,7 @@ class Interferometer2:
         the ``cal.result`` coherence payload.
         """
         f_hz = float(f_hz)
-        a, b = _pair(x0, x1)
+        a, b = _checked_pair(x0, x1, "Interferometre kalibrasyonu")
         resolvable = False
         peak = math.nan
         if estimate_delay:
@@ -262,9 +289,13 @@ class Interferometer2:
                 *, fs: float | None = None) -> Bearing:
         """Bearing of the signal common to ``x0`` / ``x1`` (optionally isolated by an FFT band
         mask ``f_bb_hz ± bw_hz/2``, baseband Hz, which needs ``fs``; default width
-        :data:`DEFAULT_MASK_BINS` bins)."""
+        :data:`DEFAULT_MASK_BINS` bins). Raises :class:`MeasurementError` for non-finite
+        input samples or a non-finite phase (e.g. overflowing sample values)."""
         dl = self.d_over_lambda(f_hz)
-        phi, coh = self._phase(x0, x1, fs, f_bb_hz, bw_hz, self.delay_cal_samples)
+        a, b = _checked_pair(x0, x1, "Kerteriz")
+        phi, coh = self._phase(a, b, fs, f_bb_hz, bw_hz, self.delay_cal_samples)
+        if not (math.isfinite(phi) and math.isfinite(coh)):
+            raise MeasurementError("Kerteriz: faz farkı/koherens sonlu değil (örnek değerleri taşıyor mu?)")
         dphi = float(wrap_rad(phi - self.phase_cal_rad))
         s0 = dphi / (2.0 * math.pi * dl)
         # principal solution (k = 0); |s0| > 1 is only possible for d <= λ/2 (noise / cal error)

@@ -10,8 +10,11 @@ must never hold more than one Pluto. :func:`isolation_plan` decides where each d
 * ``"auto"``: a soapy device whose driver is ``plutosdr`` (``args.driver``, else the
   profile's ``soapy_driver``) runs in a worker process (:class:`~eds.hal.proc.ProcessRxDevice`)
   when the process would otherwise hold more than one Pluto: the Pluto devices opened
-  together PLUS a ``pluto_tx`` measurement source that runs in-process. Everything else
-  (sim devices, non-Pluto radios, a single Pluto) stays in-process.
+  together PLUS a ``pluto_tx`` measurement source that runs in-process PLUS any Pluto that is
+  ALREADY open in this process (:func:`plutos_open_in_process`: the
+  :func:`~eds.hal.soapy_backend.claim_pluto` registry, e.g. a device or ``pluto_tx`` source
+  the CLI opened earlier). Everything else (sim devices, non-Pluto radios, a single Pluto)
+  stays in-process.
 
 Decision table for ``"auto"`` (what the process would hold → placement):
 
@@ -21,16 +24,20 @@ Decision table for ``"auto"`` (what the process would hold → placement):
                                                       worker (``open_source`` isolates it)
 1 Pluto + ``pluto_tx`` with ``source_args.isolate     DUT in a worker process (the source
 = false``                                             stays in-process)
+1 Pluto while another Pluto is already open in this   the new Pluto in a worker process
+process (claim_pluto registry)
 1 Pluto alone / sim devices / non-Pluto soapy         in-process
 ====================================================  ========================================
 
-:func:`open_device` honours ``dev.isolation`` alone (``"auto"`` = in-process: one device
-cannot conflict with itself); :func:`open_devices` / :func:`open_group` apply the plan.
+:func:`open_device` honours ``dev.isolation``; ``"auto"`` puts a Pluto in a worker only when
+a Pluto is already open in this process (a single device cannot conflict with itself);
+:func:`open_devices` / :func:`open_group` apply the plan.
 """
 
 from __future__ import annotations
 
 import logging
+import sys
 from typing import Any
 
 from ..core.config import AppConfig, DeviceConfig
@@ -80,6 +87,14 @@ def pluto_tx_in_process(app: AppConfig) -> bool:
     return app.measure.source == "pluto_tx" and not pluto_tx_isolated(app.measure.source_args)
 
 
+def plutos_open_in_process() -> list[str]:
+    """Owners of the SoapyPlutoSDR devices already open in THIS process (RX devices and
+    ``pluto_tx`` sources register with :func:`eds.hal.soapy_backend.claim_pluto`). Empty when
+    the Soapy backend was never imported (then nothing can hold a Pluto here)."""
+    mod = sys.modules.get(f"{__package__}.soapy_backend")
+    return list(mod.open_pluto_owners()) if mod is not None else []
+
+
 def _check_mode(dev: DeviceConfig) -> str:
     mode = str(dev.isolation)
     if mode not in ISOLATION_MODES:
@@ -93,14 +108,16 @@ def isolation_plan(app: AppConfig, devices: list[DeviceConfig] | None = None) ->
     devs = list(app.devices if devices is None else devices)
     plutos = {d.name for d in devs if is_pluto_config(d)}
     src_inproc = pluto_tx_in_process(app)
-    crowded = len(plutos) + int(src_inproc) > 1
+    held = plutos_open_in_process()
+    crowded = len(plutos) + int(src_inproc) + len(held) > 1
     plan: dict[str, str] = {}
     for d in devs:
         mode = _check_mode(d)
         if mode == "auto":
             mode = "subprocess" if crowded and d.name in plutos else "inproc"
         plan[d.name] = mode
-    left = sorted(n for n in plutos if plan[n] == "inproc") + (["measure.source=pluto_tx"] if src_inproc else [])
+    left = (sorted(n for n in plutos if plan[n] == "inproc") + (["measure.source=pluto_tx"] if src_inproc else [])
+            + [f"zaten açık: {h}" for h in held])
     if len(left) > 1:
         log.warning("Bu süreçte %d Pluto aynı anda açılacak (%s): SoapyPlutoSDR süreç başına TEK libiio bağlamı "
                     "tutar, ikinci Pluto sessizce birinciye bağlanır ve birini kapatmak diğerinin bağlamını yok "
@@ -131,9 +148,16 @@ def _open(dev: DeviceConfig, app: AppConfig | None, mode: str) -> RxDevice:
 
 def open_device(dev: DeviceConfig, app: AppConfig | None = None) -> RxDevice:
     """Open one device; ``dev.isolation = "subprocess"`` runs it in a worker process
-    (:class:`~eds.hal.proc.ProcessRxDevice`), ``"auto"`` / ``"inproc"`` in this process."""
+    (:class:`~eds.hal.proc.ProcessRxDevice`), ``"inproc"`` in this process. ``"auto"`` runs it
+    in this process unless it is a Pluto and another Pluto is already open here
+    (:func:`plutos_open_in_process`): then it goes to a worker."""
     mode = _check_mode(dev)
-    return _open(dev, app, "subprocess" if mode == "subprocess" else "inproc")
+    if mode == "auto":
+        held = plutos_open_in_process() if is_pluto_config(dev) else []
+        if held:
+            log.info("%s: bu süreçte zaten açık Pluto var (%s); cihaz alt süreçte açılıyor", dev.name, ", ".join(held))
+        mode = "subprocess" if held else "inproc"
+    return _open(dev, app, mode)
 
 
 def open_devices(app: AppConfig, names: list[str] | None = None) -> list[RxDevice]:

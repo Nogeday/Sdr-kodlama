@@ -110,7 +110,11 @@ def test_scan_speed_configs_repeats_and_profile_skip(tmp_path):
     assert {r["config"] for r in res.table} == {c["config"] for c in ex["configs"]}
     assert "istenen RBW" in ex["skipped_configs"][0]["config"]
     bars = next(f for f in res.figures if f.name == "scan_speed_step_breakdown")
-    assert [m[2].split(" — ")[0] for m in bars.markers] == [c["config"] for c in ex["configs"]]
+    # every bar is named on the x axis by its configuration; the markers give ms/step and the rate
+    assert [t[1].replace("\n", ", ") for t in bars.xticks] == [c["config"] for c in ex["configs"]]
+    assert [t[0] for t in bars.xticks] == [1.0, 2.0, 3.0]
+    assert [m[2] for m in bars.markers] == [
+        f"{sum(c[f'{k}_ms'] for k in TIMING_KEYS):.2f} ms/adım, {c['rate_ghz_per_s']:.3f} GHz/s" for c in ex["configs"]]
     assert res.conditions["rbw_hz"] == ex["rbw_hz"] and res.conditions["rbw_requested_hz"] == 50e3
     assert len(ex["skipped_configs"]) == 1 and ex["skipped_configs"][0]["fs_hz"] == 80e6
     assert "MS/s" in ex["skipped_configs"][0]["reason"]

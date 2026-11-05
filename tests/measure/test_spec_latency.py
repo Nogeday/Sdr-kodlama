@@ -133,7 +133,12 @@ def test_latency_realtime_sim_mode_b_detects_every_event(tmp_path):
         assert all(s.style == "bar" and s.x == [1.0] for s in f.series) and len(f.series) == n
         assert max(s.y[0] for s in f.series) == pytest.approx(sum(max(v, 0.0) for v in ex[key].values()))
         assert not any("Pencere" in s.label for s in f.series)
+        assert len(f.xticks) == 1 and f.xticks[0][0] == 1.0 and f.xticks[0][1].startswith("Mod " + name.split("_")[2].upper())
     assert res.conditions["block_size"] == BLOCK and res.conditions["transport"] == "tcp"
+    # the tone setting carries its unit (simulator source = absolute dBm) and respects the RX ceiling
+    assert "tone_power" not in res.conditions and "power" not in tone
+    assert res.conditions["tone_power_dbm"] == tone["power_dbm"] <= res.conditions["rx_max_input_dbm"] == -5.0
+    assert res.value == ex["mode_b_p95_ms"]                       # unrounded (the report formats digits)
     # the node's hardware ppm correction was undone; the device is idle again
     assert ctx.dut.ppm_hw == 0.0 and not ctx.dut.streaming
 
@@ -253,3 +258,89 @@ def test_latency_rf_on_instant_of_real_sources(tmp_path, kind, kw):
         assert blocked is (timing["uncertainty_ms"] > 0.5 * res.value)
     assert res.conditions["source_timing_unc_ms"] == timing["uncertainty_ms"]
     assert f"±{timing['uncertainty_ms']:.2f} ms" in res.summary
+
+
+# --------------------------------------------------------------------------- tone level ceiling
+class _LevelWorld:
+    """Fake pipeline for the adaptive level loop: the tone's dBFS level follows the RX input
+    exactly through the nominal level model (dBFS = dBm + G − 5), the node publishes its band
+    power in dBFS and its SNR against a fixed noise floor; it is detected above 6 dB SNR."""
+
+    G, NOISE_DBFS = 50.0, -60.0
+
+    def __init__(self, absolute: bool, anchor_dbm: float = -50.0):
+        self.absolute, self.anchor = absolute, anchor_dbm
+        self.setting = math.nan
+        self.inputs: list[float] = []
+
+    def input_dbm(self, setting: float) -> float:
+        return setting if self.absolute else setting + self.anchor
+
+
+class _LevelSource:
+    name = "fake"
+
+    def __init__(self, world: _LevelWorld):
+        self.w = world
+        self.absolute_power = world.absolute
+        self.power_range_db = (-140.0, 0.0) if world.absolute else (-90.0, 0.0)
+
+    def set_frequency(self, hz):
+        return hz
+
+    def set_power(self, p):
+        self.w.setting = float(p)
+        return float(p)
+
+    def set_enabled(self, on):
+        if on:
+            self.w.inputs.append(self.w.input_dbm(self.w.setting))
+        return now_ns()
+
+
+class _LevelSub:
+    def __init__(self, world: _LevelWorld, f_src: float):
+        self.w, self.f = world, f_src
+
+    def recv(self, timeout):
+        from types import SimpleNamespace
+
+        from eds.bus.topics import RX_DETECTIONS
+
+        level = self.w.input_dbm(self.w.setting) + self.w.G - 5.0
+        snr = level - self.w.NOISE_DBFS
+        dets = [{"f_peak_hz": self.f, "snr_db": snr, "band_power_db": level}] if snr > 6.0 else []
+        return SimpleNamespace(topic=RX_DETECTIONS, data={"t_acq_ns": now_ns() + 10**12, "unit": "dBFS",
+                                                         "detections": dets})
+
+
+@pytest.mark.parametrize("absolute", [True, False], ids=["absolute", "relative"])
+def test_latency_tone_level_respects_rx_ceiling(absolute):
+    """The adaptive level must not drive the RX input above the profile ceiling: 30 dB SNR
+    would need −75 dBm, the ceiling is −80 dBm (absolute source: capped by
+    source_power_range; relative source: cap extrapolated from the published tone level)."""
+    import dataclasses
+    from types import SimpleNamespace
+
+    from eds.core.profile import load_profile
+    from eds.measure.base import MeasurementContext
+    from eds.measure.specs.latency import LatencyMeasurement
+
+    world = _LevelWorld(absolute)
+    src = _LevelSource(world)
+    prof = dataclasses.replace(load_profile("ad9363_pluto"), rx_max_input_dbm=-80.0)
+    dev = SimpleNamespace(gains=(world.G,), profile=prof, fs=FS)
+    m = LatencyMeasurement(MeasurementContext(app=AppConfig(), devices=[dev], source=src))
+    prm = {"snr_db": 30.0, "event_timeout_s": 0.5}
+    level = m._set_level(_LevelSub(world, FC), SimpleNamespace(device=dev), prm, None, FC, 5e3, 0)
+    key = "power_dbm" if absolute else "power_rel_db"
+    assert max(world.inputs) <= -80.0 + 1e-9 and world.input_dbm(level[key]) == pytest.approx(-80.0)
+    assert level["snr_db"] == pytest.approx(25.0) and level["rx_max_input_dbm"] == -80.0
+    assert level["power_unit"] == ("dBm" if absolute else "dB (bağıl)")
+    assert m.setting_key(src) == ("tone_power_dbm" if absolute else "tone_power_rel_db")
+    # without a ceiling the same loop reaches the SNR target (the cap is what stopped it)
+    world2 = _LevelWorld(absolute)
+    dev2 = SimpleNamespace(gains=(world.G,), profile=dataclasses.replace(prof, rx_max_input_dbm=10.0), fs=FS)
+    m2 = LatencyMeasurement(MeasurementContext(app=AppConfig(), devices=[dev2], source=_LevelSource(world2)))
+    level2 = m2._set_level(_LevelSub(world2, FC), SimpleNamespace(device=dev2), prm, None, FC, 5e3, 0)
+    assert abs(level2["snr_db"] - 30.0) <= 3.0 and max(world2.inputs) > -80.0

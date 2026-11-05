@@ -34,10 +34,10 @@ interface = "usb2"
 interface_max_bytes_per_s = 53.248e6       # USB 2.0 HS bulk teorik (13×512 B / 125 µs)
 interface_practical_bytes_per_s = 24e6     # libiio+USB2 pratik eşik (uyarı için; ölçümle güncelleyin)
 bytes_per_sample = 4                       # 16-bit I + 16-bit Q (12-bit veri)
-kernel_buffers = 4
+kernel_buffers = 4                         # retune sonrası bayat kalabilecek libiio çekirdek tamponu
 # Ölçüm prosedürlerinin RX girişine uygulayabileceği en yüksek uyaran seviyesi. AD936x RX
 # mutlak maksimum girişi ≈ +2.5 dBm; marj + düşük kazançta sıkışma (P1dB) için -5 dBm.
-rx_max_input_dbm = -5.0                         # retune sonrası bayat kalabilecek libiio çekirdek tamponu
+rx_max_input_dbm = -5.0
 default_buffer_size = 65536
 
 # max_rate ölçümünde denenecek hızlar (S/s)

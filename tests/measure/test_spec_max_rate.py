@@ -334,3 +334,52 @@ def test_wall_clock_detects_one_silently_dropped_buffer(tmp_path):
     assert row["status"] == "KALDI"
     assert row["lost_samples"] == pytest.approx(16384, abs=2000)
     assert row["allowed_lost_samples"] == pytest.approx(8192)
+
+
+class BlindPlutoRx(PacedRx):
+    """Pluto-like receiver whose driver reports no overflow (``overflow_source = "none"``:
+    no thin libiio layer) opened with arguments SoapyPlutoSDR partly ignores."""
+
+    overflow_source = "none"
+
+    def __init__(self):
+        super().__init__()
+        self.cfg = DeviceConfig(name="paced", backend="soapy", args={
+            "driver": "plutosdr", "uri": "usb:1.5.5", "usb_direct": "1", "timeout": "500",
+            "stream:bufflen": "16384", "stream:loopback": "0"})
+
+
+@pytest.mark.realtime
+def test_max_rate_blind_overflow_and_ignored_pluto_args(tmp_path):
+    """Real hardware without an overflow counter: no verdict (blocker named in the summary);
+    driver-ignored Pluto args are not reported as measurement conditions."""
+    from eds.measure.specs.max_rate import BLOCKER_NO_OVERFLOW
+
+    res = _run_paced(tmp_path, BlindPlutoRx())
+    assert res.status == "ok", (res.error, res.extra.get("traceback"))
+    c = res.conditions
+    assert c["overflow_source"] == "none" and res.extra["overflow_source"] == "none"
+    assert BLOCKER_NO_OVERFLOW in res.blockers and BLOCKER_NO_OVERFLOW in res.summary
+    assert c["device_args"] == {"driver": "plutosdr", "uri": "usb:1.5.5", "stream:bufflen": "16384"}
+    assert c["device_args_ignored"] == ["stream:loopback", "timeout", "usb_direct"]
+    assert "usb_direct" in res.summary
+    # the clean paced device (no overflow_source attribute) is not blocked and lists no ignored args
+    clean = _run_paced(tmp_path, PacedRx())
+    assert BLOCKER_NO_OVERFLOW not in clean.blockers and clean.conditions["overflow_source"] == ""
+    assert "device_args_ignored" not in clean.conditions
+
+
+def test_max_rate_figure_roles_are_explicit():
+    from types import SimpleNamespace
+
+    from eds.measure.specs.max_rate import MaxRateMeasurement
+
+    out = {"transport": evaluate("transport", [_t(1e6, True), _t(2e6, False)])}
+    loss = MaxRateMeasurement._loss_figure(out, {"duration_s": 1.0, "buffer_size": 65536})
+    roles = {s.label.split(" — ")[0]: s.role for s in loss.series}
+    assert roles["GEÇTİ"] == "pass" and roles["KALDI"] == "fail"
+    assert roles["sayım izni [örnek]"] == "ref" and roles["overflow + zaman aşımı + host drop [olay]"] == "warn"
+    prof = SimpleNamespace(bytes_per_sample=4, interface="USB 2.0", interface_max_bytes_per_s=53.248e6,
+                           interface_practical_bytes_per_s=24e6)
+    thr = MaxRateMeasurement._throughput_figure(out, prof)
+    assert [s.role for s in thr.series] == ["ref", "pass", "fail"]

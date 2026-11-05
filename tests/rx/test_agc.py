@@ -11,9 +11,10 @@ import pytest
 from eds.core.config import AgcConfig, AppConfig, DeviceConfig, RxConfig, SimConfig
 from eds.core.errors import ConfigError
 from eds.core.types import IQBlock
-from eds.dsp.levels import iq_levels
+from eds.dsp.levels import IQLevels, iq_levels
 from eds.hal import open_device
 from eds.rx import GainController, RxStreamer, classify_levels, gain_delta_db, validate_agc_config
+from eds.rx.agc import COMPRESSION_SLOPE_MAX, gain_slope
 
 # eds.hal.factory caches one SimWorld per id(AppConfig): keep configs alive so ids are unique.
 _APPS: list[AppConfig] = []
@@ -251,3 +252,82 @@ def test_agc_as_streamer_callback():
     assert [g for _, g in agc.history] == [50.0, 40.0, 30.0]
     late = [b for b in s.drain() if not b.settling and b.gain_db == (30.0,)]
     assert late and all(iq_levels(b.samples).clip_fraction == 0.0 for b in late)
+
+
+# --------------------------------------------------------------------------- front-end compression
+def _lv(peak: float, rms: float | None = None, clip: float = 0.0) -> IQLevels:
+    return IQLevels(peak_dbfs=peak, rms_dbfs=peak if rms is None else rms, clip_fraction=clip, dc_dbfs=-90.0, n=4096)
+
+
+def test_gain_slope_only_judges_valid_pairs():
+    cfg = AgcConfig()                                       # target -10 dBFS, max_clip_fraction 1e-5
+    assert gain_slope(_lv(-5.0), 10.0, _lv(-15.0), 0.0, cfg) == pytest.approx(1.0)
+    assert gain_slope(_lv(-15.0), 0.0, _lv(-5.0), 10.0, cfg) == pytest.approx(1.0)      # order-free
+    assert gain_slope(_lv(-4.0), 6.0, _lv(-8.4), 0.0, cfg) == pytest.approx(4.4 / 6.0)
+    # noise-like: the peak may drop less than the RMS by chance -> the larger slope counts
+    assert gain_slope(_lv(-4.0, -12.0), 6.0, _lv(-9.0, -18.0), 0.0, cfg) == pytest.approx(1.0)
+    assert gain_slope(_lv(-5.0), 2.0, _lv(-7.0), 0.0, cfg) is None                   # step < 3 dB
+    assert gain_slope(_lv(0.0, clip=0.01), 10.0, _lv(-6.0), 0.0, cfg) is None         # ADC clipped
+    assert gain_slope(_lv(-20.0), 10.0, _lv(-30.0), 0.0, cfg) is None                 # weak signal
+    assert gain_slope(_lv(-9.0, -45.0), 10.0, _lv(-19.0, -55.0), 0.0, cfg) is None    # near the ADC floor
+
+
+def test_settle_flags_front_end_compression_at_minimum_gain():
+    # +10 dBm with the simulator's RF compression: the front end saturates below full scale,
+    # so the level looks normal (-5 dBFS, no clipping) — formerly reported as a good "ok" settle
+    dev = sim_device([strong(+10.0)], gain=40.0)
+    agc = GainController(dev, AgcConfig())
+    g = agc.settle()
+    assert agc.last_settle_status == "too_strong" and agc.compressed
+    assert g == dev.gain_range().min_db == -1.0 and dev.gains[0] == g
+    assert agc.last_gain_slope < COMPRESSION_SLOPE_MAX
+    lv = agc.last_levels
+    assert lv.clip_fraction == 0.0 and AgcConfig().low_peak_dbfs <= lv.peak_dbfs <= AgcConfig().high_peak_dbfs
+    assert dev.compression_db(10.0, g) > 5.0                                        # ground truth
+    assert [h for _, h in agc.history][-1] == -1.0
+    agc.reset()
+    assert not agc.compressed and agc.last_gain_slope is None
+
+
+@pytest.mark.parametrize("p_dbm, start_gain", [(3.0, 40.0), (5.0, 71.0), (20.0, 71.0)])
+def test_settle_compression_detected_from_any_start(p_dbm, start_gain):
+    dev = sim_device([strong(p_dbm)], gain=start_gain)
+    agc = GainController(dev, AgcConfig())
+    agc.settle()
+    assert agc.last_settle_status == "too_strong" and dev.compression_db(p_dbm) > 2.0
+
+
+def test_settle_verifies_a_linear_strong_signal_without_side_effects():
+    dev = sim_device([strong(-30.0)], gain=60.0)
+    agc = GainController(dev, AgcConfig())
+    assert agc.settle() == 30.0 and agc.last_settle_status == "ok"
+    assert not agc.compressed and agc.last_gain_slope == pytest.approx(1.0, abs=0.03)   # probe ran
+    assert [g for _, g in agc.history] == [50.0, 40.0, 30.0]           # probe and restore not recorded
+    assert dev.gains[0] == 30.0 and agc.last_levels.peak_dbfs == pytest.approx(-5.0, abs=0.3)
+    # 1 dB compressed (0 dBm): still a usable, "ok" settle
+    dev2 = sim_device([strong(0.0)], gain=40.0)
+    agc2 = GainController(dev2, AgcConfig())
+    agc2.settle()
+    assert agc2.last_settle_status == "ok" and agc2.last_gain_slope > COMPRESSION_SLOPE_MAX
+
+
+def test_continuous_update_flags_compression_from_its_own_attack():
+    # +10 dBm at 3 dB gain: peak ≈ -2 dBFS without clipping -> attack to the minimum gain; the
+    # first block at the new gain moves 0.73 dB per dB instead of 1
+    dev = sim_device([strong(+10.0)], gain=3.0)
+    agc = GainController(dev, AgcConfig())
+    dev.start_stream()
+    for _ in range(30):
+        agc.update(dev.read(BUF))
+    dev.close()
+    assert [g for _, g in agc.history] == [-1.0]
+    assert agc.compressed and agc.last_gain_slope == pytest.approx(0.73, abs=0.05)
+    # linear: -30 dBm at 33 dB (-2 dBFS, no clipping) -> 23 dB, slope 1
+    dev = sim_device([strong(-30.0)], gain=33.0)
+    agc = GainController(dev, AgcConfig())
+    dev.start_stream()
+    for _ in range(30):
+        agc.update(dev.read(BUF))
+    dev.close()
+    assert [g for _, g in agc.history] == [23.0]
+    assert not agc.compressed and agc.last_gain_slope == pytest.approx(1.0, abs=0.03)

@@ -16,7 +16,7 @@ import time
 import numpy as np
 import pytest
 
-from eds.core.config import AppConfig, DeviceConfig, config_from_dict
+from eds.core.config import AppConfig, DeviceConfig, RxConfig, config_from_dict
 from eds.core.errors import (
     ConfigError,
     DeviceError,
@@ -247,6 +247,156 @@ def test_overflow_timeout_and_errors_match_inproc(opened):
     st = b.stats
     assert (st.overflows, st.timeouts, st.discarded_samples) == (2, 1, 100)
     assert b.describe()["fake"]["started_with"] == 256
+
+
+# a Pluto-like backend: DMA-status overflow with an uncertain span, a driver buffer (bufflen) larger
+# than buffer_size, detection switched off mid-stream; 20 plain reads first (the start-up flush)
+PLUTO_SCRIPT = [{}] * 20 + [
+    {"k": 256, "overflow": True, "uncertain": -1, "dma": True},  # gap somewhere in the next settle_samples
+    {"k": 256, "ovf_source": "none"},                             # DMA poll failed: detection off
+]
+MIRRORED = ("overflow_source", "dma_overflow_events", "thin_serial_verified", "stream_mtu")
+
+
+def _attrs(dev) -> dict:
+    return {k: getattr(dev, k, "<yok>") for k in MIRRORED}
+
+
+def _pluto_session(dev) -> dict:
+    out: dict = {"open": _attrs(dev)}
+    dev.set_sample_rate(1e6)
+    dev.start_stream(256)
+    out["start"] = (dev.buffer_size, dev.settle_buffers, dev.settle_samples, dev._settle_until, _attrs(dev))
+    out["flushed"] = dev.flush(0.5)
+    b1 = dev.read(256)                         # DMA overflow: no control call before the checks below
+    out["b1"] = (block_key(b1, with_time=False), dev._settle_until, _attrs(dev))
+    b2 = dev.read(256)
+    out["b2"] = (block_key(b2, with_time=False), _attrs(dev))
+    blk = dev.capture(256)
+    out["settled"] = (block_key(blk, with_time=False), blk.samples.copy())
+    out["stats"] = stats_key(dev.stats)
+    dev.stop_stream()
+    dev.start_stream(300)                      # the backend rounds buffer_size up (round_buffer)
+    out["restart"] = (dev.buffer_size, dev.settle_samples, dev._settle_until)
+    return out
+
+
+def test_backend_state_uncertain_span_and_settle_window_match_inproc(opened):
+    """What the RX node / measurements read from a Pluto (overflow_source, dma_overflow_events,
+    thin_serial_verified ...), the DMA overflow's uncertain span and the bufflen-based settling
+    window are the same through the worker as in-process."""
+    cfg = fake_cfg(script=PLUTO_SCRIPT, pluto_like=True, mtu=1024, round_buffer=256)
+    a, b = open_fake(cfg), ProcessRxDevice(cfg, opener=FAKE)
+    opened += [a, b]
+    ra, rb = _pluto_session(a), _pluto_session(b)
+    for key in ("open", "start", "flushed", "b1", "b2", "stats", "restart"):
+        assert ra[key] == rb[key], key
+    assert ra["settled"][0] == rb["settled"][0]
+    np.testing.assert_array_equal(ra["settled"][1], rb["settled"][1])
+    assert rb["open"] == {"overflow_source": "dma_status", "dma_overflow_events": 0,
+                          "thin_serial_verified": True, "stream_mtu": 0}
+    settle = 5 * 1024                                        # settle_buffers x max(buffer_size, bufflen)
+    assert rb["start"] == (256, 5, settle, settle, {**rb["open"], "stream_mtu": 1024})
+    key1, until1, attrs1 = rb["b1"]
+    assert key1[6] is True and key1[7] is True               # overflow before b1, b1 settling
+    assert until1 == key1[0] + settle                        # uncertain span = settle_samples from b1 on
+    assert attrs1["dma_overflow_events"] == 1                # mirrored with the read reply itself
+    assert rb["b2"][1]["overflow_source"] == "none"
+    assert not rb["settled"][0][7] and rb["settled"][0][0] >= key1[0] + settle
+    assert rb["restart"][:2] == (512, 5 * 1024)              # adopted from the worker
+    d = b.describe()
+    assert d["isolation"]["mode"] == "subprocess" and d["buffer_size"] == 512
+
+
+def _soapy_session(dev) -> dict:
+    out: dict = {"open": {k: getattr(dev, k, "<yok>") for k in proc_attrs()}, "ppm": (dev.ppm_hw, dev.ppm_hw_via)}
+    out["warn"] = dev.configure(RxConfig(center_freq_hz=915e6, sample_rate_hz=2.4e6, bandwidth_hz=2e6,
+                                         gain_db=40.0, buffer_size=1024))
+    dev.start_stream()
+    out["start"] = (dev.buffer_size, dev.settle_samples, dev._settle_until)
+    out["blocks"] = [block_key(dev.read(4096), with_time=False) for _ in range(8)]
+    out["after"] = ({k: getattr(dev, k, "<yok>") for k in proc_attrs()}, dev._settle_until)
+    blk = dev.capture(4096)
+    out["settled"] = (block_key(blk, with_time=False), blk.samples.copy())
+    out["stats"] = stats_key(dev.stats)
+    return out
+
+
+def proc_attrs() -> tuple:
+    from eds.hal.proc import MIRRORED_ATTRS
+
+    return MIRRORED_ATTRS
+
+
+def test_real_soapy_pluto_in_the_worker_matches_inproc(opened, monkeypatch):
+    """SoapyRxDevice (Pluto, thin layer, DMA status register, stream:bufflen) on the fakes:
+    overflow_source / dma_overflow_events, the DMA overflow's uncertain span and the bufflen
+    settling window are identical in-process and through the worker."""
+    import sys
+
+    from tests.hal.fakes.fake_proc import open_fake_pluto
+
+    for mod in ("SoapySDR", "iio"):
+        monkeypatch.setitem(sys.modules, mod, sys.modules.get(mod))
+    cfg = DeviceConfig(name="px", backend="soapy", profile="ad9363_pluto", control_uri="ip:192.168.2.1",
+                       args={"driver": "plutosdr", "uri": "usb:1.5.5", "stream:bufflen": "4096"},
+                       sim={"rx_script": [None] * 4 + ["overflow"]})
+    a = open_fake_pluto(cfg)
+    opened.append(a)
+    b = ProcessRxDevice(cfg, opener="tests.hal.fakes.fake_proc:open_fake_pluto")
+    opened.append(b)
+    assert b.child_class == "SoapyRxDevice"
+    ra, rb = _soapy_session(a), _soapy_session(b)
+    for key in ("open", "ppm", "warn", "start", "blocks", "after", "stats"):
+        assert ra[key] == rb[key], key
+    assert ra["settled"][0] == rb["settled"][0]
+    np.testing.assert_array_equal(ra["settled"][1], rb["settled"][1])
+    assert rb["open"]["overflow_source"] == "dma_status" and rb["open"]["thin_serial_verified"] is True
+    assert rb["start"][1] == 5 * 4096                        # settle_buffers x actual bufflen
+    flagged = [k for k in rb["blocks"] if k[6]]
+    assert len(flagged) == 1 and flagged[0][7]               # one gap, its uncertain span settling
+    attrs, until = rb["after"]
+    assert attrs["dma_overflow_events"] == 1 and until == flagged[0][0] + 5 * 4096
+    assert b.describe()["overflow_source"] == "dma_status"
+
+
+def test_device_without_backend_attributes_leaves_them_absent(opened):
+    """A worker device without overflow_source (simulator: exact) must not get one on the proxy:
+    the RX node reads ``getattr(dev, "overflow_source", None)``."""
+    dev = ProcessRxDevice(fake_cfg(), opener=FAKE)
+    opened.append(dev)
+    dev.set_sample_rate(1e6)
+    dev.start_stream(64)
+    dev.read(64)
+    assert not any(hasattr(dev, k) for k in MIRRORED)
+    assert dev.settle_samples == dev.settle_buffers * dev.buffer_size
+    dev.buffer_size = 4096                                   # parent-owned: not echoed back
+    dev.read_sensors()
+    assert dev.buffer_size == 4096 and dev.settle_samples == dev.settle_buffers * 4096
+
+
+def test_interrupted_read_keeps_its_uncertain_span(opened, monkeypatch):
+    import eds.hal.proc as proc_mod
+
+    dev = ProcessRxDevice(fake_cfg(script=[{"k": 32, "overflow": True, "uncertain": 1000}]), opener=FAKE)
+    opened.append(dev)
+    dev.settle_buffers = 0
+    dev.set_sample_rate(1e6)
+    dev.start_stream(64)
+    real_wait = proc_mod._Pipe.wait
+    hits = {"n": 1}
+
+    def ctrl_c_once(self, wait_s):
+        if hits["n"]:
+            hits["n"] -= 1
+            raise KeyboardInterrupt
+        return real_wait(self, wait_s)
+
+    monkeypatch.setattr(proc_mod._Pipe, "wait", ctrl_c_once)
+    with pytest.raises(KeyboardInterrupt):
+        dev.read(32)                          # the overflow reply (uncertain 1000) is dropped
+    blk = dev.read(32)
+    assert blk.overflow and blk.settling and dev._settle_until == blk.index + 1000
 
 
 def test_errors_keep_type_message_and_child_traceback(opened):
@@ -520,6 +670,43 @@ def test_isolation_plan_warns_when_two_plutos_are_forced_inproc(caplog):
         pluto_tx_isolated({"isolate": "belki"})
 
 
+def test_auto_isolation_counts_a_pluto_already_open_in_this_process(monkeypatch, caplog):
+    """A Pluto opened earlier in this process (e.g. by the CLI) holds SoapyPlutoSDR's single
+    libiio context: the next auto Pluto must go to a worker, from the plan AND open_device."""
+    import eds.hal.proc as proc_mod
+    from eds.hal import soapy_backend as sb
+
+    made: list = []
+
+    class Recorder:
+        def __init__(self, dev, app):
+            made.append(dev.name)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(proc_mod, "ProcessRxDevice", Recorder)
+    monkeypatch.setattr(sb, "_pluto_owners", {})            # isolated registry for this test
+    one = config_from_dict({"device": [_soapy("rx0", args=PLUTO_A)]})
+    others = config_from_dict({"device": [{"name": "a", "backend": "sim"},
+                                          _soapy("hrf", args={"driver": "hackrf"})]})
+    assert factory.plutos_open_in_process() == [] and isolation_plan(one) == {"rx0": "inproc"}
+    token = sb.claim_pluto("cli-rx")
+    try:
+        assert factory.plutos_open_in_process() == ["cli-rx"]
+        assert isolation_plan(one) == {"rx0": "subprocess"}
+        assert isolation_plan(others) == {"a": "inproc", "hrf": "inproc"}       # only Plutos move
+        forced = config_from_dict({"device": [_soapy("rx0", args=PLUTO_A, isolation="inproc")]})
+        with caplog.at_level(logging.WARNING, logger="eds.hal.factory"):
+            assert isolation_plan(forced) == {"rx0": "inproc"}
+        assert "TEK libiio" in caplog.text and "zaten açık: cli-rx" in caplog.text
+        assert isinstance(open_device(one.devices[0], one), Recorder) and made == ["rx0"]
+        assert isinstance(open_devices(one)[0], Recorder) and made == ["rx0", "rx0"]
+    finally:
+        sb.release_pluto(token)
+    assert isolation_plan(one) == {"rx0": "inproc"}
+
+
 def test_open_devices_places_two_plutos_in_workers(monkeypatch):
     made: list = []
 
@@ -570,6 +757,14 @@ def test_plain_app_roundtrip_drops_the_attached_world():
     assert repr(back.to_dict()) == repr(app.to_dict())      # repr: cal.ppm_override is NaN
     assert "_eds_sim_world" not in back.__dict__
     assert isinstance(back.devices[0], DeviceConfig)
+
+
+def test_package_exports_isolation_api():
+    import eds.hal as hal
+
+    assert hal.isolation_plan is isolation_plan
+    assert hal.ProcessRxDevice is ProcessRxDevice and hal.ProcessSignalSource is ProcessSignalSource
+    assert {"isolation_plan", "ProcessRxDevice", "ProcessSignalSource"} <= set(hal.__all__)
 
 
 def test_factory_rejects_unknown_isolation():

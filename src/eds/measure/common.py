@@ -9,11 +9,12 @@ Level referencing order (:func:`level_reference`):
 3. Neither → offset 0, results stay in dBFS and are flagged ``calibrated = False``.
 
 Stimulus timing (:func:`stimulus_changed`): a source call returns before the new RF output
-reaches the DUT (Pluto TX: the samples already queued in the libiio TX buffers still play,
-``≈ 5 × buffer_len / fs``; a lab generator: synthesizer / level settling). Every stimulus
-change therefore waits :func:`source_settle_s` of wall-clock time and only then flags the
-RX's stale buffers as settling: the discarded ``settle_samples`` cover the whole RX
-FIFO, so every later sample was taken after the wait.
+reaches the DUT (Pluto TX: the samples already queued in the 4 libiio TX kernel buffers still
+play, ``SoapyTxSource.estimated_queue_latency_s = 4 × buffer_len / fs``, plus SoapyPlutoSDR's
+own staging buffer; a lab generator: synthesizer / level settling). Every stimulus change
+therefore waits :func:`source_settle_s` (Pluto TX: ``1.25 × estimated_queue_latency_s + 5 ms``)
+of wall-clock time and only then flags the RX's stale buffers as settling: the discarded
+``settle_samples`` cover the whole RX FIFO, so every later sample was taken after the wait.
 """
 
 from __future__ import annotations
@@ -214,12 +215,23 @@ def source_conditions(ctx: MeasurementContext) -> dict[str, Any]:
             "source_settle_s": source_settle_s(src)}
 
 
+def _full_span(spec) -> bool:
+    """The spectrum covers its whole ``fc ± fs/2`` grid (not a slice, not a stitched sweep)."""
+    meta = getattr(spec, "meta", None) or {}
+    return not meta.get("stitched") and int(np.size(spec.f_hz)) == int(spec.nfft)
+
+
 def spectrum_screenshot(spec, name: str, title: str, *, offset_db: float = 0.0, unit: str | None = None,
                         markers: list[tuple[float, float, str]] | None = None, max_points: int = 4001,
-                        ref_level: float | None = None, extra_info: dict[str, str] | None = None) -> FigureSpec:
+                        ref_level: float | None = None, extra_info: dict[str, str] | None = None,
+                        xlim_hz: tuple[float, float] | None = None) -> FigureSpec:
     """Spectrum-analyzer style figure (``kind='spectrum'``) from a :class:`Spectrum`.
 
-    The trace is max-hold decimated to ``max_points`` so narrow peaks survive.
+    The trace is max-hold decimated to ``max_points`` so narrow peaks survive. The frequency
+    axis is ``xlim_hz`` when given, else exactly ``fc ± fs/2`` for a full-span spectrum (the
+    fftshift grid stops one bin short of ``+fs/2``); for a slice or a stitched sweep it is left
+    to the renderer (``Center`` / ``Span`` of ``extra_info``, else the data extent). ``Center``
+    is written with 9 significant digits (1 Hz at GHz).
     """
     f = np.asarray(spec.f_hz, dtype=float)
     p = np.asarray(spec.p_db, dtype=float) + offset_db
@@ -230,17 +242,21 @@ def spectrum_screenshot(spec, name: str, title: str, *, offset_db: float = 0.0, 
         p = p[:m].reshape(-1, k).max(axis=1)
     u = unit or spec.unit
     top = float(np.max(p)) if ref_level is None else ref_level
-    ref = 10.0 * np.ceil((top + 5.0) / 10.0)
+    ref = float(10.0 * np.ceil((top + 5.0) / 10.0)) + 0.0         # "+ 0.0": never "-0"
+    fc, fs = float(spec.fc), float(spec.fs)
     info = {
-        "Center": fmt_hz(spec.fc), "Span": fmt_hz(spec.fs), "RBW": fmt_hz(spec.rbw_hz),
+        "Center": fmt_hz(fc, 9), "Span": fmt_hz(fs), "RBW": fmt_hz(spec.rbw_hz),
         "Avg": str(spec.averages), "Ref": f"{ref:.0f} {u}", "Window": spec.window,
     }
     if extra_info:
         info.update(extra_info)
+    if xlim_hz is None and _full_span(spec) and fs > 0:
+        xlim_hz = (fc - fs / 2.0, fc + fs / 2.0)
     return FigureSpec(
         name=name, title=title, kind="spectrum",
         series=[Series(x=(f / 1e6).tolist(), y=p.tolist(), label=u)],
         xlabel="Frekans [MHz]", ylabel=f"Seviye [{u}]",
         markers=[(m[0] / 1e6, m[1], m[2]) for m in (markers or [])],
         info=info, ylim=(ref - 100.0, ref),
+        xlim=None if xlim_hz is None else (float(xlim_hz[0]) / 1e6, float(xlim_hz[1]) / 1e6),
     )

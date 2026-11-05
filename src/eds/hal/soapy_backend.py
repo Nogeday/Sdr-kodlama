@@ -3,8 +3,8 @@
 Every SoapySDR-supported radio (Pluto now; bladeRF/USRP/HackRF later) is opened through
 :class:`SoapyRxDevice`. Pluto-only low-level controls that SoapySDR does not expose go
 through the thin libiio layer :class:`eds.hal.pluto_iio.PlutoIIO` (``control_uri``), opened
-on first need and at the latest by :meth:`SoapyRxDevice.configure` / stream start, only for
-driver ``plutosdr``.
+together with the device, only for driver ``plutosdr`` (it establishes the ``xo_correction``
+in effect and whether sample loss is detectable before anything else uses the device).
 
 SoapyPlutoSDR facts relied upon (verified against the upstream sources; check your build
 with ``SoapySDRUtil --probe="driver=plutosdr"``):
@@ -44,7 +44,10 @@ with ``SoapySDRUtil --probe="driver=plutosdr"``):
   ``settle_samples`` samples ``settling``. ``overflow_source`` says what is in effect:
   ``"driver"`` (other Soapy drivers: ``SOAPY_SDR_OVERFLOW`` / hardware-timestamp jumps,
   ``detect_ts_gaps``), ``"dma_status"`` (Pluto + thin layer) or ``"none"`` (Pluto without
-  the thin layer: sample loss is NOT detected; warning).
+  the thin layer: sample loss is NOT detected; warning at stream start). It is known from the
+  open on — a Pluto is never ``"driver"``: ``"dma_status"`` only if the thin layer opened at
+  open can read the register, else ``"none"`` — so ``eds devices --probe`` shows the truth
+  before any stream; stream start re-checks it (and clears the stale bit).
 * **Stop / timeouts.** ``readStream`` holds the driver's RX mutex during
   ``iio_buffer_refill`` and ignores ``timeoutUs``; a stuck refill ends only with libiio's
   own context timeout (5 s default; SoapyPlutoSDR offers no argument to change it), and
@@ -475,7 +478,7 @@ class SoapyRxDevice(RxDevice):
         self._thin_obj: PlutoIIO | None = None
         self._thin_tried = False
         self.thin_serial_verified = False
-        self.overflow_source = "driver"
+        self.overflow_source = "none" if is_pluto_args(self.device_args) else "driver"   # final value below
         self._dma_thin: PlutoIIO | None = None
         self._dma_pending = False
         self._dma_last_poll = -math.inf
@@ -511,6 +514,19 @@ class SoapyRxDevice(RxDevice):
                 dev, self._dev = self._dev, None
                 quarantine_pluto_device(dev)
                 raise
+        if self.is_pluto:
+            # opened with the device: the xo_correction in effect (ppm_hw) and the overflow
+            # detection the streams will have are known from here on (a failure = warning)
+            try:
+                self.overflow_source = self._overflow_source_at_rest(self.thin_layer())
+            except Exception as e:  # libiio errors are warnings inside thin_layer(): this is a bug
+                try:
+                    self._close()
+                except EDSError as close_err:
+                    log.warning("%s: açılış hatası sonrası kapatma da başarısız: %s", self.name, close_err)
+                raise DeviceError(f"{self.name}: Pluto ince katmanı açılırken beklenmeyen hata: {e!r}") from e
+        else:
+            self.overflow_source = "driver"
 
     # ------------------------------------------------------------------ open / identity
     def _not_found_message(self, err: Exception) -> str:
@@ -596,7 +612,8 @@ class SoapyRxDevice(RxDevice):
         return self._hwinfo.get("uri", "").strip()
 
     def thin_layer(self) -> PlutoIIO | None:
-        """The Pluto thin libiio layer, opened once on first need (None if unavailable).
+        """The Pluto thin libiio layer, opened once — at device open for a Pluto (None if
+        unavailable; the open is not retried).
 
         Opening it also establishes the reference-clock state: the ``xo_correction`` in
         effect (boot value) becomes ``ppm_hw`` (see module docstring).
@@ -852,6 +869,21 @@ class SoapyRxDevice(RxDevice):
         self._ts_expect = None
         self._zero_since = None
         self._setup_overflow_detection(thin)
+
+    def _overflow_source_at_rest(self, thin: PlutoIIO | None) -> str:
+        """The overflow detection the next stream will have, known without streaming:
+        ``"driver"`` (not a Pluto), ``"dma_status"`` (the thin layer can read the RX DMA status
+        register; read only, the bit is cleared at stream start) or ``"none"``."""
+        if not self.is_pluto:
+            return "driver"
+        if thin is None or not thin.rx_overflow_supported():
+            return "none"
+        try:
+            thin.read_rx_dma_status()
+        except EDSError as e:
+            log.debug("%s: RX DMA durum yazmacı okunamadı: %s", self.name, e)
+            return "none"
+        return "dma_status"
 
     def _setup_overflow_detection(self, thin: PlutoIIO | None) -> None:
         self._dma_thin, self._dma_pending, self._dma_last_poll = None, False, -math.inf

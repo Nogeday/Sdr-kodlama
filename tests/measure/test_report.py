@@ -443,6 +443,7 @@ def test_format_helpers():
     assert format_condition("nfft", np.int64(4096)) == "4096"
     assert format_condition("tracking", True) == "evet"
     assert format_condition("x", None) == "—"
+    assert format_condition("overflow_source", "") == "—"                 # not stated by the device
     assert format_condition("ppm", 12.34567) == "12.3 ppm"
     assert format_condition("noise_dbfs_hz", -150.04) == "-150.0 dBFS/Hz"
     assert format_condition("cal", {"a": float("nan")}) == "a: —"
@@ -624,7 +625,10 @@ def test_short_conditions_are_spec_specific():
     df = MeasurementResult(spec_id="df_rms", title="t", value=0.5, unit="°", conditions={
         "fc_hz": 999.5e6, "f_target_hz": 999.9e6, "baseline_m": 0.15, "angles_deg": [-60, -40, -20, 0, 20, 40, 60],
         "repeats": 2, "coherent": True})
-    assert short_conditions(df) == "f 999.9 MHz; d 0.150 m; θ -60.0 ° … 60.0 ° (7); tekrar 2; koherent evet"
+    assert short_conditions(df) == "f 999.9 MHz; d 0.150 m; θ -60.0 ° … 60.0 ° (7); koherent evet; tekrar 2"
+    df.conditions.update(snr_db=10.04, snr_bw_hz=25e3)               # DF accuracy depends on the SNR
+    assert short_conditions(df) == \
+        "f 999.9 MHz; d 0.150 m; θ -60.0 ° … 60.0 ° (7); SNR 10.0 dB / 25 kHz; koherent evet; tekrar 2"
     ibw = MeasurementResult(spec_id="inst_bw", title="t", value=16.9, unit="MHz", conditions={
         "fc_hz": 935e6, "configs": [[20e6, 20e6]], "rbw_hz": 9786.88, "gain_db": [40.0]})
     assert short_conditions(ibw) == "fc 935 MHz; fs / BW 20 MS/s / 20 MHz; RBW 9.787 kHz; G 40.0 dB"
@@ -661,10 +665,24 @@ def test_unit_formatting_rules():
 def test_unit_hints_in_report_tables(tmp_path):
     r = MeasurementResult(spec_id="sensitivity", title="Duyarlılık", value=-131.8, unit="dBm",
                           extra={"sensitivity": -131.785, "clip_input": -35.576, "clip_input_unit": "dBm",
-                                 "rms_deg": 0.0028})
+                                 "rms_deg": 0.0028, "p_max_input": -12.04, "p_max_input_unit": "dBm",
+                                 "mds_dbm_by_bw_hz": {"978.723": -118.31, "25000": -104.2, "1e+06": -88.12}},
+                          conditions={"tone_power_dbm": -61.25, "tone_power_rel_db": -32.0,
+                                      "tone_power_max_rel_db": -20.5})
     md = (write_report([r], tmp_path, meta={"git_commit": "x"}) / "summary.md").read_text(encoding="utf-8")
     assert "| `sensitivity` | -131.8 dBm |" in md and "| `clip_input` | -35.6 dBm |" in md
     assert "| `rms_deg` | 0.0028 ° |" in md
+    # renamed keys carry their unit (p_max_input via its *_unit sibling, MDS(B) indexed by B in Hz)
+    assert "| `p_max_input` | -12.0 dBm |" in md
+    assert "| `mds_dbm_by_bw_hz` | 978.7 Hz: -118.3 dBm; 25 kHz: -104.2 dBm; 1 MHz: -88.1 dBm |" in md
+    assert "-61.2 dBm" in md and "-32.0 dB" in md and "-20.5 dB" in md
+
+
+def test_indexed_mapping_keys():
+    assert format_condition("mds_dbfs_by_bw_hz", {"978.723": -150.0}) == "978.7 Hz: -150.0 dBFS"
+    assert format_condition("mds_dbm_by_bw_hz", -101.04) == "-101.0 dBm"        # scalar: the value unit
+    # trailing-unit convention keeps working (dynamic_range noise per gain)
+    assert format_condition("noise_rbw_by_gain_dbfs", {"40": -80.04, "50": -75.0}) == "40: -80.0 dBFS; 50: -75.0 dBFS"
 
 
 # ------------------------------------------------------------------------- raw tables

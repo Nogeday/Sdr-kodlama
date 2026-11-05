@@ -15,7 +15,10 @@ is lost and DF must re-calibrate. On a Pluto the member overflow comes from the 
 status register (:mod:`eds.hal.soapy_backend`; SoapyPlutoSDR itself never reports one) and
 the uncertain span after it is flagged ``settling``, which the group block inherits.
 SoapyPlutoSDR allows only ONE Pluto per process, so 2× Pluto members are subprocess proxies
-(``[[device]] isolation``).
+(``[[device]] isolation``). :attr:`DeviceGroup.overflow_source` is the weakest member's
+detection (``"none"`` if any member cannot detect sample loss, else ``"dma_status"`` if any
+member relies on the DMA status register, else ``"driver"``; ``""`` when no member states
+one, e.g. simulators), per member in ``describe()["overflow_source_members"]``.
 
 USB load: the group profile scales the interface limits by the number of members (each
 device has its own USB link). If several Plutos share one USB 2.0 host controller the
@@ -128,6 +131,28 @@ class DeviceGroup(RxDevice):
         if len(self._members) == 1:
             return self._members[0].coherent
         return self._assume_coherent
+
+    @property
+    def overflow_source(self) -> str:
+        """How sample loss is detected for the group block, from the members' ``overflow_source``:
+        ``"none"`` if any member is ``"none"`` (a loss there goes unnoticed), else
+        ``"dma_status"`` if any member is, else ``"driver"``; ``""`` if no member states one."""
+        known = [v for v in self.overflow_source_members.values() if v]
+        if not known:
+            return ""
+        for level in ("none", "dma_status", "driver"):
+            if level in known:
+                return level
+        return known[0]
+
+    @property
+    def overflow_source_members(self) -> dict[str, str]:
+        """``{member name: overflow_source}`` (``""`` for a member that does not state one)."""
+        out: dict[str, str] = {}
+        for m in self._members:
+            v = getattr(m, "overflow_source", None)
+            out[m.name] = v if isinstance(v, str) else ""
+        return out
 
     def runtime_limits(self) -> dict[str, Any]:
         """Intersection of the members' runtime limits."""
@@ -333,6 +358,8 @@ class DeviceGroup(RxDevice):
         d["members"] = [m.describe() for m in self._members]
         d["last_skew_ns"] = self.last_skew_ns
         d["ppm_hw_members"] = list(self.ppm_hw_members)
+        d["overflow_source"] = self.overflow_source
+        d["overflow_source_members"] = self.overflow_source_members
         return d
 
     @property

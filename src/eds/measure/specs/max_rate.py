@@ -69,10 +69,20 @@ result is blocked. On the real-time simulator the transport limit is the simulat
 model (``usb_bytes_per_s``), which the summary states.
 
 Hardware tuning matrix: ``buffer_sizes = [...]`` repeats the transport search for every
-listed buffer size (``extra['matrix']``). Device arguments that only act when the device is
-opened (e.g. SoapyPlutoSDR ``usb_direct``, ``timeout``, ``loopback``) cannot be switched by a
-running measurement: run it once per ``[[device]].args`` variant — the arguments in effect
-are recorded in ``conditions['device_args']``.
+listed buffer size (``extra['matrix']``); on a Pluto the buffer size (the stream argument
+``bufflen``) is the only stream setting SoapyPlutoSDR reads. Its device arguments are only
+``uri``, ``hostname`` and ``label`` (``serial`` is resolved to ``uri`` by EDS): anything else
+(``usb_direct``, ``timeout``, ``loopback``, ``timestamp_every`` …) is IGNORED by the driver
+(the HAL warns), so it is not a measurement condition — such arguments are listed in
+``conditions['device_args_ignored']`` and kept out of ``conditions['device_args']`` (the
+arguments in effect). Arguments a driver honours only when the device is opened cannot be
+switched by a running measurement: run it once per ``[[device]].args`` variant.
+
+Overflow detection: ``conditions['overflow_source']`` is the device's own statement
+(``"dma_status"`` / ``"driver"`` / ``"none"``; ``""`` when the device does not state one).
+``"none"`` on real hardware (a Pluto without the thin libiio layer) means sample loss is NOT
+flagged by the device — only the sample count can find it — and the result carries
+:data:`BLOCKER_NO_OVERFLOW` (no target verdict).
 """
 
 from __future__ import annotations
@@ -127,7 +137,31 @@ NONREALTIME_WARNING = ("UYARI: gerçek zamanlı olmayan simülatör (sim.realtim
                        "USB/FIFO modeli devre dışıdır; ölçülen hız fiziksel olarak ANLAMLI DEĞİLDİR.")
 BLOCKER_TRANSPORT_ONLY = ("yalnız taşıma modu ölçüldü: KTR sistem düzeyi (DSP hattı açık) değeri ister "
                           "(max_rate.modes'a 'pipeline' ekleyin)")
+BLOCKER_NO_OVERFLOW = ("örnek kaybı algılanamaz: overflow sayacı bildirilmiyor (overflow_source = none; Pluto'da "
+                       "ince libiio katmanı / control_uri yok) — kayıp yalnız örnek sayımıyla aranır")
 STATUS_TR = {"pass": "GEÇTİ", "fail": "KALDI", "skipped": "ATLANDI"}
+
+
+def device_args_conditions(dev: Any) -> tuple[dict[str, str], list[str]]:
+    """``(args in effect, ignored arg names)`` of the device's ``[[device]].args``.
+
+    SoapyPlutoSDR reads only ``uri`` / ``hostname`` / ``label`` (+ ``driver``, ``serial`` →
+    ``uri``) and the stream argument ``stream:bufflen``; every other argument of a Pluto is
+    ignored by the driver and must not be reported as a measurement condition. Other
+    backends: all arguments are reported as given."""
+    from ...hal.soapy_backend import PLUTO_DEVICE_ARGS, PLUTO_DRIVER, PLUTO_STREAM_ARGS, STREAM_ARG_PREFIX
+
+    args = {str(k): str(v) for k, v in (getattr(getattr(dev, "cfg", None), "args", None) or {}).items()}
+    driver = str(args.get("driver") or getattr(getattr(dev, "profile", None), "soapy_driver", "") or "").lower()
+    if getattr(getattr(dev, "info", None), "backend", "") == "sim" or driver != PLUTO_DRIVER:
+        return args, []
+
+    def honoured(k: str) -> bool:
+        if k.startswith(STREAM_ARG_PREFIX):
+            return k[len(STREAM_ARG_PREFIX):] in PLUTO_STREAM_ARGS
+        return k in PLUTO_DEVICE_ARGS
+
+    return {k: v for k, v in args.items() if honoured(k)}, sorted(k for k in args if not honoured(k))
 
 
 @dataclass
@@ -760,8 +794,10 @@ class MaxRateMeasurement(Measurement):
         value = None if fs_max is None else fs_max / 1e6
         mb = None if fs_max is None else fs_max * bps / 1e6
         accounting = sorted({t.accounting for o in outcomes.values() for t in o.trials if t.accounting})
-        ovf_src = str(getattr(dev, "overflow_source", "driver"))
+        ovf_src = str(getattr(dev, "overflow_source", "") or "")
         is_sim = getattr(dev.info, "backend", "") == "sim"
+        no_overflow = ovf_src == "none" and not is_sim          # real hardware: loss not flagged by the device
+        dev_args, ignored_args = device_args_conditions(dev)
         unresolvable = sorted({t.buffer_size for o in outcomes.values() for t in o.trials
                                if t.accounting == "wall_clock" and t.allowed_lost >= t.buffer_size})
         extra: dict[str, Any] = {
@@ -802,11 +838,13 @@ class MaxRateMeasurement(Measurement):
             "refine": prm["refine"], "refine_steps": prm["refine_steps"], "interface": prof.interface,
             "interface_max_bytes_per_s": prof.interface_max_bytes_per_s,
             "interface_practical_bytes_per_s": prof.interface_practical_bytes_per_s, "bytes_per_sample": bps,
-            "stream_format": app.rx.stream_format, "device_args": dict(getattr(dev.cfg, "args", {}) or {}),
+            "stream_format": app.rx.stream_format, "device_args": dev_args,
             "accounting": ", ".join(ACCOUNTING_LABELS.get(a, a) for a in accounting) or "-",
             "overflow_source": ovf_src, "wall_clock_jitter_s": prm["jitter_s"],
             "host": platform.node() or "-", "host_platform": platform.platform(), "cpu_count": os.cpu_count() or 0,
         })
+        if ignored_args:
+            conditions["device_args_ignored"] = ignored_args
         if "pipeline" in prm["modes"]:
             conditions.update({"block_size": min(int(app.rx.block_size), prm["buffer_size"]),
                                "queue_blocks": int(app.rx.queue_blocks), "nfft": int(app.dsp.nfft),
@@ -843,8 +881,12 @@ class MaxRateMeasurement(Measurement):
             usb = getattr(dev, "sim_params", {}).get("usb_bytes_per_s") if hasattr(dev, "sim_params") else None
             summary += (" Simülatör: taşıma sınırı yapılandırılmış USB modelinden gelir"
                         + (f" (usb_bytes_per_s = {float(usb) / 1e6:g} MB/s)" if usb else "") + ".")
-        if ovf_src == "none":
+        if no_overflow:
+            summary += f" UYARI: {BLOCKER_NO_OVERFLOW} — hedef kararı verilmez."
+        elif ovf_src == "none":
             summary += " UYARI: bu cihazda overflow bayrağı yok; kayıp yalnız örnek sayımıyla aranır."
+        if ignored_args:
+            summary += (f" Sürücünün yok saydığı cihaz argümanları ölçüm koşulu değildir: {', '.join(ignored_args)}.")
         if unresolvable:
             summary += (f" UYARI: buffer_size {unresolvable} için duvar saati sayımı tek tamponluk sessiz kaybı ayırt "
                         "edemez (süreyi kısaltın ya da tamponu büyütün).")
@@ -870,13 +912,15 @@ class MaxRateMeasurement(Measurement):
                "daha az yük)" if len(prm["modes"]) > 1 else "")
             + (f"; son geçen ile ilk kalan arasında {prm['refine_steps']} adımlı ikiye bölme ile inceltilir." if
                prm["refine"] else ".")
-            + f" Overflow kaynağı: {ovf_src}."
+            + f" Overflow kaynağı: {ovf_src or 'cihaz belirtmedi (sürücü bayrakları)'}."
         )
         res = self.new_result(value, summary=summary, method=method, conditions=conditions, extra=extra)
         if nonrt:
             res.blockers.append(REASON_NONREALTIME)
         if head_mode != "pipeline":
             res.blockers.append(BLOCKER_TRANSPORT_ONLY)
+        if no_overflow:
+            res.blockers.append(BLOCKER_NO_OVERFLOW)
         all_trials = [t for o in outcomes.values() for t in o.trials] + matrix_trials
         res.table = [t.row(bps) for t in sorted(all_trials, key=lambda t: (t.buffer_size != prm["buffer_size"],
                                                                          t.buffer_size, MODES.index(t.mode),
@@ -907,9 +951,10 @@ class MaxRateMeasurement(Measurement):
             allowed = [max(t.allowed_lost, PLOT_FLOOR) if math.isfinite(t.allowed_lost) else PLOT_FLOOR for t in ts]
             ev = [max(float(t.overflows + t.timeouts + t.host_drops), PLOT_FLOOR) for t in ts]
             series.append(Series(x=x, y=lost, label=f"kayıp örnek — {MODE_LABELS[m]}", style="line"))
-            series.append(Series(x=x, y=allowed, label=f"sayım izni [örnek] — {MODE_LABELS[m]}", style="step"))
+            series.append(Series(x=x, y=allowed, label=f"sayım izni [örnek] — {MODE_LABELS[m]}", style="step",
+                                 role="ref"))
             series.append(Series(x=x, y=ev, label=f"overflow + zaman aşımı + host drop [olay] — {MODE_LABELS[m]}",
-                                 style="marker"))
+                                 style="marker", role="warn"))
             for t, xi, yl, yo in zip(ts, x, lost, ev):
                 if t.passed:
                     pas_x.append(xi)
@@ -919,8 +964,8 @@ class MaxRateMeasurement(Measurement):
                     fail_y.append(max(yl, yo))
             if o.max_hz is not None:
                 vlines.append((o.max_hz / 1e6, f"fs_max {MODE_LABELS[m]} = {o.max_hz / 1e6:.4g} MS/s"))
-        series.append(Series(x=pas_x, y=pas_y, label="GEÇTİ", style="marker"))
-        series.append(Series(x=fail_x, y=fail_y, label="KALDI", style="marker"))
+        series.append(Series(x=pas_x, y=pas_y, label="GEÇTİ", style="marker", role="pass"))
+        series.append(Series(x=fail_x, y=fail_y, label="KALDI", style="marker", role="fail"))
         top = max((y for sr in series for y in sr.y), default=PLOT_FLOOR)
         return FigureSpec(
             name="max_rate_overflow_loss", ylim=(0.5 * PLOT_FLOOR, max(10.0, 3.0 * top)),
@@ -935,17 +980,17 @@ class MaxRateMeasurement(Measurement):
         bps = int(prof.bytes_per_sample)
         rates = sorted({t.rate_hz for o in outcomes.values() for t in o.trials})
         series = [Series(x=[r / 1e6 for r in rates], y=[r * bps / 1e6 for r in rates],
-                         label=f"gerekli veri hızı (fs × {bps} B)", style="line")]
-        groups = (("GEÇTİ", lambda t: t.passed and not t.implied),
-                  ("GEÇTİ (DSP hattından çıkarım)", lambda t: t.implied),
-                  ("KALDI", lambda t: not t.passed))
+                         label=f"gerekli veri hızı (fs × {bps} B)", style="line", role="ref")]
+        groups = (("GEÇTİ", "pass", lambda t: t.passed and not t.implied),
+                  ("GEÇTİ (DSP hattından çıkarım)", "pass", lambda t: t.implied),
+                  ("KALDI", "fail", lambda t: not t.passed))
         for mode, o in outcomes.items():
             ts = [t for t in o.trials if t.status != "skipped"]
-            for word, pick in groups:
+            for word, role, pick in groups:
                 sel = sorted((t for t in ts if pick(t)), key=lambda t: t.rate_hz)
                 if sel:
                     series.append(Series(x=[t.rate_hz / 1e6 for t in sel], y=[t.rate_hz * bps / 1e6 for t in sel],
-                                         label=f"{word} — {MODE_LABELS[mode]}", style="marker"))
+                                         label=f"{word} — {MODE_LABELS[mode]}", style="marker", role=role))
         vlines = [(o.max_hz / 1e6, f"fs_max {MODE_LABELS[m]} = {o.max_hz / 1e6:.4g} MS/s")
                   for m, o in outcomes.items() if o.max_hz is not None]
         theo = prof.interface_max_bytes_per_s / 1e6

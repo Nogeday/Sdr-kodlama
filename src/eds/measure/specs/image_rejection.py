@@ -416,7 +416,7 @@ class ImageRejectionMeasurement(Measurement):
                         f"iyileşme {w_on.irr_db - w_off.irr_db:.1f} dB — ")
         else:
             summary += "tracking kapalı ölçülemedi — "
-        summary += (f"fc {fcs_txt}, fs {fmt_hz(prm['fs'])}, ±{min(prm['offsets_frac']):g}…{max(prm['offsets_frac']):g}·fs, "
+        summary += (f"fc {fcs_txt}, fs {prm['fs'] / 1e6:g} MS/s, ±{min(prm['offsets_frac']):g}…{max(prm['offsets_frac']):g}·fs, "
                     f"G = {prm['gain']:g} dB, ton ≈ {prm['tone_dbfs']:g} dBFS")
         if notes:
             summary += "; " + "; ".join(notes)
