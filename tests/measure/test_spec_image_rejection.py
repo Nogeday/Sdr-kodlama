@@ -11,8 +11,19 @@ import pytest
 from eds.calib.store import CalibrationStore
 from eds.hal.sim import signals as sg
 from eds.measure.base import run_measurement
+from eds.measure.specs.image_rejection import artifacts_clear, fold_to_band, lo_offset_candidates
+from eds.measure.targets import Target, apply_targets
 
-from .spec_fixtures import check_contract, run_spec, sim_app, sim_context, source_enabled
+from .spec_fixtures import (
+    SimLoSource,
+    check_contract,
+    replace_source,
+    run_spec,
+    sim_app,
+    sim_context,
+    source_enabled,
+    without_quadrature_control,
+)
 
 FC, FS = 915e6, 4e6
 
@@ -82,3 +93,70 @@ def test_save_stores_worst_on_irr_and_skips_invalid_fc(tmp_path):
 def test_image_rejection_requires_a_source(tmp_path):
     res = run_spec(sim_app(tmp_path, fc=FC, fs=FS, source="none"), "image_rejection").result
     assert res.status == "skipped" and "kaynağı gerekli" in res.error
+
+
+# --------------------------------------------------------------------------- stimulus artifacts
+def test_lo_offset_choice_keeps_the_source_tx_image_off_the_rx_image_bin():
+    """Pluto TX default (LO 199.95 kHz below the tone): at δ = +0.05·fs = 200 kHz its TX image
+    (tone − 2·offset) lands 98 Hz from the RX image bin (fc − δ). The chosen offsets avoid it."""
+    fs, df = FS, FS / 4096
+    guard = 7 * df
+    f = FC + 0.05 * FS
+    assert abs((f - 2 * 199951.171875) - (2 * FC - f)) < 100.0
+    assert not artifacts_clear(f, FC, fs, 199951.171875, guard)
+    for frac in (0.05, 0.1, 0.2, 0.3, 0.4):
+        for sign in (1.0, -1.0):
+            ft = FC + sign * frac * fs
+            cands = lo_offset_candidates(ft, FC, fs, 199951.171875, guard)
+            assert cands and math.copysign(1.0, cands[0]) == -sign       # LO beyond the tone, away from fc
+            for off in cands:
+                lo = ft - off
+                for a in (lo, 2 * lo - ft):
+                    fa = fold_to_band(a, FC, fs)
+                    assert abs(fa - ft) >= guard and abs(fa - (2 * FC - ft)) >= guard
+    assert fold_to_band(FC + 2.3e6, FC, fs) == pytest.approx(FC - 1.7e6)
+
+
+def test_image_rejection_with_a_pluto_like_source_keeps_source_artifacts_off_the_image(tmp_path):
+    """Source LO leakage / TX image at −40 dBc (Pluto TX): with the per-point LO placement every
+    point still measures the DUT's IRR (≈55 dB with tracking on), not the source's image."""
+    params = {"image_rejection": {"offsets_frac": [0.05, 0.2]}}
+    app = sim_app(tmp_path, fc=FC, fs=FS, params=params)
+    with sim_context(app, quick=True) as ctx:
+        src = replace_source(ctx, lambda w: SimLoSource(w, freq_hz=FC))
+        res = run_measurement("image_rejection", ctx)
+        sp = ctx.dut.sim_params
+        left_on = source_enabled(ctx)
+    check_contract(res, unit="dB", min_spectrum_figs=2)
+    irr_on = sg.image_rejection_db(sp["iq_residual_gain_db"], sp["iq_residual_phase_deg"])
+    irr_off = sg.image_rejection_db(sp["iq_gain_db"], sp["iq_phase_deg"])
+    assert res.value == pytest.approx(irr_on, abs=1.0)
+    for r in res.table:
+        truth = irr_on if r["tracking"] == "açık" else irr_off
+        assert r["irr_db"] == pytest.approx(truth, abs=1.0)
+        assert r["source_artifacts_clear"] is True
+        assert math.copysign(1.0, r["source_lo_offset_hz"]) == -math.copysign(1.0, r["offset_frac"])
+    assert res.extra["source_artifact_conflicts"] == 0
+    assert src.tone_offset_hz == pytest.approx(199951.171875)          # restored at the end
+    assert not left_on
+
+
+def test_image_rejection_skips_off_points_when_tracking_cannot_be_switched(tmp_path):
+    """Pluto without the thin libiio layer: set_tracking reports 'unsupported'. The OFF points must
+    not be measured (they would be tracking-ON values labelled OFF) and the headline gets a
+    blocker (tracking state unverified → no target verdict)."""
+    app = sim_app(tmp_path, fc=FC, fs=FS, params={"image_rejection": {"offsets_frac": [0.1, 0.3]}})
+    with sim_context(app, quick=True) as ctx:
+        without_quadrature_control(ctx.dut)
+        res = run_measurement("image_rejection", ctx)
+        sp = ctx.dut.sim_params
+    check_contract(res, unit="dB", min_spectrum_figs=1)
+    assert all(r["tracking"] == "açık" for r in res.table) and len(res.table) == 2 * 2
+    assert "irr_off_worst_db" not in res.extra and "improvement_db" not in res.extra
+    assert res.extra["tracking_paths_on"] == ["unsupported"] and res.extra["tracking_paths_off"] == ["unsupported"]
+    assert res.value == pytest.approx(sg.image_rejection_db(sp["iq_residual_gain_db"], sp["iq_residual_phase_deg"]),
+                                      abs=1.0)
+    assert "tracking kapalı ölçülemedi" in res.summary and "kapatılamadı" in res.summary
+    assert res.blockers and "doğrulanamadı" in res.blockers[0]
+    apply_targets([res], {"image_rejection": Target(target=40.0, op=">=")})
+    assert res.passed is None

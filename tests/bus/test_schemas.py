@@ -541,3 +541,37 @@ def test_examples_untouched_by_validation():
     for t, p in E.EXAMPLES.items():
         V.validate_data(t, p)
     assert E.EXAMPLES == before
+
+
+# --------------------------------------------------------------------------- overflow source / blockers
+@pytest.mark.parametrize("src", ["driver", "dma_status", "none"])
+def test_status_stream_overflow_source_accepted(src):
+    st = E.example(T.RX_STATUS)
+    st["stream"]["overflow_source"] = src
+    _valid(T.RX_STATUS, st)
+
+
+def test_status_stream_overflow_source_is_optional_and_non_empty():
+    st = E.example(T.RX_STATUS)
+    st["stream"].pop("overflow_source", None)
+    _valid(T.RX_STATUS, st)
+    st["stream"]["overflow_source"] = ""
+    assert _invalid(T.RX_STATUS, st).validator == "minLength"
+    st["stream"]["overflow_source"] = 0
+    assert _invalid(T.RX_STATUS, st).validator == "type"
+
+
+def test_measurement_result_blockers_travel_in_extra():
+    from eds.measure.base import MeasurementResult
+
+    r = MeasurementResult(spec_id="df_rms", title="DF RMS hatası", value=np.float64(0.47), unit="°",
+                          extra={"value_bound": "", "pd": np.array([1.0, np.inf])},
+                          blockers=["koherens yok", "simülatör: yalnız termal gürültü"],
+                          conditions={"quick": True, "simulated": True})
+    r.evaluate_target(5.0, "<=")
+    payload = r.bus_payload()
+    _valid(T.MEAS_RESULT, payload)
+    assert payload["extra"]["blockers"] == ["koherens yok", "simülatör: yalnız termal gürültü"]
+    assert payload["extra"]["pd"] == [1.0, None] and "blockers" not in r.extra   # result itself untouched
+    r.blockers = []
+    assert "blockers" not in r.bus_payload()["extra"]

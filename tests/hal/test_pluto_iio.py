@@ -7,7 +7,16 @@ import errno
 import pytest
 
 from eds.core.errors import BackendUnavailable, ConfigError, DeviceError, DeviceNotFound, NotSupported
-from eds.hal.pluto_iio import EXTERNAL_REF_NOTE, PlutoIIO, attr_text, parse_number, parse_range
+from eds.hal.pluto_iio import (
+    ADC_DMA_STATUS_OVERFLOW,
+    ADC_DMA_STATUS_REG,
+    EXTERNAL_REF_NOTE,
+    PlutoIIO,
+    attr_text,
+    parse_number,
+    parse_range,
+    scan_serials,
+)
 from tests.hal.fakes import fake_iio
 
 URI = "ip:192.168.2.1"
@@ -173,3 +182,62 @@ def test_close(board):
     with pytest.raises(DeviceError):
         pl.firmware_version()
     pl.close()   # idempotent
+
+
+# ----------------------------------------------------------------------------- RX DMA overflow register
+def test_rx_dma_overflow_bit_read_and_write_one_to_clear(board):
+    pl = PlutoIIO(URI)
+    assert pl.rx_overflow_supported()
+    assert pl.read_rx_dma_status() == 0 and pl.read_clear_rx_overflow() is False
+    board.dma_overflow()
+    board.rx_regs[ADC_DMA_STATUS_REG] |= 0x2                 # another sticky status bit
+    assert pl.read_rx_dma_status() & ADC_DMA_STATUS_OVERFLOW
+    assert pl.read_clear_rx_overflow() is True
+    # exactly the iio_adi_xflow_check access: reg 0x80000088, bit 2 written back to clear it
+    assert board.reg_log[-1] == ("w", "cf-ad9361-lpc", 0x80000088, 0x4)
+    assert board.rx_regs[ADC_DMA_STATUS_REG] == 0x2          # only the overflow bit cleared
+    assert pl.read_clear_rx_overflow() is False
+    assert board.writes == []                                # no IIO attribute was touched
+    assert (ADC_DMA_STATUS_REG, ADC_DMA_STATUS_OVERFLOW) == (0x80000088, 0x4)
+
+
+def test_rx_dma_register_errors(monkeypatch):
+    b = fake_iio.make_pluto_board(URI, dma_regs=False)
+    fake_iio.install(monkeypatch, b)
+    pl = PlutoIIO(URI)
+    assert not pl.rx_overflow_supported()                   # no direct_reg_access
+    with pytest.raises(NotSupported):
+        pl.read_clear_rx_overflow()
+    b2 = fake_iio.make_pluto_board(URI)
+    fake_iio.install(monkeypatch, b2)
+    pl = PlutoIIO(URI)
+    b2.reg_error = (errno.ETIMEDOUT, "Connection timed out")
+    with pytest.raises(DeviceError, match="DMA"):
+        pl.read_clear_rx_overflow()
+    pl.close()
+    with pytest.raises(DeviceError, match="kapalı"):
+        pl.read_rx_dma_status()
+
+
+# ----------------------------------------------------------------------------- libiio scan
+def test_scan_serials_maps_uri_to_serial(monkeypatch):
+    a = fake_iio.make_pluto_board("usb:1.5.5", hw_serial="104473dc5993000917000e00c83b2e5e35")
+    n = fake_iio.make_pluto_board("ip:192.168.3.1", hw_serial="1044734c9605000f12003300af7c5b6a8e")
+    mod = fake_iio.install(monkeypatch, a, n, scan_extra={"local:": "Local devices"})
+    assert scan_serials() == {"usb:1.5.5": "104473dc5993000917000e00c83b2e5e35",
+                              "ip:192.168.3.1": "1044734c9605000f12003300af7c5b6a8e"}
+    assert mod.scan_contexts()["usb:1.5.5"].startswith("0456:b673 (Analog Devices Inc. PlutoSDR")
+
+
+def test_scan_serials_errors(monkeypatch):
+    fake_iio.uninstall(monkeypatch)
+    with pytest.raises(BackendUnavailable):
+        scan_serials()
+    mod = fake_iio.install(monkeypatch)
+
+    def broken():
+        raise OSError(errno.EIO, "Input/output error")
+
+    mod.scan_contexts = broken
+    with pytest.raises(DeviceError, match="tarama"):
+        scan_serials()

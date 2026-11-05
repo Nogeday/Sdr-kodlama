@@ -10,12 +10,12 @@ import uuid
 from typing import Any
 
 from ..bus.pubsub import Message, ProxyThread, Publisher, Subscriber
-from ..bus.topics import ALL_TOPICS, CTL_ACK, CTL_RX
+from ..bus.topics import ALL_TOPICS, CTL_ACK, CTL_RX, registry
 from ..core.config import AppConfig, BusConfig
 from ..core.errors import BusError, ConfigError
 from ..core.timeutil import mono
 from ..core.units import fmt_hz
-from .util import compact_json, load_app, parse_kv_list
+from .util import compact_json, load_app, nonfinite_paths, parse_kv_list
 
 #: Max wait for the subscription of a one-shot message's receiver (ZMQ slow joiner).
 ONE_SHOT_WAIT_S = 1.0
@@ -23,6 +23,8 @@ ONE_SHOT_WAIT_S = 1.0
 ONE_SHOT_LINGER_MS = 1000
 #: Minimum time between connecting the ack subscriber and sending the command.
 ACK_SUB_SETTLE_S = 0.2
+#: ``ctl.rx`` ``req_id`` length limit (contracts/schemas/ctl.rx.schema.json).
+REQ_ID_MAX_LEN = 128
 
 
 def _publisher(bus: BusConfig, src: str, endpoint: str | None = None) -> Publisher:
@@ -118,7 +120,10 @@ def summarize(msg: Message, limit: int = 220) -> str:
             s = f"{d['req_id']} → {d['target']}: {d['cmd']} {compact_json(d.get('args') or {})}"
         elif t == "ctl.ack":
             res = "OK" if d["ok"] else f"HATA: {d.get('error')}"
-            s = f"{d['req_id']} ← {d.get('target', '?')}: {d.get('cmd', '?')} {res} {compact_json(d.get('result'))}"
+            result = d.get("result")
+            s = f"{d['req_id']} ← {d.get('target', '?')}: {d.get('cmd', '?')} {res}"
+            if result is not None:
+                s += f" {compact_json(result)}"
         elif t == "cal.result":
             s = f"{d['device']} {d['kind']} via={d.get('applied_via', '-')} {compact_json(d['values'])}"
         elif t == "meas.result":
@@ -136,6 +141,11 @@ def summarize(msg: Message, limit: int = 220) -> str:
 def cmd_bus_echo(args: argparse.Namespace) -> int:
     app = load_app(args)
     topics = list(args.topics) if args.topics else list(ALL_TOPICS)
+    known = registry()
+    unknown = [t for t in topics if t not in known]
+    if unknown:
+        raise ConfigError(f"Bilinmeyen topic(ler): {unknown} — kayıtlı olanlar (contracts/topics.json): "
+                          f"{', '.join(sorted(known))}")
     ep = args.endpoint or _sub_endpoint(app.bus)
     count = 0
     with Subscriber(ep, topics) as sub:
@@ -174,8 +184,17 @@ def cmd_bus_send(args: argparse.Namespace) -> int:
         raise ConfigError("bus.ctl_endpoints boş: komutun bind edileceği uç noktayı --endpoint ile verin "
                           "(RX düğümleri bus.ctl_endpoints'e bağlanır)")
     endpoint = args.endpoint or (bus.ctl_endpoints[0] if bus.mode == "direct" else bus.proxy_frontend)
-    data: dict[str, Any] = {"req_id": args.req_id or uuid.uuid4().hex[:16], "target": args.target, "cmd": args.cmd}
+    req_id = uuid.uuid4().hex[:16] if args.req_id is None else str(args.req_id)
+    if not 1 <= len(req_id) <= REQ_ID_MAX_LEN:
+        raise ConfigError(f"--req-id 1–{REQ_ID_MAX_LEN} karakter olmalı ({len(req_id)} karakter geldi)")
+    if not args.target:
+        raise ConfigError("--target boş olamaz (cihaz adı ya da '*')")
+    data: dict[str, Any] = {"req_id": req_id, "target": args.target, "cmd": args.cmd}
     cmd_args = parse_kv_list(args.arg, "--arg")
+    bad = nonfinite_paths(cmd_args)
+    if bad:
+        raise ConfigError(f"--arg: sonlu olmayan sayı (nan/inf) bus üzerinden gönderilemez (JSON'da yok): "
+                          f"{', '.join(bad)}")
     if cmd_args:
         data["args"] = cmd_args
     ack_sub: Subscriber | None = None

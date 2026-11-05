@@ -8,9 +8,10 @@ import numpy as np
 import pytest
 
 from eds.calib.ppm import PpmEstimate
+from eds.core.config import AppConfig
 from eds.dsp.windows import get_window, window_info
-from eds.measure.base import run_measurement
-from eds.measure.specs.freq_resolution import analytic_dip_db, dip_analysis
+from eds.measure.base import MeasurementContext, run_measurement
+from eds.measure.specs.freq_resolution import FreqResolutionMeasurement, analytic_dip_db, dip_analysis
 
 from .spec_fixtures import check_contract, run_spec, sim_app, sim_context, source_enabled
 
@@ -80,10 +81,21 @@ def test_freq_resolution_two_tone_line_width_and_accuracy(tmp_path):
     assert abs(ex["freq_error_cal_hz"]) < 1.0
     assert ex["ppm_estimate"] == pytest.approx(dev.true_ppm, abs=1e-3)
     assert abs(ex["residual_ppm"]) < 1e-3
+    # MM-08: the in-situ figure shares the source reference — self-consistency, never "accuracy";
+    # the accuracy after correction comes from the independently stored calibration ppm
+    assert ex["freq_error_corrected_is_self_consistency"] is True and ex["reference_locked"] is True
+    assert ex["accuracy_verified"] is True and res.conditions["source_reference_locked"] is True
+    assert "öz-tutarlılık" in res.summary and "doğruluk değildir" in res.summary
+    assert "kalibrasyon ppm'i" in res.summary and "(doğruluk)" in res.summary
     assert not left_on and single_tone
     names = {f.name for f in res.figures}
     assert {"freq_resolution_resolved", "freq_resolution_unresolved", "freq_resolution_single_tone",
             "freq_resolution_dip_vs_separation"} <= names
+    # JURY-08: every measured dip is inside the figure (no hard-coded 45 dB ceiling)
+    dip = next(f for f in res.figures if f.name == "freq_resolution_dip_vs_separation")
+    measured = next(sr for sr in dip.series if sr.label == "Ölçülen çukur")
+    assert dip.ylim is not None and dip.ylim[0] <= min(measured.y) and max(measured.y) < dip.ylim[1]
+    assert dip.xlim is not None and max(measured.x) <= dip.xlim[1]
 
 
 def test_freq_resolution_single_tone_source_reports_rbw(tmp_path):
@@ -104,3 +116,30 @@ def test_freq_resolution_without_source(tmp_path):
     assert "freq_error_raw_hz" not in res.extra
     dip = next(f for f in res.figures if f.name == "freq_resolution_dip_vs_separation")
     assert [s.label.startswith("Hesap") for s in dip.series] == [True]
+
+
+def test_freq_resolution_unlocked_source_makes_no_absolute_accuracy_claim(tmp_path):
+    """MM-08: a source that is not reference-locked (e.g. the 2nd Pluto, ±25 ppm TCXO): the raw
+    error is only the TX-vs-RX reference difference and is labelled so."""
+    params = {"freq_resolution": {"reference_locked": False}}
+    with sim_context(sim_app(tmp_path, fc=FC, fs=FS, params=params), quick=True) as ctx:
+        ctx.source.max_tones = 1
+        res = run_measurement("freq_resolution", ctx)
+    check_contract(res, unit="Hz", min_spectrum_figs=1)
+    ex = res.extra
+    assert ex["reference_locked"] is False and ex["accuracy_verified"] is False
+    assert "referansa kilitli değil" in res.summary and "mutlak frekans doğruluğu iddia edilmez" in res.summary
+    assert "öz-tutarlılık" in res.summary and "(doğruluk)" not in res.summary
+
+
+def test_reference_lock_auto_detection():
+    class _PlutoTx:
+        name = "pluto_tx"
+
+    class _Scpi:
+        name = "scpi"
+
+    for src, want in ((_PlutoTx(), False), (_Scpi(), None)):
+        m = FreqResolutionMeasurement(MeasurementContext(app=AppConfig(), devices=[object()], source=src))
+        assert m._reference_locked({"reference_locked": None}) is want
+        assert m._reference_locked({"reference_locked": True}) is True

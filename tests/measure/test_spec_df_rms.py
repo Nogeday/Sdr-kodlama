@@ -24,7 +24,8 @@ from eds.hal import get_sim_world, open_devices
 from eds.hal.sim.world import Emitter
 from eds.hal.tx import SignalSource
 from eds.measure.base import MeasurementContext, run_measurement
-from eds.measure.specs.df_rms import NO_COHERENCE_FLAG, locate_tone
+from eds.measure.specs.df_rms import BLOCKER_SIM, NO_COHERENCE_FLAG, SIM_FLAG, AngleResult, locate_tone
+from eds.measure.targets import REASON_NO_COHERENCE
 
 from .spec_fixtures_b import assert_result_contract, dual_sim_app, run_spec, single_sim_app
 
@@ -47,7 +48,16 @@ def test_df_rms_shared_clock_quick(tmp_path):
     assert ex["coherent"] is True and ex["coherence"] > 0.99 and abs(ex["phase_drift_deg_per_s"]) < 1.0
     assert NO_COHERENCE_FLAG not in res.summary
     assert abs(ex["bias_deg"]) < 1.0 and ex["max_abs_deg"] < 3.0 and ex["n"] == 7 * 2
-    assert ex["recalibrations"] == 0 and ex["snr_db_mean"] > 40.0
+    # MM-06: realistic default SNR, always stated WITH its bandwidth (10 dB in 25 kHz ≈ 36 dB in a 61 Hz bin)
+    assert ex["recalibrations"] == 0 and ex["snr_bw_hz"] == 25e3 and ex["snr_bw_db"] == pytest.approx(10.0, abs=1.0)
+    rbw = window_info("blackmanharris", 65536).enbw_bins * FS / 65536
+    assert ex["snr_db_mean"] == pytest.approx(ex["snr_bw_db"] - 10 * math.log10(rbw / 25e3), abs=1e-9)
+    assert ex["snr_per_sample_db"] == pytest.approx(ex["snr_bw_db"] + 10 * math.log10(25e3 / FS), abs=1e-9)
+    assert f"SNR {ex['snr_bw_db']:.1f} dB / 25 kHz" in res.summary
+    assert 0.05 < res.value < 2.0                              # not a sub-millidegree "measurement"
+    # only thermal noise is modelled: said first in summary and method, and no target verdict
+    assert res.summary.startswith(SIM_FLAG) and "yalnız termal gürültü" in res.method
+    assert res.blockers == [BLOCKER_SIM] and "snr_sweep" not in ex           # quick: no SNR sweep
     # geometry of the simulator: d = 0.15 m at the target frequency
     assert ex["baseline_m"] == 0.15 and ex["d_over_lambda"] == pytest.approx(0.15 * F_TARGET / 299_792_458.0)
     assert ex["unambiguous_max_deg"] > 80.0 and ex["ambiguous"] is False
@@ -80,7 +90,7 @@ def test_df_rms_members_stay_open_and_stream_delay_is_calibrated_out(tmp_path):
     """rx1 runs 37 samples ahead: a CW pilot cannot resolve that delay, so a calibration at
     another baseband frequency would be off by 360·Δf_bb·37/fs; calibrating at the target
     frequency keeps the bearings exact."""
-    app = dual_sim_app(tmp_path, time_offset=37, params={"angles_deg": [-45.0, 0.0, 30.0]})
+    app = dual_sim_app(tmp_path, time_offset=37, params={"angles_deg": [-45.0, 0.0, 30.0], "sim_snr_db": 40.0})
     from eds.measure.session import build_context, close_context
 
     ctx = build_context(app, quick=True)
@@ -103,6 +113,7 @@ def test_df_rms_independent_clocks_flags_non_coherence(tmp_path):
     assert res.status == "ok", (res.error, res.extra.get("traceback"))
     ex = res.extra
     assert NO_COHERENCE_FLAG in res.summary and ex["coherent"] is False
+    assert REASON_NO_COHERENCE in res.blockers
     e0, e1 = (d.true_ppm * 1e-6 for d in ctx.devices)
     drift = 360.0 * F_PILOT * (1.0 / (1.0 + e1) - 1.0 / (1.0 + e0))
     assert ex["phase_drift_deg_per_s"] == pytest.approx(drift, rel=0.01)
@@ -116,7 +127,7 @@ def test_df_rms_single_device_is_skipped(tmp_path):
 
 
 def test_df_rms_geometry_mismatch_is_reported(tmp_path):
-    app = dual_sim_app(tmp_path, params={"baseline_m": 0.10, "angles_deg": [0.0, 30.0]})
+    app = dual_sim_app(tmp_path, params={"baseline_m": 0.10, "angles_deg": [0.0, 30.0], "sim_snr_db": 40.0})
     res, _ = run_spec(app, "df_rms", quick=True)
     assert res.status == "ok"
     assert res.extra["geometry_warnings"] and "UYARI" in res.summary
@@ -222,3 +233,43 @@ def test_locate_tone_frequency_and_snr():
     enbw = window_info("blackmanharris", n).enbw_bins
     snr_truth = 10.0 * math.log10(amp ** 2 / (sigma2 * enbw / n))   # SNR in RBW = ENBW·fs/n
     assert snr == pytest.approx(snr_truth, abs=0.5)
+
+
+def test_df_rms_snr_sweep_follows_thermal_noise_law(tmp_path):
+    """Outside --quick the simulator repeats the scan per SNR: with thermal noise only the
+    phase error, hence the bearing RMS, scales as 1/√SNR (20 dB → ×10)."""
+    app = dual_sim_app(tmp_path, params={"angles_deg": [-30.0, 0.0, 30.0], "repeats": 6,
+                                         "snr_sweep_db": [0.0, 20.0]})
+    res, _ = run_spec(app, "df_rms", quick=False)
+    assert res.status == "ok", (res.error, res.extra.get("traceback"))
+    sw = res.extra["snr_sweep"]
+    assert [w["snr_target_db"] for w in sw] == [0.0, 20.0]
+    for w in sw:
+        assert w["snr_bw_db"] == pytest.approx(w["snr_target_db"], abs=1.0) and w["n"] == 18
+    assert 4.0 < sw[0]["rms_deg"] / sw[1]["rms_deg"] < 25.0
+    assert "RMS–SNR (25 kHz): +0 dB" in res.summary
+    fig = next(f for f in res.figures if f.name == "df_rms_vs_snr")
+    assert fig.series[0].y == [w["rms_deg"] for w in sw] and fig.vlines[0][0] == 10.0
+
+
+def test_df_rms_uncertainty_uses_angles_as_independent_units():
+    """MM-06: the K repeats at one angle share that angle's bias; the uncertainty of the RMS
+    comes from the M per-angle mean squared errors, not from M·K 'independent' samples."""
+    from eds.core.config import AppConfig
+    from eds.df.interferometer import Bearing
+    from eds.measure.specs.df_rms import DfRmsMeasurement
+
+    m = DfRmsMeasurement(MeasurementContext(app=AppConfig(), devices=[]))
+    rng = np.random.default_rng(7)
+    angles = []
+    for true, bias in ((-30.0, 0.0), (0.0, 2.0), (10.0, 0.0), (30.0, 2.0)):
+        r = AngleResult(true_deg=true)
+        for _ in range(50):
+            r.bearings.append(Bearing(az_deg=true + bias + 1e-3 * rng.standard_normal(), phase_deg=0.0,
+                                      coherence=1.0, quality=1.0))
+            r.snr_db.append(30.0)
+        angles.append(r)
+    st = m._stats(angles, {"n": 65536, "fs": FS, "snr_bw_hz": 25e3})
+    assert st["rms_deg"] == pytest.approx(math.sqrt(2.0), rel=1e-3)
+    e2 = np.array([0.0, 4.0, 0.0, 4.0])
+    assert st["rms_unc_deg"] == pytest.approx(np.std(e2, ddof=1) / (2 * math.sqrt(2.0) * 2.0), rel=1e-2)   # ≈ 0.41°

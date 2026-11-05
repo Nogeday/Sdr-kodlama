@@ -12,6 +12,8 @@
 #   3. Örnek hizalaması: iki USB akışı farklı anlarda başlar; ortak geniş bantlı sinyalin
 #      çapraz korelasyonu ile gecikme (tam + kesirli örnek) kestirilir. Herhangi bir
 #      overflow'da hizalama kaybolur (grup bloğu overflow=True) → yeniden kalibrasyon.
+#      SoapyPlutoSDR overflow RAPORLAMAZ: EDS bunu ince katmandan (control_uri) RX DMA durum
+#      yazmacıyla algılar — DF için her iki cihazın control_uri'si ÇALIŞIR olmalıdır.
 #   4. Koherens kontrolü (eds.df.coherence.check_coherence): faz kayması °/s ve koherens
 #      eşiği sağlanmadan DF sonucu yayımlanmaz.
 #
@@ -29,14 +31,23 @@
 #     0: 0456:b673 (Analog Devices Inc. PlutoSDR (ADALM-PLUTO)), serial=1044730a1997000b1500... [usb:1.5.5]
 #     1: 0456:b673 (Analog Devices Inc. PlutoSDR (ADALM-PLUTO)), serial=104473dc5993001d0f00... [usb:1.6.5]
 #
-#   $ SoapySDRUtil --find="driver=plutosdr"      → uri=usb:1.5.5, label=... (seri no)
+#   $ SoapySDRUtil --find="driver=plutosdr"      → uri=usb:1.5.5, label="PlutoSDR #0 usb:1.5.5"
+#                                                  (SoapyPlutoSDR seri numarası GÖSTERMEZ)
 #
-# Takımın kuralı: seri numarasını Pluto kasasına etiketleyin (A/B) ve aşağıdaki
-# "seri:" yorumlarını güncelleyin; her oturumda URI ↔ seri eşlemesini iio_info -s ile
-# doğrulayın. EDS açılışta okuduğu seri numarasını DeviceInfo.serial / rapora yazar ve
-# kalibrasyonu cal/<seri>.json'dan yükler — yanlış eşleme raporda görünür.
-# NOT: SoapyPlutoSDR "serial" anahtarına göre FİLTRELEMEZ; args içine yalnızca
-# serial = "..." yazmak yanlış cihazı sessizce açabilir. Seçim URI ile yapılır.
+# Takımın kuralı: seri numarasını Pluto kasasına etiketleyin (A/B). İki seçenek:
+#   * args = { driver = "plutosdr", serial = "<A seri no ya da tekil önek>" } — ÖNERİLİR:
+#     SoapyPlutoSDR "serial" ile filtrelemez, bu yüzden EDS seriyi libiio taramasıyla
+#     (python3-libiio, iio_info -s ile aynı) URI'ye çevirir; USB adresi değişse de doğru
+#     Pluto açılır. Eşleşme yoksa / önek belirsizse adaylar listelenerek hata verilir.
+#   * args = { driver = "plutosdr", uri = "usb:B.D.I" } — tam URI; yeniden takınca
+#     değişebilir, her oturumda iio_info -s ile doğrulayın.
+# EDS açılışta okuduğu seri numarasını DeviceInfo.serial / rapora yazar ve kalibrasyonu
+# cal/<seri>.json'dan yükler. İnce katmanın (control_uri) seri numarası da akış cihazınınkiyle
+# karşılaştırılır: control_uri yanlış Pluto'yu gösteriyorsa ince katman kullanılmaz (uyarı).
+#
+# SÜREÇ BAŞINA TEK PLUTO: SoapyPlutoSDR süreç başına TEK libiio bağlamı tutar (ikinci Pluto
+# ilkine bağlanır). Bu yüzden her Pluto kendi alt sürecinde çalışır: isolation = "auto"
+# (varsayılan; iki Pluto açılınca otomatik "subprocess") ya da açıkça "subprocess".
 
 [[device]]
 name = "rx0"                      # "Pluto A" — referans eleman (dizi ekseninin başı); seri: <A seri no>

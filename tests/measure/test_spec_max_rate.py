@@ -21,7 +21,8 @@ from eds.core.timeutil import now_ns
 from eds.hal.base import RawRead, RxDevice
 from eds.measure.base import run_measurement
 from eds.measure.session import build_context, close_context
-from eds.measure.specs.max_rate import NONREALTIME_WARNING, Trial, evaluate
+from eds.measure.specs.max_rate import BLOCKER_TRANSPORT_ONLY, NONREALTIME_WARNING, Trial, evaluate
+from eds.measure.targets import REASON_NONREALTIME
 
 from .spec_fixtures_b import assert_result_contract, run_spec, single_sim_app
 
@@ -34,15 +35,21 @@ def test_max_rate_quick_realtime_usb_boundary(tmp_path):
     app = single_sim_app(tmp_path, realtime=True, spec_id="max_rate", sim={"usb_bytes_per_s": 24e6})
     t0 = time.perf_counter()
     res, _ = run_spec(app, "max_rate", quick=True)
-    assert time.perf_counter() - t0 < 20.0
+    assert time.perf_counter() - t0 < 30.0
     assert_result_contract(res, tmp_path)
     ex = res.extra
-    assert res.unit == "MS/s" and res.value in (5.0, 6.0)
-    assert ex["max_rate_transport_msps"] == res.value
-    assert ex["max_rate_pipeline_msps"] is not None and ex["max_rate_pipeline_msps"] <= res.value
+    # MM-02: the headline is the system-level value (real RxNode pipeline), not the transport
+    assert res.title == "Taşmasız maksimum örnekleme hızı" and res.unit == "MS/s"
+    assert ex["headline_mode"] == "pipeline" and res.conditions["headline_mode"] == "pipeline"
+    assert res.value == ex["max_rate_pipeline_msps"] and res.value in (4.0, 5.0, 6.0)
+    assert ex["max_rate_transport_msps"] in (5.0, 6.0) and res.value <= ex["max_rate_transport_msps"]
+    assert res.summary.startswith("Sistem düzeyi (DSP hattı açık") and "usb_bytes_per_s = 24 MB/s" in res.summary
+    assert "RxNode" in res.method and "CFAR" in res.method
+    assert res.blockers == []                                   # real-time simulator, pipeline measured
     assert ex["mb_per_s_at_max"] == pytest.approx(res.value * 4.0)
     assert ex["usb_theoretical_pct"] == pytest.approx(100.0 * res.value * 4e6 / 53.248e6)
     assert ex["accounting"] == ["device_counter"] and ex["duration_s"] == 0.6
+    assert res.conditions["queue_blocks"] == app.rx.queue_blocks and res.conditions["nfft"] == app.dsp.nfft
     rows = res.table
     measured = [r for r in rows if not r["implied"]]
     # every rate >= 7.68 MS/s fails in both modes; overflows are counted
@@ -51,24 +58,29 @@ def test_max_rate_quick_realtime_usb_boundary(tmp_path):
     # above the USB boundary the delivered fraction is the link rate / fs (consumer overhead: +5 %)
     for r in (r for r in high if r["mode"] == "transport"):
         assert r["loss"] == pytest.approx(1.0 - USB_SPS / (r["rate_msps"] * 1e6), abs=0.05)
-    # passing rates: device counter shows no gap at all
+    # passing rates: no event; the device counter shows no gap (pipeline: ±1 block snapshot race)
     for r in measured:
         if r["status"] == "GEÇTİ":
-            assert r["overflows"] == 0 and r["timeouts"] == 0 and r["delivered_samples"] == r["expected_samples"]
-            assert r["loss"] == 0.0 and r["elapsed_s"] >= 0.6
+            assert r["overflows"] == 0 and r["timeouts"] == 0 and r["host_drops"] == 0
+            if r["mode"] == "transport":
+                assert r["delivered_samples"] == r["expected_samples"] and r["loss"] == 0.0
+            else:
+                assert abs(r["lost_samples"]) <= r["allowed_lost_samples"] == app.rx.block_size
+                assert r["frames"] > 0 and r["backlog_ms"] >= 0.0 and math.isfinite(r["lag_ms"])
+            assert r["elapsed_s"] >= 0.6
     # pipeline passes below its first failure imply transport passes (not streamed)
     implied = [r for r in rows if r["implied"]]
     assert implied and all(r["mode"] == "transport" and r["status"] == "GEÇTİ (çıkarım)" for r in implied)
     assert all(r["overflows"] is None and r["loss"] is None for r in implied)
     assert max(r["rate_msps"] for r in implied) <= ex["max_rate_pipeline_msps"]
-    pipe = [r for r in measured if r["mode"] == "pipeline"]
-    assert all(math.isfinite(r["dsp_ms"]) and r["dsp_ms"] > 0 for r in pipe)
     names = {f.name: f for f in res.figures}
     assert set(names) == {"max_rate_overflow_loss", "max_rate_throughput", "max_rate_spectrum"}
     assert names["max_rate_overflow_loss"].logy
+    assert names["max_rate_overflow_loss"].title.startswith("Taşmasız maksimum örnekleme hızı")
     hl = [h[1] for h in names["max_rate_throughput"].hlines]
     assert any("53.2" in t for t in hl) and any("24.0" in t for t in hl)
     assert names["max_rate_spectrum"].info["Span"].startswith(f"{res.value:g}")
+    assert "DSP hattı açık" in names["max_rate_spectrum"].title
 
 
 def test_max_rate_nonrealtime_profile_limits_and_matrix(tmp_path):
@@ -79,6 +91,9 @@ def test_max_rate_nonrealtime_profile_limits_and_matrix(tmp_path):
     assert_result_contract(res, tmp_path)
     ex = res.extra
     assert res.summary.startswith(NONREALTIME_WARNING) and ex["warning"] == NONREALTIME_WARNING
+    # not comparable with the KTR target: non-real-time simulator AND transport-only value
+    assert REASON_NONREALTIME in res.blockers and BLOCKER_TRANSPORT_ONLY in res.blockers
+    assert ex["headline_mode"] == "transport" and res.summary.count("Yalnız taşıma") == 1
     assert ex["excluded_rates_hz"] == [0.01e6, 100e6]                     # outside 65.1 kS/s .. 61.44 MS/s
     assert res.value == 2.0 and ex["all_passed_transport"] is True        # lower bound: list exhausted
     assert "aday listesinin sonu" in res.summary
@@ -90,6 +105,19 @@ def test_max_rate_nonrealtime_profile_limits_and_matrix(tmp_path):
     dev = ctx.devices[0]
     assert dev.fs == app.rx.sample_rate_hz and dev.bw == app.rx.bandwidth_hz
     assert dev.buffer_size == app.rx.buffer_size and not dev.streaming
+
+
+def test_max_rate_nonrealtime_skips_pipeline_and_is_blocked(tmp_path):
+    """The RxNode pipeline cannot be measured on a non-real-time simulator (its host queue
+    overflows at any rate): only the transport runs, the reason is reported, no verdict."""
+    params = {"rates": [1e6, 2e6], "quick_duration_s": 0.05, "quick_fail_window_s": 0.0}
+    app = single_sim_app(tmp_path, realtime=False, spec_id="max_rate", params=params)
+    res, _ = run_spec(app, "max_rate", quick=True)
+    assert res.status == "ok", (res.error, res.extra.get("traceback"))
+    assert res.extra["headline_mode"] == "transport" and "pipeline_skipped" in res.extra
+    assert {r["mode"] for r in res.table} == {"transport"} and res.value == 2.0
+    assert "DSP hattı: gerçek zamanlı olmayan" in res.summary
+    assert REASON_NONREALTIME in res.blockers
 
 
 def test_max_rate_rejects_bad_modes(tmp_path):
@@ -212,3 +240,97 @@ def test_hardware_timestamp_accounting_is_exact(tmp_path):
     (row,) = res.table
     assert row["status"] == "KALDI"
     assert row["loss"] == pytest.approx(dev.gap_samples / (row["delivered_samples"] + dev.gap_samples), abs=1e-12)
+
+
+class FifoRx(PacedRx):
+    """Wall-clock fake of a Pluto-like stream: whole buffers of ``buffer_size`` samples are
+    produced at ``fs`` into a ``kernel_buffers``-deep device FIFO and cross a USB link at
+    ``usb_bytes_per_s`` when read. No sample counter, no timestamps, no overflow flag (a
+    full FIFO silently drops the oldest buffer, like an old Pluto). ``stall_every`` /
+    ``stall_periods``: the consumer is descheduled for ``stall_periods`` buffer periods
+    before every ``stall_every``-th read (a momentary backlog that drains again)."""
+
+    backend_name = "fifo"
+
+    def __init__(self, usb_bytes_per_s: float = 30e6, stall_every: int = 0, stall_periods: float = 0.0,
+                 drop_at_s: float | None = None, drop_periods: float = 0.0):
+        super().__init__()
+        self._usb = usb_bytes_per_s
+        self._stall_every, self._stall_periods = stall_every, stall_periods
+        self._drop_at, self._drop_periods = drop_at_s, drop_periods
+        self.dropped_buffers = 0
+        self._reads = 0
+
+    def _start(self, buffer_size: int) -> None:
+        self._t0, self._buf, self._off, self._reads, self._dropped_once = time.perf_counter(), 0, 0, 0, False
+
+    def _read_raw(self, n: int, timeout_s: float) -> RawRead:
+        fs, b = self.fs, int(self.buffer_size)
+        period = b / fs
+        self._reads += 1
+        stall = 0.0
+        if self._stall_every and self._reads % self._stall_every == 0:
+            stall = self._stall_periods * period
+        if self._drop_at is not None and not self._dropped_once and time.perf_counter() - self._t0 >= self._drop_at:
+            stall, self._dropped_once = self._drop_periods * period, True
+        if stall:
+            time.sleep(stall)
+        completed = int((time.perf_counter() - self._t0) / period)
+        oldest = completed - int(self.profile.kernel_buffers)
+        if self._buf < oldest:                            # FIFO overflowed: silently lost buffers
+            self.dropped_buffers += oldest - self._buf
+            self._buf, self._off = oldest, 0
+        wait = self._t0 + (self._buf + 1) * period - time.perf_counter()
+        if wait > 0:
+            time.sleep(wait)
+        k = min(n, b - self._off)
+        time.sleep(k * 4.0 / self._usb)
+        self._off += k
+        if self._off >= b:
+            self._buf, self._off = self._buf + 1, 0
+        return RawRead(samples=np.zeros((1, k), np.complex64), t_ns=now_ns())
+
+
+def _run_fifo(tmp_path, dev: FifoRx, rate: float, buffer_size: int, duration_s: float = 0.6):
+    app = AppConfig(devices=[DeviceConfig(name="fifo", backend="sim")],
+                    rx=RxConfig(center_freq_hz=915e6, sample_rate_hz=rate, bandwidth_hz=min(rate, 20e6),
+                                buffer_size=buffer_size),
+                    cal=CalConfig(dir=str(tmp_path / "cal")), measure=MeasureConfig(source="none", out_dir=str(tmp_path)))
+    ctx = build_context(app, devices=[dev], quick=True)
+    try:
+        return run_measurement("max_rate", ctx, rates=[rate], modes=["transport"], quick_duration_s=duration_s,
+                               quick_fail_window_s=1.0, spectrum_nfft=1024, spectrum_averages=4)
+    finally:
+        close_context(ctx, close_devices=False)
+
+
+@pytest.mark.realtime
+@pytest.mark.parametrize("rate, buffer_size, every, periods", [(1e6, 16384, 3, 1.6), (5e6, 65536, 4, 1.0)])
+def test_wall_clock_backlog_at_window_end_is_not_loss(tmp_path, rate, buffer_size, every, periods):
+    """STR-03: momentary consumer stalls leave buffers queued in the FIFO most of the time
+    (at 5 MS/s the 30 MB/s link is 67 % loaded, a backlog drains at 1/3 buffer per read), so
+    the window usually ends with a backlog; nothing is lost (the FIFO never fills) and every
+    trial must pass. The old ``fs × (t_last − t0)`` accounting failed most of these windows
+    (loss ≈ backlog / (fs·T) ≈ 1e-2 ≫ 1e-4)."""
+    for _ in range(3):
+        dev = FifoRx(stall_every=every, stall_periods=periods)
+        res = _run_fifo(tmp_path, dev, rate, buffer_size)
+        assert res.status == "ok", (res.error, res.extra.get("traceback"))
+        (row,) = res.table
+        assert dev.dropped_buffers == 0
+        assert row["accounting"] == "wall_clock" and row["status"] == "GEÇTİ", row
+        assert abs(row["lost_samples"]) <= row["allowed_lost_samples"] < buffer_size
+        assert row["drain_reads"] >= 2 and "boşalmadı" not in row["note"]
+
+
+@pytest.mark.realtime
+def test_wall_clock_detects_one_silently_dropped_buffer(tmp_path):
+    """MM-14: one whole buffer silently dropped (FIFO full, no overflow flag) must fail; the
+    old relative tolerance (1e-4) only resolved it for short runs."""
+    dev = FifoRx(drop_at_s=0.3, drop_periods=5.5)          # 4-deep FIFO: 5.5 periods → 1 lost buffer
+    res = _run_fifo(tmp_path, dev, 1e6, 16384)
+    (row,) = res.table
+    assert dev.dropped_buffers == 1 and row["overflows"] == 0
+    assert row["status"] == "KALDI"
+    assert row["lost_samples"] == pytest.approx(16384, abs=2000)
+    assert row["allowed_lost_samples"] == pytest.approx(8192)

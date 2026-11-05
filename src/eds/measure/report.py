@@ -14,6 +14,20 @@ method + measurement time + device serial + software version and git commit.
     results.json           {"meta": ..., "results": [MeasurementResult.to_dict(False) ...]}
     report.html            self-contained (inline CSS, PNGs as base64), print-friendly A4
 
+How a number was obtained is never lost on the way to the jury:
+
+* simulator data (``conditions['simulated']`` / backend ``sim``) → SİMÜLASYON banner (MD,
+  HTML), ``simulated`` column in summary.csv and a red footer tag on every figure;
+* quick mode (``conditions['quick']``) → "HIZLI MOD - KTR'de kullanılmaz" banner, header row,
+  ``quick`` column / ``meta['quick']`` and the same figure footer tag;
+* a result that must not be compared with its KTR target (``MeasurementResult.blockers``,
+  ``extra['verdict_note']`` from :func:`eds.measure.targets.apply_targets`, or the
+  :func:`eds.measure.targets.verdict_blockers` rules) shows ``KARŞILAŞTIRILMADI`` with the
+  reason instead of GEÇTİ / KALDI.
+
+Wide raw-data tables are split into column groups (constant columns listed once) so that
+the printed A4 page never cuts columns off.
+
 CSV files are UTF-8 *with BOM* (``utf-8-sig``) so that Excel shows Turkish characters;
 read them with ``encoding="utf-8-sig"``. Plotting is optional: when matplotlib is missing
 or a figure fails, the failure is logged, written into the report next to the figure
@@ -47,12 +61,22 @@ from ..core.timeutil import iso_utc, now_ns, stamp
 from ..core.units import fmt_hz
 from .base import MeasurementResult
 from .base import jsonable as _jsonable
-from .targets import TARGET_NOTE_KEY, resolve_targets_path
+from .targets import (
+    NO_VERDICT_SUFFIX,
+    TARGET_NOTE_KEY,
+    TARGET_REQUIRE_KEY,
+    VERDICT_NOTE_KEY,
+    resolve_targets_path,
+    verdict_blockers,
+)
 
 log = logging.getLogger(__name__)
 
 DEFAULT_TITLE = "EDS RX - KTR Nicel Spesifikasyon Ölçüm Raporu"
 SIM_BANNER = "SİMÜLASYON VERİSİ - donanım ölçümü değildir"
+QUICK_TAG = "HIZLI MOD - KTR'de kullanılmaz"
+QUICK_BANNER = f"{QUICK_TAG} (--quick: azaltılmış nokta sayısı / ölçüm süresi; hedefle karşılaştırılmaz)"
+SIM_TAG = "SİMÜLASYON"
 EXT_PROFILE = "ad9364_pluto_ext"
 EXT_BANNER = ("SPESİFİKASYON DIŞI MOD - ad9364_pluto_ext profili kullanıldı "
               "(AD9363 resmî sınırları dışında; spesifikasyon dışı mod)")
@@ -60,19 +84,20 @@ RAW_ROWS_IN_DOC = 50
 UNKNOWN = "unknown"
 
 PASS, FAIL, NO_TARGET, SKIPPED, ERROR = "GEÇTİ", "KALDI", "HEDEF YOK", "ATLANDI", "HATA"
-VERDICTS: tuple[str, ...] = (PASS, FAIL, NO_TARGET, SKIPPED, ERROR)
-_BADGE_CLASS = {PASS: "pass", FAIL: "fail", NO_TARGET: "none", SKIPPED: "skip", ERROR: "err"}
+NOT_COMPARED = "KARŞILAŞTIRILMADI"
+VERDICTS: tuple[str, ...] = (PASS, FAIL, NOT_COMPARED, NO_TARGET, SKIPPED, ERROR)
+_BADGE_CLASS = {PASS: "pass", FAIL: "fail", NOT_COMPARED: "nc", NO_TARGET: "none", SKIPPED: "skip", ERROR: "err"}
 
 SUMMARY_CSV_COLUMNS: tuple[str, ...] = (
     "spec_id", "title", "value", "unit", "target_op", "target", "passed", "status", "conditions",
     "method", "verdict", "uncertainty", "summary", "error", "t_start_utc", "duration_s",
-    "device_name", "device_serial", "eds_version", "git_commit",
+    "device_name", "device_serial", "eds_version", "git_commit", "quick", "simulated", "verdict_note",
 )
 
 _DASH = "—"
 _DB_UNITS = frozenset({"db", "dbm", "dbfs", "dbc", "dbw", "dbi", "db/hz", "dbm/hz", "dbfs/hz", "dbc/hz"})
 _ANGLE_UNITS = frozenset({"°", "deg", "derece"})
-_HIDDEN_EXTRA = frozenset({"traceback", TARGET_NOTE_KEY})
+_HIDDEN_EXTRA = frozenset({"traceback", TARGET_NOTE_KEY, VERDICT_NOTE_KEY, TARGET_REQUIRE_KEY})
 
 # condition keys → Turkish labels (full table) and short labels (main table)
 _COND_LABELS: dict[str, str] = {
@@ -84,20 +109,51 @@ _COND_LABELS: dict[str, str] = {
     "pfa": "Yanlış alarm olasılığı (Pfa)", "calibrated": "Güç kalibrasyonlu", "level_ref": "Seviye referansı",
     "duration_s": "Süre", "overlap": "Örtüşme", "span_hz": "Açıklık (span)", "start_hz": "Başlangıç frekansı",
     "stop_hz": "Bitiş frekansı", "step_hz": "Adım", "repeats": "Tekrar sayısı", "baseline_m": "Taban hattı",
+    "quick": "Hızlı mod (--quick)", "simulated": "Simülasyon verisi",
 }
 _SHORT_KEYS: tuple[tuple[str, str], ...] = (
     ("fc_hz", "fc"), ("fs_hz", "fs"), ("rbw_hz", "RBW"), ("gain_db", "G"), ("averages", "ort."),
     ("source", "kaynak"), ("temperature_c", "T"),
 )
 _SHORT_MAX = 4
+# Conditions that define each spec's number (the main table must show *these*, not a generic
+# fc/fs list: e.g. the swept range of scan_speed, the stream duration of max_rate).
+_SPEC_SHORT_KEYS: dict[str, tuple[tuple[str, str], ...]] = {
+    "sensitivity": (("fc_hz", "fc"), ("rbw_hz", "RBW"), ("pfa", "Pfa"), ("gain_db", "G"),
+                    ("trials", "deneme/seviye")),
+    "dynamic_range": (("fc_hz", "fc"), ("fs_hz", "fs"), ("rbw_hz", "RBW"), ("gain_db", "G")),
+    "inst_bw": (("fc_hz", "fc"), ("configs", "fs / BW"), ("rbw_hz", "RBW"), ("gain_db", "G")),
+    "scan_speed": (("start_hz", "aralık"), ("fs_hz", "fs"), ("rbw_hz", "RBW"), ("averages", "ort."),
+                   ("repeats", "tekrar")),
+    "freq_resolution": (("fc_hz", "fc"), ("rbw_hz", "RBW"), ("window", "pencere"), ("nfft", "N")),
+    "df_rms": (("f_target_hz", "f"), ("baseline_m", "d"), ("angles_deg", "θ"), ("repeats", "tekrar"),
+               ("coherent", "koherent")),
+    "image_rejection": (("fcs_hz", "fc"), ("fs_hz", "fs"), ("offsets_frac", "δ/fs"), ("gain_db", "G")),
+    "max_rate": (("duration_s", "süre/hız"), ("buffer_size", "buffer"), ("interface", "arayüz"),
+                 ("headline_mode", "mod")),
+    "latency": (("headline_mode", "mod"), ("n_events", "olay"), ("transport", "taşıma"), ("fs_hz", "fs")),
+}
+_SPEC_SHORT_MAX = 5
+_SHORT_HZ_DIGITS = {"rbw_hz": 4}
 _DENSITY_SUFFIXES: tuple[tuple[str, str], ...] = (
     ("_dbm_hz", "dBm/Hz"), ("_dbfs_hz", "dBFS/Hz"), ("_dbc_hz", "dBc/Hz"), ("_db_hz", "dB/Hz"),
 )
-_UNIT_SUFFIXES: tuple[tuple[str, str], ...] = (
-    ("_dbm", "dBm"),
-    ("_dbfs", "dBFS"), ("_dbc", "dBc"), ("_db", "dB"), ("_deg", "°"), ("_pct", "%"),
-    ("_ms", "ms"), ("_us", "µs"), ("_m", "m"), ("_ppm", "ppm"), ("_sps", "S/s"),
-)
+# key token → display unit (the value is already in that unit)
+_TOKEN_UNITS: dict[str, str] = {
+    "dbm": "dBm", "dbfs": "dBFS", "dbc": "dBc", "db": "dB", "deg": "°", "pct": "%", "ms": "ms", "us": "µs",
+    "m": "m", "ppm": "ppm", "sps": "S/s", "msps": "MS/s", "ghz": "GHz", "mhz": "MHz", "khz": "kHz",
+    "mb": "MB", "bins": "bin",
+}
+# tokens with special formatting: hz (scaled frequency), s / ns (durations), c (temperature)
+_SPECIAL_TOKENS = frozenset({"hz", "s", "ns", "c"})
+# statistic / qualifier tokens that may follow the unit token (``snr_db_mean``, ``ppm_estimate``)
+_QUALIFIERS = frozenset({
+    "mean", "avg", "std", "min", "max", "median", "rms", "p50", "p90", "p95", "p99", "est", "estimate",
+    "abs", "worst", "best", "typ", "nominal", "measured", "meas", "raw", "corrected", "total", "ci95",
+    "lo", "hi", "limit", "floor", "peak", "actual", "at",
+})
+_PER_UNITS: dict[str, str] = {"s": "s", "db": "dB", "hz": "Hz", "m": "m", "ms": "ms", "c": "°C", "deg": "°"}
+_PER_RE = re.compile(r"^(.*)_per_(s|db|hz|m|ms|c|deg)$")
 
 
 # ============================================================================ formatting
@@ -123,9 +179,10 @@ def _fixed(v: float, decimals: int) -> str:
     return s.lstrip("-") if float(s) == 0.0 else s
 
 
-def _smart_decimals(v: float, sig: int = 3, max_sig: int = 5) -> int:
+def _smart_decimals(v: float, sig: int = 3, max_sig: int = 4) -> int:
     """Decimals for ≥ ``sig`` significant digits, extended up to ``max_sig`` when that
-    represents the value exactly (61.44 → 2, 4.0 → 2, 18.23456 → 1, 2441.4 → 1)."""
+    represents the value exactly (61.44 → 2, 4.0 → 2, 18.23456 → 1, 44.467 → 1: a value
+    rounded upstream to 5 digits is not shown with spurious precision)."""
     if v == 0.0:
         return sig - 1
     mag = math.floor(math.log10(abs(v)))
@@ -141,8 +198,9 @@ def _default_decimals(v: float, unit: str) -> int | None:
     u = unit.strip()
     if _is_db(u):
         return 1
-    if u in _ANGLE_UNITS:
-        return 2 if abs(v) < 10.0 else 1
+    if u in _ANGLE_UNITS:              # ≥ 2 significant digits for small angles (0.0028 °)
+        d = 2 if abs(v) < 10.0 else 1
+        return max(d, 1 - math.floor(math.log10(abs(v)))) if 0.0 < abs(v) < 1.0 else d
     if u == "°C":
         return 1
     if v != 0.0 and (abs(v) < 1e-3 or abs(v) >= 1e12):
@@ -231,61 +289,212 @@ def _compact_json(v: Any, limit: int | None = None) -> str:
     return s
 
 
-def format_condition(key: str, value: Any, *, limit: int | None = 300, hz_digits: int = 9) -> str:
+def _round_floats(v: Any) -> Any:
+    """Display copy with floats at 6 significant digits (never used for CSV / JSON files)."""
+    if isinstance(v, float):
+        return float(f"{v:.6g}") if math.isfinite(v) else None
+    if isinstance(v, Mapping):
+        return {str(k): _round_floats(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_round_floats(x) for x in v]
+    return v
+
+
+def _display_json(v: Any, limit: int | None) -> str:
+    return _compact_json(_round_floats(_jsonable(v)), limit)
+
+
+def _truncate(s: str, limit: int | None) -> str:
+    return s if limit is None or len(s) <= limit else s[: limit - 1] + "…"
+
+
+def fmt_sps(v: float, digits: int = 6) -> str:
+    """Sample rate: ``4e6`` → ``"4 MS/s"`` (a sample rate is not a bandwidth: never "MHz")."""
+    a = abs(v)
+    for div, unit in ((1e9, "GS/s"), (1e6, "MS/s"), (1e3, "kS/s")):
+        if a >= div:
+            return f"{v / div:.{digits}g} {unit}"
+    return f"{v:.{digits}g} S/s"
+
+
+def _key_tokens(key: str) -> list[str]:
+    """Lower-case tokens of a key without trailing statistic qualifiers."""
+    tokens = key.lower().split("_")
+    while len(tokens) > 1 and tokens[-1] in _QUALIFIERS:
+        tokens.pop()
+    return tokens
+
+
+def _unit_token(key: str) -> str:
+    """The key's unit token (``"db"``, ``"hz"``, ``"s"`` …) or ``""``."""
+    tokens = _key_tokens(key)
+    last = tokens[-1] if tokens else ""
+    if len(tokens) == 1 and last not in ("hz", "ppm", "temperature"):
+        return ""
+    return last if last in _TOKEN_UNITS or last in _SPECIAL_TOKENS else ""
+
+
+def _is_rate_key(k: str) -> bool:
+    """``fs_hz``, ``fs_max_hz``, ``rates_hz``, ``sample_rate_hz`` … are sample rates (S/s)."""
+    tokens = k.split("_")
+    if len(tokens) < 2 or tokens[-1] != "hz":
+        return False
+    head = tokens[:-1]
+    return "fs" in head or head[-1] == "rates" or head[-2:] == ["sample", "rate"]
+
+
+def _has_unit(key: str) -> bool:
+    k = key.lower()
+    return bool(_unit_token(k) or _PER_RE.match(k) or _is_rate_key(k) or k.endswith("_hz_per_s")
+                or any(k.endswith(sfx) for sfx, _ in _DENSITY_SUFFIXES))
+
+
+def _is_scalar(v: Any) -> bool:
+    v = _py(v)
+    return v is None or isinstance(v, (bool, str)) or _is_number(v)
+
+
+def _format_mapping(key: str, value: Mapping[Any, Any], limit: int | None, hz_digits: int) -> str:
+    """Flat mapping → ``"k: v; k2: v2"`` with every value formatted by its own key's unit, or
+    by the parent key's unit (``timing_share_pct = {"tune": 0.42}`` → ``tune: 0.420 %``)."""
+    items = list(value.items())
+    flat = all(_is_scalar(x) or (isinstance(_py(x), (list, tuple)) and all(_is_scalar(y) for y in _py(x)))
+               for _, x in items)
+    if not items or len(items) > 12 or not flat:
+        return _display_json(value, limit)
+    parts = []
+    for k2, v2 in items:
+        sub = str(k2) if _has_unit(str(k2)) else key
+        parts.append(f"{k2}: {format_condition(sub, v2, limit=None, hz_digits=hz_digits)}")
+    return _truncate("; ".join(parts), limit)
+
+
+def format_condition(key: str, value: Any, *, limit: int | None = 300, hz_digits: int = 9,
+                     unit: str | None = None) -> str:
     """Format a condition / extra metric using its key's unit suffix
-    (``*_hz`` → ``915 MHz``, ``*_s`` → ``12.5 ms``, ``*_db`` → ``40.0 dB``, ``*_c`` → ``°C`` …).
-    ``hz_digits`` = significant digits of frequencies (9 keeps commanded values exact)."""
+    (``*_hz`` → ``915 MHz``, ``fs_hz`` → ``4 MS/s``, ``*_s`` → ``12.5 ms``, ``*_db`` →
+    ``40.0 dB``, ``*_c`` → ``°C``, ``*_per_db`` → ``/dB``, ``snr_db_mean`` → ``dB`` …).
+    ``hz_digits`` = significant digits of frequencies (9 keeps commanded values exact);
+    ``unit`` = unit of a key that carries none in its name (e.g. from a ``<key>_unit``
+    sibling). Flat mappings are formatted item by item."""
     value = _py(value)
     if value is None:
         return _DASH
     if isinstance(value, bool):
         return "evet" if value else "hayır"
-    if isinstance(value, (list, tuple)) and value and all(_is_number(x) for x in value) and len(value) <= 8:
-        return ", ".join(format_condition(key, x, hz_digits=hz_digits) for x in value)
-    if isinstance(value, (Mapping, list, tuple)):
-        return _compact_json(value, limit)
+    if isinstance(value, Mapping):
+        return _format_mapping(key, value, limit, hz_digits)
+    if isinstance(value, (list, tuple)):
+        if value and all(_is_number(_py(x)) for x in value) and len(value) <= 8:
+            return ", ".join(format_condition(key, x, hz_digits=hz_digits, unit=unit) for x in value)
+        if value and all(isinstance(_py(x), str) for x in value) and len(value) <= 12:
+            return _truncate(", ".join(str(x) for x in value), limit)
+        return _display_json(value, limit)
     if isinstance(value, str):
-        return value if limit is None or len(value) <= limit else value[: limit - 1] + "…"
+        return _truncate(value, limit)
     if not _is_number(value):
         return str(value)
     v = float(value)
     if not math.isfinite(v):
         return _non_finite_text(v)
     k = key.lower()
-    for suffix, unit in _DENSITY_SUFFIXES:          # before "_hz": "*_dbm_hz" is a density, not a frequency
+    for suffix, dens in _DENSITY_SUFFIXES:          # before "_hz": "*_dbm_hz" is a density, not a frequency
         if k.endswith(suffix):
-            return format_value(v, unit)
+            return format_value(v, dens)
     if k.endswith("_hz_per_s"):
         return f"{fmt_hz(v, 6)}/s"
-    if k.endswith("_hz") or k == "hz":
+    m = _PER_RE.match("_".join(_key_tokens(k)))
+    if m:                                           # "_per_db" / "_per_s" before "_db" / "_s"
+        tok = m.group(1).split("_")[-1]
+        num = "Hz" if tok == "hz" else ("s" if tok == "s" else _TOKEN_UNITS.get(tok, ""))
+        return f"{format_number(v, num)} {num}/{_PER_UNITS[m.group(2)]}"
+    if _is_rate_key(k):
+        return fmt_sps(v, hz_digits)
+    tok = _unit_token(k)
+    if tok == "hz":
         return fmt_hz(v, hz_digits)
-    if k.endswith("_ns"):
+    if tok == "ns":
         return iso_utc(int(v)) if v > 1e15 else _fmt_duration(v * 1e-9)
-    if k.endswith("_s") and not k.endswith("_per_s"):
+    if tok == "s":
         return _fmt_duration(v)
-    if k.endswith("_c") or k == "temperature":
+    if tok == "c" or k == "temperature":
         return format_value(v, "°C")
-    for suffix, unit in _UNIT_SUFFIXES:
-        if k.endswith(suffix):
-            return format_value(v, unit)
-    if k.endswith("ppm"):
-        return format_value(v, "ppm")
+    u = _TOKEN_UNITS.get(tok) or (unit or "").strip()
+    if u:
+        if isinstance(value, numbers.Integral) and not _is_db(u) and u not in _ANGLE_UNITS:
+            return f"{int(value)} {u}"
+        return format_value(v, u)
     if isinstance(value, numbers.Integral):
         return str(int(value))
     return format_number(v)
 
 
+def _has_target(r: MeasurementResult) -> bool:
+    return _finite(r.target) and r.target_op in ("<=", ">=")
+
+
+def no_verdict_reason(r: MeasurementResult) -> str:
+    """Why ``r`` is shown as KARŞILAŞTIRILMADI instead of GEÇTİ / KALDI ("" = comparable).
+
+    Collects ``extra['verdict_note']`` (written by :func:`eds.measure.targets.apply_targets`,
+    includes unmet target conditions), the measurement's own ``blockers`` and, for a
+    result with a target, the :func:`eds.measure.targets.verdict_blockers` rules (quick
+    mode, non-real-time simulator, no coherence, unit/calibration mismatch) — so a report
+    never shows a verdict for such a number even if the targets were applied elsewhere.
+    Only ``ok`` results with a finite value can be "not compared" (else ATLANDI / HATA).
+    """
+    if r.status != "ok" or not _finite(r.value):
+        return ""
+    parts: list[str] = []
+    note = str(r.extra.get(VERDICT_NOTE_KEY) or "").strip()
+    if note:
+        parts.append(note[: -len(NO_VERDICT_SUFFIX)].strip() if note.endswith(NO_VERDICT_SUFFIX) else note)
+    derived = [str(b) for b in r.blockers]
+    if _has_target(r):
+        from . import specs  # noqa: F401  (spec units for the unit-mismatch rule)
+
+        derived += verdict_blockers(r)
+    for b in derived:
+        b = b.strip()
+        if b and not any(b in p for p in parts):
+            parts.append(b)
+    if not parts and _has_target(r) and r.passed is None:
+        parts.append("hedef değerlendirilmedi")
+    return "; ".join(parts)
+
+
 def verdict(r: MeasurementResult) -> str:
-    """Report status word: GEÇTİ / KALDI / HEDEF YOK / ATLANDI / HATA."""
+    """Report status word: GEÇTİ / KALDI / KARŞILAŞTIRILMADI / HEDEF YOK / ATLANDI / HATA."""
     if r.status == "skipped":
         return SKIPPED
     if r.status != "ok" or not _finite(r.value):
         return ERROR
+    if no_verdict_reason(r):
+        return NOT_COMPARED
     if r.passed is True:
         return PASS
     if r.passed is False:
         return FAIL
     return NO_TARGET
+
+
+def is_quick(r: MeasurementResult) -> bool:
+    """Result produced in quick mode (``--quick``: fewer points / shorter durations)."""
+    return r.conditions.get("quick") is True
+
+
+def is_simulated(r: MeasurementResult, default: bool = False) -> bool:
+    """Result produced on the simulator (``conditions['simulated']``, else backend ``sim``
+    of the result or of any device member; ``default`` when nothing says)."""
+    flag = r.conditions.get("simulated")
+    if isinstance(flag, (bool, np.bool_)):
+        return bool(flag)
+    backends = {str(r.conditions.get("backend") or "")}
+    if r.device:
+        backends |= {d["backend"] for d in _walk_devices(r.device)}
+    backends.discard("")
+    backends.discard("group")
+    return "sim" in backends if backends else default
 
 
 def _target_text(r: MeasurementResult, with_unit: bool = False) -> str:
@@ -296,12 +505,40 @@ def _target_text(r: MeasurementResult, with_unit: bool = False) -> str:
     return f"{sym} {num}" + (f" {r.unit}" if with_unit and r.unit else "")
 
 
+def _summarize_numbers(key: str, vals: Sequence[Any]) -> str:
+    nums = [float(_py(v)) for v in vals]
+    if len(nums) <= 3:
+        return ", ".join(format_condition(key, v, hz_digits=6) for v in nums)
+    return (f"{format_condition(key, min(nums), hz_digits=6)} … {format_condition(key, max(nums), hz_digits=6)}"
+            f" ({len(nums)})")
+
+
+def _short_value(key: str, c: Mapping[str, Any]) -> str:
+    v = _py(c[key])
+    if key == "start_hz" and _is_number(v) and _is_number(_py(c.get("stop_hz"))):
+        return f"{fmt_hz(float(v), 6)} – {fmt_hz(float(_py(c['stop_hz'])), 6)}"
+    if key == "configs" and isinstance(v, (list, tuple)) and v and all(
+            isinstance(_py(x), (list, tuple)) and len(_py(x)) == 2 for x in v):
+        if len(v) > 2:
+            return f"{len(v)} yapılandırma"
+        return ", ".join(f"{fmt_sps(float(_py(x)[0]), 4)} / {fmt_hz(float(_py(x)[1]), 4)}" for x in v)
+    if isinstance(v, (list, tuple)) and v and all(_is_number(_py(x)) for x in v):
+        return _summarize_numbers(key, v)
+    return format_condition(key, v, limit=40, hz_digits=_SHORT_HZ_DIGITS.get(key, 6))
+
+
 def short_conditions(r: MeasurementResult) -> str:
-    """At most four key conditions for the main table (``fc 915 MHz; fs 4 MHz; …``)."""
+    """The conditions that define the number, for the main table: the spec's own keys
+    (``scan_speed``: swept range; ``max_rate``: stream duration, buffer, interface …),
+    else ``fc``/``fs``/RBW/gain (at most four), e.g. ``fc 915 MHz; fs 4 MS/s; RBW 1.465 kHz``."""
     c = r.conditions or {}
-    parts = [f"{label} {format_condition(k, c[k], limit=40, hz_digits=6)}" for k, label in _SHORT_KEYS if k in c]
+    keys = _SPEC_SHORT_KEYS.get(r.spec_id)
+    if keys and any(k in c for k, _ in keys):
+        parts = [f"{label} {_short_value(k, c)}" for k, label in keys if k in c]
+        return "; ".join(parts[:_SPEC_SHORT_MAX])
+    parts = [f"{label} {_short_value(k, c)}" for k, label in _SHORT_KEYS if k in c]
     if not parts:
-        skip = {"backend", "serial", "profile"}
+        skip = {"backend", "serial", "profile", "quick", "simulated"}
         parts = [f"{k} {format_condition(k, v, limit=40, hz_digits=6)}" for k, v in c.items() if k not in skip]
     return "; ".join(parts[:_SHORT_MAX]) or _DASH
 
@@ -401,7 +638,8 @@ def _flags(results: Sequence[MeasurementResult], devices: Sequence[Mapping[str, 
     for r in results:
         backends.add(str(r.conditions.get("backend", "")))
         profiles.add(str(r.conditions.get("profile", "")))
-    return "sim" in backends, EXT_PROFILE in profiles
+    sim = "sim" in backends or any(r.conditions.get("simulated") is True for r in results)
+    return sim, EXT_PROFILE in profiles
 
 
 @dataclass
@@ -427,6 +665,8 @@ class _Doc:
     sim: bool
     ext: bool
     user_meta: dict[str, Any]
+    quick_ids: list[str] = field(default_factory=list)   # spec ids measured in quick mode
+    n_results: int = 0
     figures: dict[int, list[_FigureEntry]] = field(default_factory=dict)
     tables: dict[int, str] = field(default_factory=dict)
 
@@ -441,13 +681,41 @@ class _Doc:
         return f"{self.commit}-dirty" if self.dirty else self.commit
 
     @property
+    def quick(self) -> bool:
+        return bool(self.quick_ids)
+
+    @property
     def banners(self) -> list[tuple[str, str]]:
         out = []
         if self.sim:
             out.append(("sim", SIM_BANNER))
+        if self.quick:
+            partial = len(self.quick_ids) < self.n_results
+            out.append(("quick", QUICK_BANNER + (f" — hızlı modda ölçülenler: {', '.join(self.quick_ids)}"
+                                                 if partial else "")))
         if self.ext:
             out.append(("ext", EXT_BANNER))
         return out
+
+    @property
+    def mode_text(self) -> str:
+        if not self.n_results:
+            return _DASH
+        if not self.quick:
+            return "tam (--quick kullanılmadı)"
+        if len(self.quick_ids) < self.n_results:
+            return f"KARIŞIK — hızlı modda: {', '.join(self.quick_ids)} ({QUICK_TAG})"
+        return "HIZLI (--quick): azaltılmış nokta sayısı / ölçüm süresi — KTR'de kullanılmaz"
+
+
+def figure_flags(r: MeasurementResult, doc_sim: bool = False) -> str:
+    """Footer tag stamped on every figure of ``r`` (``""`` for a full hardware measurement)."""
+    parts = []
+    if is_simulated(r, doc_sim):
+        parts.append(SIM_TAG)
+    if is_quick(r):
+        parts.append(QUICK_TAG)
+    return " · ".join(parts)
 
 
 # ============================================================================ file helpers
@@ -520,6 +788,7 @@ def _render_figures(results: Sequence[MeasurementResult], rdir: Path, doc: _Doc)
         entries: list[_FigureEntry] = []
         serial = _result_serial(r)
         date = iso_utc(r.t_start_ns) if r.t_start_ns > 0 else doc.generated
+        flags = figure_flags(r, doc.sim)
         for j, fig in enumerate(r.figures):
             entry = _FigureEntry(title=fig.title or fig.name)
             entries.append(entry)
@@ -531,6 +800,8 @@ def _render_figures(results: Sequence[MeasurementResult], rdir: Path, doc: _Doc)
             info.setdefault("date", date)
             if serial:
                 info.setdefault("serial", serial)
+            if flags:
+                info.setdefault("flags", flags)
             stem = _unique(_safe_name(fig.name, f"{r.spec_id}_fig{j + 1}"), used)
             rel = f"figures/{stem}.png"
             try:
@@ -578,6 +849,7 @@ def _write_summary_csv(results: Sequence[MeasurementResult], path: Path, doc: _D
             _csv_cell(r.uncertainty), r.summary, r.error,
             iso_utc(r.t_start_ns) if r.t_start_ns > 0 else "", _csv_cell(r.duration_s),
             dev.get("name", ""), _result_serial(r), doc.version, doc.commit_tag,
+            _csv_cell(is_quick(r)), _csv_cell(is_simulated(r, doc.sim)), no_verdict_reason(r),
         ])
     _write_csv(path, SUMMARY_CSV_COLUMNS, rows)
 
@@ -590,7 +862,8 @@ def _report_meta(results: Sequence[MeasurementResult], doc: _Doc) -> dict[str, A
         "title": doc.title, "generated_utc": doc.generated, "generated_ns": doc.t_ns,
         "eds_version": doc.version, "git_commit": doc.commit, "git_dirty": doc.dirty,
         "config_path": doc.config_path, "targets_file": doc.targets_path, "devices": doc.devices,
-        "simulation": doc.sim, "out_of_spec_profile": doc.ext, "banners": [b for _, b in doc.banners],
+        "simulation": doc.sim, "quick": doc.quick, "quick_specs": list(doc.quick_ids),
+        "out_of_spec_profile": doc.ext, "banners": [b for _, b in doc.banners],
         "measured_from_utc": iso_utc(min(starts)) if starts else "",
         "measured_to_utc": iso_utc(max(ends)) if ends else "",
         "verdicts": {v: sum(1 for r in results if verdict(r) == v) for v in VERDICTS},
@@ -604,6 +877,9 @@ def _write_json(results: Sequence[MeasurementResult], path: Path, doc: _Doc) -> 
     for r in results:
         d = r.to_dict(with_figures=False)
         d["verdict"] = verdict(r)
+        reason = no_verdict_reason(r)
+        if reason:
+            d["no_verdict_reason"] = reason
         items.append(d)
     payload = {"meta": _jsonable(_report_meta(results, doc)), "results": items}
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str, allow_nan=False) + "\n",
@@ -624,6 +900,8 @@ def _header_rows(results: Sequence[MeasurementResult], doc: _Doc) -> list[tuple[
         ("KTR hedef dosyası", doc.targets_path or _DASH),
         ("Ölçüm sayısı", f"{len(results)}  ("
          + ", ".join(f"{v} {counts[v]}" for v in VERDICTS if counts[v]) + ")" if results else "0"),
+        ("Ölçüm modu", doc.mode_text),
+        ("Veri kaynağı", "SİMÜLASYON (donanım ölçümü değil)" if doc.sim else "donanım"),
     ]
     for k, v in doc.user_meta.items():
         if k in ("devices", "git_commit", "git_dirty", "config_path"):
@@ -647,6 +925,12 @@ def _main_rows(results: Sequence[MeasurementResult]) -> list[list[str]]:
              _target_text(r), verdict(r), short_conditions(r)] for i, r in enumerate(results, 1)]
 
 
+def _status_text(r: MeasurementResult) -> str:
+    """Status word, with the reason when the result was not compared with its target."""
+    reason = no_verdict_reason(r)
+    return f"{NOT_COMPARED} — {reason}" if reason else verdict(r)
+
+
 def _condition_label(key: str) -> str:
     return _COND_LABELS.get(key, "")
 
@@ -657,9 +941,18 @@ def _result_facts(r: MeasurementResult) -> list[tuple[str, str]]:
     res = format_value(r.value, r.unit, r.uncertainty) if _finite(r.value) else "değer yok"
     tgt = _target_text(r, with_unit=True)
     facts = [("Sonuç", f"{res} — {v}" + (f" (hedef {tgt})" if tgt != _DASH else ""))]
+    reason = no_verdict_reason(r)
+    if reason:
+        facts.append(("Karşılaştırılmama nedeni", reason))
+    if is_quick(r):
+        facts.append(("Mod", "hızlı (--quick): azaltılmış nokta sayısı / ölçüm süresi — KTR'de kullanılmaz"))
     note = r.extra.get(TARGET_NOTE_KEY)
     if note:
         facts.append(("Hedef notu", str(note)))
+    req = r.extra.get(TARGET_REQUIRE_KEY)
+    if isinstance(req, Mapping) and req:
+        facts.append(("Hedef koşulları", "; ".join(f"{k} = {_py(v)!r}" if isinstance(_py(v), str) else
+                                                   f"{k} = {_py(v)}" for k, v in req.items())))
     if r.summary:
         facts.append(("Özet", r.summary))
     facts.append(("Yöntem", r.method or _DASH))
@@ -678,20 +971,102 @@ def _result_facts(r: MeasurementResult) -> list[tuple[str, str]]:
     return facts
 
 
-def _raw_cell(v: Any) -> str:
+def _is_freq_key(key: str) -> bool:
+    k = key.lower()
+    return (k.endswith("_hz") and not k.endswith("_per_hz")
+            and not any(k.endswith(sfx) for sfx, _ in _DENSITY_SUFFIXES))
+
+
+def _raw_cell(key: str, v: Any) -> str:
+    """Raw-table cell. Frequencies (``*_hz``) keep 1 Hz resolution with their unit
+    (``935.401 MHz``: ``%.6g`` would print two tones 1.3 kHz apart as the same number)."""
     v = _py(v)
     if v is None:
         return ""
     if isinstance(v, bool):
         return "evet" if v else "hayır"
-    if isinstance(v, numbers.Integral):
+    if isinstance(v, numbers.Integral) and not _is_freq_key(key):
         return str(int(v))
     if isinstance(v, numbers.Real):
         f = float(v)
-        return f"{f:.6g}" if math.isfinite(f) else _non_finite_text(f)
+        if not math.isfinite(f):
+            return _non_finite_text(f)
+        if _is_freq_key(key):              # 1 Hz resolution (≥ 6 digits): 935.399353 MHz
+            digits = min(10, max(6, math.floor(math.log10(abs(f))) + 1)) if f else 6
+            return fmt_sps(f, digits) if _is_rate_key(key.lower()) else fmt_hz(f, digits)
+        return f"{f:.6g}"
     if isinstance(v, (Mapping, list, tuple)):
-        return _compact_json(v, 80)
+        return _display_json(v, 80)
     return str(v)
+
+
+def _unit_hint(key: str, mapping: Mapping[str, Any], r: MeasurementResult) -> str | None:
+    """Unit of a key whose name carries none: a ``<key>_unit`` sibling, or the result's
+    unit for the key named like the spec (``sensitivity`` in the sensitivity extras)."""
+    u = mapping.get(f"{key}_unit")
+    if isinstance(u, str) and u.strip():
+        return u.strip()
+    if key == r.spec_id and r.unit:
+        return r.unit
+    return None
+
+
+def _kv_rows(mapping: Mapping[str, Any], r: MeasurementResult) -> list[tuple[str, str]]:
+    return [(k, format_condition(k, v, unit=_unit_hint(k, mapping, r))) for k, v in mapping.items()]
+
+
+# Raw tables in the A4 HTML/PDF: estimated column widths at the raw-table font (7.4 pt
+# DejaVu Sans, digits 0.64 em) → columns are split into groups that fit the page width.
+_RAW_BUDGET_MM = 170.0
+_RAW_CHAR_MM = 1.72
+_RAW_PAD_MM = 3.8
+_RAW_LONG_CHARS = 28          # longer text cells wrap (and count as this many characters)
+
+
+@dataclass
+class _RawLayout:
+    cols: list[str]
+    shown: list[list[str]]                        # cell texts of the rows shown (all columns)
+    groups: list[list[int]]                       # column indices per table
+    constant: list[tuple[str, str]] = field(default_factory=list)   # (column, value) dropped
+
+
+def _raw_col_width(head: str, cells: Iterable[str]) -> float:
+    head_chars = max(len(p) for p in re.split(r"(?<=_)", head)) if head else 1
+    n = max([head_chars, *(min(len(c), _RAW_LONG_CHARS) for c in cells)])
+    return n * _RAW_CHAR_MM + _RAW_PAD_MM
+
+
+def _raw_layout(r: MeasurementResult) -> _RawLayout:
+    """Columns of the raw table split into page-width groups. When a split is needed, the
+    columns that hold the same value on every row are listed once instead of repeated, and
+    every group after the first repeats the first column so rows stay identifiable."""
+    cols = _table_columns(r.table)
+    text = [[_raw_cell(c, row.get(c)) for c in cols] for row in r.table]
+    shown = text[:RAW_ROWS_IN_DOC]
+    widths = [_raw_col_width(c, (row[j] for row in shown)) for j, c in enumerate(cols)]
+    if sum(widths) <= _RAW_BUDGET_MM or len(cols) <= 1:
+        return _RawLayout(cols, shown, [list(range(len(cols)))])
+    constant: list[tuple[str, str]] = []
+    keep = list(range(len(cols)))
+    if len(text) > 1:
+        const_idx = [j for j in range(len(cols)) if all(row[j] == text[0][j] for row in text)]
+        if len(const_idx) < len(cols):
+            constant = [(cols[j], text[0][j] or _DASH) for j in const_idx]
+            keep = [j for j in keep if j not in const_idx]
+    groups: list[list[int]] = []
+    cur: list[int] = []
+    used = 0.0
+    first = keep[0]
+    for j in keep:
+        if cur and used + widths[j] > _RAW_BUDGET_MM:
+            groups.append(cur)
+            cur, used = ([first], widths[first]) if j != first else ([], 0.0)
+        cur.append(j)
+        used += widths[j]
+    if cur:
+        groups.append(cur)
+    return _RawLayout(cols, shown, groups, constant)
 
 
 # ---------------------------------------------------------------------------- markdown
@@ -713,7 +1088,13 @@ def _build_markdown(results: Sequence[MeasurementResult], doc: _Doc) -> str:
     L += ["## Cihazlar", ""]
     L += _md_table(_DEVICE_HEAD, _device_rows(doc)) if doc.devices else ["Cihaz bilgisi yok.", ""]
     L += ["## Özet tablo", ""]
-    L += _md_table(_MAIN_HEAD, _main_rows(results)) if results else ["Ölçüm sonucu yok.", ""]
+    if results:
+        rows = _main_rows(results)
+        for row, r in zip(rows, results):
+            row[5] = _status_text(r)
+        L += _md_table(_MAIN_HEAD, rows)
+    else:
+        L += ["Ölçüm sonucu yok.", ""]
     if results:
         L += ["## Ölçümler", ""]
     for i, r in enumerate(results):
@@ -723,12 +1104,12 @@ def _build_markdown(results: Sequence[MeasurementResult], doc: _Doc) -> str:
         if r.conditions:
             L += ["#### Koşullar", ""]
             L += _md_table(["Koşul", "Değer"], [
-                [f"{_condition_label(k)} (`{k}`)" if _condition_label(k) else f"`{k}`", format_condition(k, v)]
-                for k, v in r.conditions.items()])
+                [f"{_condition_label(k)} (`{k}`)" if _condition_label(k) else f"`{k}`", text]
+                for k, text in _kv_rows(r.conditions, r)])
         extra = {k: v for k, v in r.extra.items() if k not in _HIDDEN_EXTRA}
         if extra:
             L += ["#### Ek metrikler", ""]
-            L += _md_table(["Metrik", "Değer"], [[f"`{k}`", format_condition(k, v)] for k, v in extra.items()])
+            L += _md_table(["Metrik", "Değer"], [[f"`{k}`", text] for k, text in _kv_rows(extra, r)])
         figs = doc.figures.get(i, [])
         if figs:
             L += ["#### Grafikler", ""]
@@ -744,7 +1125,7 @@ def _build_markdown(results: Sequence[MeasurementResult], doc: _Doc) -> str:
             shown = r.table[:RAW_ROWS_IN_DOC]
             L += ["#### Ham veri", "",
                   f"İlk {len(shown)} / {len(r.table)} satır; tamamı: [{rel}]({rel})", ""]
-            L += _md_table(cols, [[_raw_cell(row.get(c)) for c in cols] for row in shown])
+            L += _md_table(cols, [[_raw_cell(c, row.get(c)) for c in cols] for row in shown])
         tb = r.extra.get("traceback")
         if tb:
             L += ["#### Hata ayrıntısı", "", "```text", str(tb).rstrip(), "```", ""]
@@ -755,7 +1136,7 @@ def _build_markdown(results: Sequence[MeasurementResult], doc: _Doc) -> str:
 # ---------------------------------------------------------------------------- html
 _CSS = """
 :root{--ink:#0b0b0b;--ink2:#52514e;--muted:#8a8984;--line:#d9d8d4;--head:#f3f2ef;
---pass:#1a7f37;--fail:#cf222e;--none:#6e7781;--skip:#9a6700;--err:#8250df}
+--pass:#1a7f37;--fail:#cf222e;--nc:#bc4c00;--none:#6e7781;--skip:#9a6700;--err:#8250df}
 *{box-sizing:border-box;-webkit-print-color-adjust:exact;print-color-adjust:exact}
 @page{size:A4;margin:14mm 12mm 16mm 12mm}
 html{background:#ffffff}
@@ -772,14 +1153,21 @@ th{background:var(--head);font-weight:600}
 thead{display:table-header-group}
 tr{break-inside:avoid}
 td.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
-td.raw{font-variant-numeric:tabular-nums;white-space:nowrap}
+table.raw{font-size:7.4pt;margin:1mm 0 2.5mm}
+table.raw th{white-space:normal;padding:.8mm 1.2mm}
+td.raw{font-variant-numeric:tabular-nums;white-space:nowrap;padding:.8mm 1.2mm}
+td.raw.long{white-space:normal;min-width:28mm}
+.rawwrap{overflow-x:auto;max-width:100%}
+.grp{margin:2mm 0 0}
+.why{font-size:7.4pt;color:var(--ink2);margin-top:.6mm;line-height:1.25}
 .kv td:first-child{width:34%;color:var(--ink2)}
 .badge{display:inline-block;padding:.3mm 2mm;border-radius:2mm;color:#ffffff;font-weight:700;
 font-size:7.8pt;white-space:nowrap;letter-spacing:.02em}
 .b-pass{background:var(--pass)}.b-fail{background:var(--fail)}.b-none{background:var(--none)}
-.b-skip{background:var(--skip)}.b-err{background:var(--err)}
+.b-skip{background:var(--skip)}.b-err{background:var(--err)}.b-nc{background:var(--nc)}
 .banner{border:2px solid #cf222e;background:#fff1f0;color:#a40e26;padding:2.5mm 3mm;font-weight:700;
 margin:2mm 0 4mm;font-size:11pt}
+.banner.quick{border-color:#bc4c00;background:#fff1e5;color:#953800}
 .banner.ext{border-color:#9a6700;background:#fff8e6;color:#7a4f00}
 .facts{margin:0 0 3mm;padding:0;list-style:none}
 .facts li{margin:.8mm 0}
@@ -794,6 +1182,7 @@ section.meas{break-before:page;padding-top:2mm}
 footer{margin-top:8mm;color:var(--muted);font-size:8pt;border-top:.6px solid var(--line);padding-top:2mm}
 a{color:#1f5fae}
 @media screen{body{padding:10mm 6mm}section.meas{border-top:2px solid var(--line);margin-top:8mm}}
+@media print{.rawwrap{overflow:visible}}
 """
 
 
@@ -821,6 +1210,30 @@ def _html_table(head: Sequence[str], rows: Iterable[Sequence[str]], *, cls: str 
     return "".join(out)
 
 
+def _html_raw_tables(r: MeasurementResult) -> str:
+    """Raw rows as one or more page-width tables (see :func:`_raw_layout`)."""
+    lay = _raw_layout(r)
+    out: list[str] = []
+    if lay.constant:
+        out.append('<p class="note">Tüm satırlarda aynı: '
+                   + "; ".join(f"<code>{_h(c)}</code> = {_h(v)}" for c, v in lay.constant) + "</p>")
+    n = len(lay.groups)
+    for g, idx in enumerate(lay.groups, 1):
+        if n > 1:
+            out.append(f'<p class="note grp">Sütun grubu {g}/{n}'
+                       + (f" (ilk sütun <code>{_h(lay.cols[idx[0]])}</code> tekrarlanır)" if g > 1 else "")
+                       + "</p>")
+        head = "".join(f"<th>{_h(lay.cols[j]).replace('_', '_<wbr>')}</th>" for j in idx)
+        body = []
+        for row in lay.shown:
+            cells = "".join(f'<td class="{"raw long" if len(row[j]) > _RAW_LONG_CHARS else "raw"}">{_h(row[j])}</td>'
+                            for j in idx)
+            body.append(f"<tr>{cells}</tr>")
+        out.append(f'<div class="rawwrap"><table class="raw"><thead><tr>{head}</tr></thead>'
+                   f'<tbody>{"".join(body)}</tbody></table></div>')
+    return "".join(out)
+
+
 def _img_data_uri(path: Path) -> str:
     return "data:image/png;base64," + base64.b64encode(path.read_bytes()).decode("ascii")
 
@@ -839,8 +1252,10 @@ def _build_html(results: Sequence[MeasurementResult], doc: _Doc, rdir: Path) -> 
     if results:
         rows = []
         for i, (row, r) in enumerate(zip(_main_rows(results), results)):
+            reason = no_verdict_reason(r)
+            status = _badge(verdict(r)) + (f'<div class="why">{_h(reason)}</div>' if reason else "")
             rows.append([_h(row[0]), f'<a href="#m{i + 1}">{_h(row[1])}</a>', _h(row[2]), _h(row[3]),
-                         _h(row[4]), _badge(verdict(r)), _h(row[6])])
+                         _h(row[4]), status, _h(row[6])])
         P.append(_html_table(_MAIN_HEAD, rows, num_cols=(0, 2, 4), escape=[False] * len(_MAIN_HEAD)))
     else:
         P.append('<p class="note">Ölçüm sonucu yok.</p>')
@@ -853,12 +1268,11 @@ def _build_html(results: Sequence[MeasurementResult], doc: _Doc, rdir: Path) -> 
         if r.conditions:
             P.append("<h4>Koşullar</h4>")
             P.append(_html_table(["Koşul", "Anahtar", "Değer"], [
-                [_condition_label(k) or k, k, format_condition(k, v)] for k, v in r.conditions.items()], cls="kv"))
+                [_condition_label(k) or k, k, text] for k, text in _kv_rows(r.conditions, r)], cls="kv"))
         extra = {k: v for k, v in r.extra.items() if k not in _HIDDEN_EXTRA}
         if extra:
             P.append("<h4>Ek metrikler</h4>")
-            P.append(_html_table(["Metrik", "Değer"], [[k, format_condition(k, v)] for k, v in extra.items()],
-                                 cls="kv"))
+            P.append(_html_table(["Metrik", "Değer"], _kv_rows(extra, r), cls="kv"))
         figs = doc.figures.get(i, [])
         if figs:
             P.append("<h4>Grafikler</h4>")
@@ -871,12 +1285,11 @@ def _build_html(results: Sequence[MeasurementResult], doc: _Doc, rdir: Path) -> 
                 P.append(f'<p class="figerr">{_h(cap)}: {_h(e.error)}</p>')
         if r.table:
             rel = doc.tables.get(i, "")
-            cols = _table_columns(r.table)
             shown = r.table[:RAW_ROWS_IN_DOC]
             P.append("<h4>Ham veri</h4>")
             P.append(f'<p class="note">İlk {len(shown)} / {len(r.table)} satır; tamamı: '
                      f'<a href="{_h(rel)}">{_h(rel)}</a></p>')
-            P.append(_html_table(cols, [[_raw_cell(row.get(c)) for c in cols] for row in shown], raw=True))
+            P.append(_html_raw_tables(r))
         tb = r.extra.get("traceback")
         if tb:
             P.append(f"<h4>Hata ayrıntısı</h4><pre>{_h(str(tb).rstrip())}</pre>")
@@ -921,7 +1334,8 @@ def write_report(
     sim, ext = _flags(results, devices)
     doc = _Doc(title=title, t_ns=t_ns, generated=iso_utc(t_ns), version=__version__, commit=commit,
                dirty=dirty, config_path=config_path, targets_path=targets_path, devices=devices, sim=sim,
-               ext=ext, user_meta=user_meta)
+               ext=ext, user_meta=user_meta, quick_ids=[r.spec_id for r in results if is_quick(r)],
+               n_results=len(results))
 
     rdir = _make_report_dir(Path(out_dir), t_ns)
     for r in results:

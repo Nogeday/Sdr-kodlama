@@ -132,7 +132,17 @@ def cmd_info(args: argparse.Namespace) -> int:
         extra = f"  args={compact_json(d.args)}" if d.args else ""
         sim = f"  sim={compact_json(d.sim)}" if d.sim and d.backend == "sim" else ""
         ctl = f"  control_uri={d.control_uri}" if d.control_uri else ""
-        print(f"  {d.name}: backend={d.backend}  profil={d.profile}  kanallar={d.channels}{extra}{ctl}{sim}")
+        iso = f"  isolation={d.isolation}" if d.isolation != "auto" else ""
+        print(f"  {d.name}: backend={d.backend}  profil={d.profile}  kanallar={d.channels}{extra}{ctl}{iso}{sim}")
+    if any(d.backend == "soapy" for d in app.devices) or me.source == "pluto_tx":
+        from ..hal.factory import isolation_plan, pluto_tx_in_process
+
+        plan = ", ".join(f"{n}={m}" for n, m in isolation_plan(app).items())
+        src = ""
+        if me.source == "pluto_tx":
+            src = "; pluto_tx kaynağı " + ("bu süreçte (source_args.isolate = false)" if pluto_tx_in_process(app)
+                                           else "ayrı süreçte")
+        print(f"Süreç yalıtımı (birlikte açılınca; SoapyPlutoSDR süreç başına tek Pluto): {plan}{src}")
     rbw = window_info(dsp.window, int(dsp.nfft)).enbw_bins * rx.sample_rate_hz / dsp.nfft
     n_win = welch_len(int(dsp.nfft), int(dsp.averages), float(dsp.overlap))
     gain = f"{rx.gain_db:g} dB" if rx.gain_mode in ("manual", "soft_agc") else "donanım AGC"
@@ -181,6 +191,23 @@ def cmd_info(args: argparse.Namespace) -> int:
 
 
 # =============================================================================== rx
+#: Overflow counter text when the driver cannot detect sample loss (``overflow_source = "none"``).
+OVERFLOW_UNKNOWN = "bilinmiyor (sürücü raporlamaz)"
+
+
+def _fmt_gains(gains: Any) -> str:
+    if isinstance(gains, (list, tuple)) and gains:
+        return "/".join(f"{float(g):g}" for g in gains)
+    return str(gains)
+
+
+def _overflows_text(stream: dict[str, Any]) -> str:
+    """Overflow counter for the operator: unknown (not 0) when the driver cannot detect loss."""
+    if stream.get("overflow_source") == "none":
+        return OVERFLOW_UNKNOWN
+    return str(stream.get("overflows", 0))
+
+
 def _status_line(name: str, d: dict[str, Any], node: Any) -> str:
     st = d.get("stream", {})
     ppm = d.get("ppm") or {}
@@ -191,9 +218,9 @@ def _status_line(name: str, d: dict[str, Any], node: Any) -> str:
     stats = node.stats if node is not None else {}
     parts = [
         f"[{name}] {d.get('state')}", f"fc {fmt_hz(float(d.get('fc_hz', 0.0)))}",
-        f"fs {float(d.get('fs_hz', 0.0)) / 1e6:.4g} MS/s", f"G {d.get('gain_db')} dB ({d.get('gain_mode')})",
+        f"fs {float(d.get('fs_hz', 0.0)) / 1e6:.4g} MS/s", f"G {_fmt_gains(d.get('gain_db'))} dB ({d.get('gain_mode')})",
         f"kare {stats.get('frames', 0)}", f"tespit {stats.get('detections', 0)}",
-        f"blok {st.get('blocks', 0)}", f"ovf {st.get('overflows', 0)}", f"drop {st.get('host_drops', 0)}",
+        f"blok {st.get('blocks', 0)}", f"ovf {_overflows_text(st)}", f"drop {st.get('host_drops', 0)}",
         f"{float(st.get('throughput_sps', 0.0)) / 1e6:.3g} MS/s", f"ppm {ppm_txt}",
     ]
     if isinstance(temp, (int, float)):
@@ -227,10 +254,16 @@ def cmd_rx(args: argparse.Namespace) -> int:
     dur = "Ctrl-C ile durdurun" if args.duration is None else f"{args.duration:g} s"
     print(f"RX düğümü '{node.name}' çalışıyor ({dur}); bus {app.bus.mode} "
           f"{app.bus.pub_endpoint if app.bus.mode == 'direct' else app.bus.proxy_frontend}", file=sys.stderr)
-    node.run(args.duration)
+    try:
+        node.run(args.duration)
+    finally:
+        node.stop()                                   # idempotent; also if run() raised before start
     s = node.stats
+    stream = dict(s["stream"])
+    if node.overflow_source is not None:
+        stream["overflow_source"] = node.overflow_source
     print(f"RX düğümü durdu: {s['frames']} kare, {s['detections']} tespit, {s['spectrum_msgs']} spektrum, "
-          f"{s['status_msgs']} durum mesajı; overflow {s['stream']['overflows']}, host drop {s['stream']['host_drops']}, "
+          f"{s['status_msgs']} durum mesajı; overflow {_overflows_text(stream)}, host drop {stream['host_drops']}, "
           f"yayın hatası {s['publish_errors']}", file=sys.stderr)
     return 0
 
@@ -288,6 +321,8 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     if args.fs is not None:
         sw.sample_rate_hz = float(args.fs)
         sw.bandwidth_hz = min(float(sw.bandwidth_hz), float(args.fs))
+    if args.publish and sw.publish_max_points < 1:      # fail before the sweep, not after it
+        raise ConfigError(f"sweep.publish_max_points pozitif tamsayı olmalı, {sw.publish_max_points!r} geldi")
     dev = open_device(app.devices[0], app)
     try:
         for w in dev.configure(app.rx):

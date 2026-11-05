@@ -39,7 +39,7 @@ APT_PACKAGES=(
     soapysdr-tools libsoapysdr-dev python3-soapysdr
     libzmq3-dev
     cmake g++ make git pkg-config ca-certificates
-    libusb-1.0-0-dev            # SoapyPlutoSDR isteğe bağlı usb_direct desteği (HAS_LIBUSB1)
+    libusb-1.0-0-dev            # SoapyPlutoSDR: taramada Pluto VID:PID ön kontrolü (HAS_LIBUSB1); "usb_direct" diye bir argüman YOK
 )
 
 DO_BUILD=1

@@ -12,6 +12,7 @@ import time
 import numpy as np
 import pytest
 
+from eds.core.config import DeviceConfig
 from eds.core.errors import (
     BackendUnavailable,
     ConfigError,
@@ -21,7 +22,9 @@ from eds.core.errors import (
     NotSupported,
     StreamError,
 )
+from eds.core.profile import load_profile
 from eds.core.timeutil import now_ns
+from eds.hal import soapy_backend as sb
 from eds.hal.tx import open_source
 from eds.hal.tx_hw import (
     DIGITAL_FULL_AMPLITUDE,
@@ -85,6 +88,16 @@ def test_tone_buffer_validation():
 
 
 # ----------------------------------------------------------------------------- Soapy TX
+@pytest.fixture(autouse=True)
+def _fresh_pluto_registry():
+    gc.collect()
+    with sb._pluto_lock:
+        sb._pluto_owners.clear()
+    yield
+    with sb._pluto_lock:
+        sb._pluto_owners.clear()
+
+
 @pytest.fixture
 def sdr(monkeypatch):
     return fake_soapy.install(monkeypatch)
@@ -238,9 +251,84 @@ def test_soapy_tx_open_failure(monkeypatch):
 
 
 def test_open_source_factory(sdr):
-    s = open_source("pluto_tx", {"fs": FS, "buffer_len": N})
+    s = open_source("pluto_tx", {"fs": FS, "buffer_len": N, "isolate": False})     # in-process (fake driver)
     assert isinstance(s, SoapyTxSource)
     s.close()
+
+
+# ----------------------------------------------------------------------------- LO offset
+def test_set_lo_offset_moves_lo_and_keeps_the_rf_tone(sdr, src):
+    fk = sdr.state.last()
+    assert src.set_frequency(915e6) == pytest.approx(915e6, abs=1e-6)
+    src.set_power(-10.0)
+    src.set_enabled(True)
+    off = src.set_lo_offset(-300e3)                          # LO above the tone now
+    q = quantize_tone_freq(-300e3, FS, N)
+    assert off == pytest.approx(q) and q == pytest.approx(-128 * FS / N)
+    assert fk.getFrequency(TX, 0) == pytest.approx(915e6 - q, abs=1e-6)
+    assert src.tones_hz == [pytest.approx(915e6, abs=1e-6)] and src.enabled
+    assert src.describe()["lo_offset_hz"] == pytest.approx(q)
+    # the buffer now carries the tone at the new baseband offset (integer cycles)
+    spec = np.abs(np.fft.fft(src._tone)) ** 2
+    assert int(np.argmax(spec)) == N - 128
+    assert src.set_power(-20.0) == pytest.approx(-20.0, abs=1e-9)   # level path unaffected
+    # later tunes keep the new offset
+    src.set_frequency(1.0e9)
+    assert fk.getFrequency(TX, 0) == pytest.approx(1.0e9 - q, abs=1e-6)
+
+
+def test_set_lo_offset_validation_and_two_tone_mode(sdr, src):
+    with pytest.raises(ConfigError):
+        src.set_lo_offset(0.0)
+    with pytest.raises(ConfigError):
+        src.set_lo_offset(0.5 * FS)                          # beyond 0.4·fs
+    with pytest.raises(ConfigError):
+        src.set_lo_offset(FS / N / 4)                        # quantises to 0 cycles
+    assert src.set_lo_offset(100e3) == pytest.approx(quantize_tone_freq(100e3, FS, N))   # not tuned yet
+    src.set_tones([915.0e6, 915.1e6], [-6.0206, -6.0206])
+    lo = src.lo_hz
+    assert src.set_lo_offset(250e3) == pytest.approx(quantize_tone_freq(250e3, FS, N))
+    assert src.lo_hz == lo                                   # two tones: LO stays at the midpoint
+    src.set_frequency(915e6)
+    assert src.lo_hz == pytest.approx(915e6 - quantize_tone_freq(250e3, FS, N))
+
+
+def test_set_lo_offset_out_of_range_lo_keeps_previous_state(sdr, src):
+    src.set_frequency(47.2e6)                                # LO ≈ 47.0 MHz (range starts 46.875 MHz)
+    lo, off, tones = src.lo_hz, src.tone_offset_hz, list(src.tones_hz)
+    with pytest.raises(ConfigError):
+        src.set_lo_offset(900e3)                             # LO would be ≈ 46.3 MHz
+    assert (src.lo_hz, src.tone_offset_hz, src.tones_hz) == (lo, off, tones)
+
+
+# ----------------------------------------------------------------------------- one Pluto per process
+def test_tx_pluto_next_to_an_rx_pluto_in_the_same_process_is_refused(monkeypatch):
+    from eds.hal.soapy_backend import SoapyRxDevice
+    from tests.hal.fakes import fake_iio
+
+    fake_iio.uninstall(monkeypatch)
+    sdr = fake_soapy.install(monkeypatch, devices=[
+        {"device": "PlutoSDR", "driver": "plutosdr", "label": "PlutoSDR #0 usb:1.5.5", "uri": "usb:1.5.5"},
+        {"device": "PlutoSDR", "driver": "plutosdr", "label": "PlutoSDR #1 ip:192.168.3.1", "uri": "ip:192.168.3.1"},
+    ])
+    rx = SoapyRxDevice(DeviceConfig(name="rx0", backend="soapy", args={"driver": "plutosdr", "uri": "usb:1.5.5"},
+                                    control_uri="none"), load_profile("ad9363_pluto"))
+    with pytest.raises(DeviceError, match="süreç"):
+        SoapyTxSource(args={"driver": "plutosdr", "uri": "ip:192.168.3.1"}, fs=FS, buffer_len=N)
+    assert len(sdr.state.live) == 1
+    rx.close()
+    with SoapyTxSource(args={"driver": "plutosdr", "uri": "ip:192.168.3.1"}, fs=FS, buffer_len=N) as tx:
+        assert tx.lo_hz is None
+        assert sdr.state.last().entry["uri"] == "ip:192.168.3.1"
+        assert sb.open_pluto_owners() == ["pluto_tx"]
+    assert sb.open_pluto_owners() == []
+
+
+def test_tx_slot_released_when_setup_fails(monkeypatch):
+    fake_soapy.install(monkeypatch, activate_ret=-2)
+    with pytest.raises(StreamError):
+        SoapyTxSource(fs=FS, buffer_len=N)
+    assert sb.open_pluto_owners() == []
 
 
 # ----------------------------------------------------------------------------- SCPI

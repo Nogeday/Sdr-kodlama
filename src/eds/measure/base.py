@@ -50,6 +50,7 @@ class Series:
     label: str = ""
     style: str = "line"            # line | marker | step | bar
     yerr: list[float] | None = None
+    role: str = ""                 # "" | pass | fail | warn | ref → fixed colour (eds.measure.plots.ROLE_COLORS)
 
 
 @dataclass
@@ -77,6 +78,8 @@ class FigureSpec:
     logy: bool = False
     ylim: tuple[float, float] | None = None
     xlim: tuple[float, float] | None = None
+    # (x, label) tick positions + labels of a categorical x axis (bar plots); empty = automatic
+    xticks: list[tuple[float, str]] = field(default_factory=list)
 
 
 @dataclass

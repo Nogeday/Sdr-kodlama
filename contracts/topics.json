@@ -1,5 +1,5 @@
 {
-  "$comment": "TEK DOĞRULUK KAYNAĞI: ZeroMQ topic kayıt defteri. Topic adı değişecekse YALNIZCA burayı ve src/eds/bus/topics.py sabitlerini değiştirin; tests/bus/test_contracts.py ikisinin birebir eşleştiğini doğrular. Çerçeve: ZMQ multipart [topic(utf-8), json(utf-8)]. Her mesaj envelope.schema.json zarfını taşır; 'data' alanı aşağıdaki şemaya uyar.",
+  "$comment": "TEK DOĞRULUK KAYNAĞI: ZeroMQ topic kayıt defteri. Topic adı değişecekse YALNIZCA burayı ve src/eds/bus/topics.py sabitlerini değiştirin; tests/bus/test_contracts.py ikisinin birebir eşleştiğini doğrular. Çerçeve: ZMQ multipart [topic(utf-8), json(utf-8)]. Her mesaj envelope.schema.json zarfını ({topic, v, src, seq, t_ns, data}) taşır; 'data' alanı aşağıdaki şemaya uyar. Ortak $defs (ör. detection) schemas/common.schema.json içindedir; her şemanın $id'si https://eds.invalid/contracts/schemas/<dosya> (hiç indirilmez, $ref'ler göreli ve yerel çözülür). *_ns alanları time.time_ns() tamsayılarıdır ve 2**53'ü aşar: JavaScript tüketicileri BigInt ile ayrıştırmalıdır.",
   "version": 1,
   "envelope": "envelope.schema.json",
   "topics": {

@@ -247,7 +247,9 @@ bw_hz = 200e3
 power_dbm = -60.0
 cabled = true
 """, encoding="utf-8")
-    assert main(["-c", str(cfg), "cal", "coherence", "--n", "16384", "--blocks", "4", "--no-publish"]) == 0
+    # 8 blocks: with a noise pilot the drift estimate's realization spread at 4 blocks (~1 °/s
+    # rms over world seeds) equals the ±1 °/s limit; 8 blocks bring it to ~0.2 °/s
+    assert main(["-c", str(cfg), "cal", "coherence", "--n", "16384", "--blocks", "8", "--no-publish"]) == 0
     out = capsys.readouterr().out
     assert "KOHERENT" in out and "DEĞİL" not in out
     files = list((tmp_path / "cal").glob("SIM-A_SIM-B-*.json"))
@@ -271,7 +273,7 @@ def test_measure_latency_quick_realtime_writes_report(tmp_path, capsys):
     res = json.loads((rdir / "results.json").read_text(encoding="utf-8"))["results"][0]
     assert res["spec_id"] == "latency" and res["status"] == "ok" and res["unit"] == "ms"
     assert 0 < res["value"] < 1000 and res["extra"]["mode_b_detected"] == res["extra"]["mode_b_events"] == 6
-    assert "Uçtan-uca gecikme" in cap.out
+    assert "Uçtan uca gecikme" in cap.out
     assert len(list((rdir / "figures").glob("*.png"))) == 4
 
 
@@ -359,3 +361,125 @@ def test_rx_command_prints_status_lines(tmp_path, capsys):
     status = [x for x in err.splitlines() if x.startswith("[rx0] ")]
     assert len(status) >= 2 and "fc 915 MHz" in status[-1] and "streaming" in status[-1]
     assert "RX düğümü durdu:" in err
+
+
+# --------------------------------------------------------------------------- input validation / review fixes
+@pytest.mark.parametrize("argv, fragment", [
+    (["rx", "--duration", "nan"], "argüman --duration: sonlu bir sayı olmalı"),
+    (["rx", "--duration", "-1"], "negatif olmayan"),
+    (["sweep", "--rbw", "-5"], "argüman --rbw: pozitif bir sayı olmalı"),
+    (["sweep", "--start", "inf"], "sonlu bir sayı olmalı"),
+    (["cal", "ppm", "--ref-hz", "915e6", "--repeats", "0"], "argüman --repeats: en az 1 olmalı"),
+    (["cal", "coherence", "--n", "abc"], "tamsayı bekleniyordu"),
+    (["bus", "echo", "--timeout", "nan"], "sonlu bir sayı olmalı"),
+    (["bus", "send", "ctl.rx", "--cmd", "ping", "--wait-ack", "-2"], "negatif olmayan"),
+    (["bus", "send", "ctl.rx"], "şu argümanlar gerekli: --cmd"),
+    (["cal", "ppm"], "şu argümanlardan biri gerekli"),
+    (["bus", "send", "ctl.rx", "--cmd", "reboot"], "geçersiz seçim: 'reboot' (seçenekler:"),
+])
+def test_bad_numeric_options_are_usage_errors_in_turkish(capsys, argv, fragment):
+    assert main(argv) == 1
+    err = capsys.readouterr().err
+    assert fragment in err and "hata:" in err
+
+
+def test_bus_send_rejects_non_finite_args_and_bad_ids(capsys):
+    ep = f"tcp://127.0.0.1:{free_port()}"
+    assert main(["bus", "send", "ctl.rx", "--cmd", "set_center_freq", "--arg", "hz=nan", "--endpoint", ep]) == 1
+    assert "sonlu olmayan sayı" in capsys.readouterr().err
+    assert main(["bus", "send", "ctl.rx", "--cmd", "ping", "--target", "", "--endpoint", ep]) == 1
+    assert "--target boş olamaz" in capsys.readouterr().err
+    assert main(["bus", "send", "ctl.rx", "--cmd", "ping", "--req-id", "x" * 129, "--endpoint", ep]) == 1
+    assert "--req-id" in capsys.readouterr().err
+
+
+def test_bus_echo_rejects_unknown_topic(capsys):
+    assert main(["bus", "echo", "rx.bogus", "--timeout", "0.1"]) == 1
+    err = capsys.readouterr().err
+    assert "Bilinmeyen topic" in err and "rx.status" in err
+
+
+def test_ack_summary_omits_null_result():
+    from eds.bus.pubsub import Message
+    from eds.cli.cmd_bus import summarize
+
+    env = {"topic": "ctl.ack", "v": 1, "src": "rx0", "seq": 0, "t_ns": 1,
+           "data": {"req_id": "r", "target": "rx0", "cmd": "set_gain", "ok": False, "error": "Kazanç aralık dışı",
+                    "result": None}}
+    s = summarize(Message("ctl.ack", env, 2))
+    assert s.endswith("HATA: Kazanç aralık dışı") and "null" not in s
+    env["data"].update(ok=True, error=None, result={"gain_db": [30.0]})
+    assert summarize(Message("ctl.ack", env, 2)).endswith('OK {"gain_db":[30.0]}')
+
+
+def test_status_line_shows_unknown_overflows_when_driver_cannot_detect():
+    from eds.cli.cmd_hw import OVERFLOW_UNKNOWN, _status_line
+
+    d = {"state": "streaming", "fc_hz": 915e6, "fs_hz": 4e6, "gain_db": [40.0, 41.5], "gain_mode": "manual",
+         "stream": {"blocks": 3, "overflows": 0, "host_drops": 0, "throughput_sps": 4e6, "overflow_source": "none"},
+         "ppm": {"value": None, "via": "none"}}
+    line = _status_line("rx0", d, None)
+    assert f"ovf {OVERFLOW_UNKNOWN}" in line and "G 40/41.5 dB" in line
+    d["stream"]["overflow_source"] = "dma_status"
+    assert "ovf 0 " in _status_line("rx0", d, None)
+
+
+def test_info_shows_pluto_process_isolation(capsys):
+    repo = Path(__file__).resolve().parents[2]
+    assert main(["info", "-c", str(repo / "config" / "dual_pluto.toml")]) in (0, 1)
+    out = capsys.readouterr().out
+    assert "Süreç yalıtımı" in out and "rx0=subprocess, rx1=subprocess" in out
+
+
+def test_cal_coherence_switches_off_over_the_air_emitters_on_sim(tmp_path, capsys):
+    """The coherence check is a cabled setup: an OTA emitter in the scene (geometric phase
+    difference) must not make a shared-clock pair look non-coherent; it is restored after."""
+    cfg = tmp_path / "dual_ota.toml"
+    cfg.write_text(f"""
+[[device]]
+name = "rx0"
+backend = "sim"
+sim = {{ ppm = 5.0, shared_clock = "ref", realtime = false, serial = "SIM-A" }}
+[[device]]
+name = "rx1"
+backend = "sim"
+sim = {{ shared_clock = "ref", realtime = false, serial = "SIM-B", position_m = [0.15, 0.0] }}
+[rx]
+center_freq_hz = 999.5e6
+sample_rate_hz = 2e6
+bandwidth_hz = 2e6
+gain_db = 40.0
+[cal]
+dir = "{(tmp_path / 'cal').as_posix()}"
+[[sim.emitters]]
+name = "pilot"
+kind = "cw"
+freq_hz = 998.9e6
+power_dbm = -55.0
+cabled = true
+[[sim.emitters]]
+name = "ota"
+kind = "cw"
+freq_hz = 1.0e9
+power_dbm = -60.0
+aoa_deg = 25.0
+""", encoding="utf-8")
+    import eds.cli.cmd_cal as cmd_cal
+    from eds.hal.factory import get_sim_world
+
+    seen = {}
+    orig = cmd_cal._cabled_setup
+
+    def spy(app):
+        seen["world"] = get_sim_world(app)
+        return orig(app)
+
+    import unittest.mock as um
+
+    with um.patch.object(cmd_cal, "_cabled_setup", spy):
+        assert main(["-c", str(cfg), "cal", "coherence", "--n", "16384", "--blocks", "4", "--no-save",
+                     "--no-publish"]) == 0
+    cap = capsys.readouterr()
+    assert "KOHERENT" in cap.out and "DEĞİL" not in cap.out
+    assert "havadan gelen 1 emitter (ota)" in cap.err
+    assert seen["world"].get("ota").enabled is True                       # scene restored

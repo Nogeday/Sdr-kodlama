@@ -74,6 +74,11 @@ def open_source(kind: str, args: dict[str, Any] | None = None, *, world: Any = N
     """Factory used by the CLI / measurement runner.
 
     kind: "sim" (needs ``world``), "pluto_tx", "scpi", "manual", "none".
+
+    ``pluto_tx`` returns a :class:`~eds.hal.proc.ProcessSignalSource` running
+    :class:`~eds.hal.tx_hw.SoapyTxSource` in a worker process, because SoapyPlutoSDR keeps one
+    libiio context per process and the DUT is usually a Pluto too. ``args["isolate"] = False``
+    opens the source in this process instead (only safe when no other Pluto is open here).
     """
     args = dict(args or {})
     if kind == "none":
@@ -85,6 +90,12 @@ def open_source(kind: str, args: dict[str, Any] | None = None, *, world: Any = N
             raise ConfigError("sim kaynağı için SimWorld gerekli (measure.source = sim yalnızca sim backend ile)")
         return SimSignalSource(world, **args)
     if kind == "pluto_tx":
+        from .proc import ProcessSignalSource, pluto_tx_isolated
+
+        isolate = pluto_tx_isolated(args)
+        args.pop("isolate", None)
+        if isolate:
+            return ProcessSignalSource("eds.hal.tx_hw:SoapyTxSource", kwargs=args)
         from .tx_hw import SoapyTxSource
 
         return SoapyTxSource(**args)

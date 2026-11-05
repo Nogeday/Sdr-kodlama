@@ -8,8 +8,14 @@
 Tone generation (:func:`build_tone_buffer`): every tone gets an **integer number of cycles**
 in the buffer (``f = k·fs/N``), so wrapping the buffer is phase-continuous and the spectrum
 is a clean line, not a spread of wrap-around discontinuities. The TX LO sits
-``tone_offset_hz`` below a single tone (LO leakage / DC never coincides with the tone);
-for two tones it sits at their midpoint (no odd-order IMD product lands on it).
+``tone_offset_hz`` below a single tone (LO leakage / DC never coincides with the tone;
+:meth:`SoapyTxSource.set_lo_offset` moves it, keeping the RF tone, so that the LO leakage
+at ``LO`` and the TX IQ image at ``2·LO − f`` avoid the bins a measurement uses); for two
+tones it sits at their midpoint (no odd-order IMD product lands on it).
+
+A Pluto TX source is a SoapyPlutoSDR device: only ONE may be open per process (see
+:mod:`eds.hal.soapy_backend`), so next to a Pluto DUT it runs in its own process
+(:func:`eds.hal.tx.open_source` isolates it).
 
 Power on the Pluto TX is *relative* (0 dB = maximum TX gain, digital amplitude 0.5 so the
 DAC and PA stay linear) and realised as **TX gain first, then digital scaling** for the
@@ -41,7 +47,14 @@ from ..core.errors import (
 )
 from ..core.timeutil import now_ns
 from ..core.units import fmt_hz
-from .soapy_backend import import_soapy, release_device
+from .soapy_backend import (
+    PLUTO_DRIVER,
+    import_soapy,
+    is_pluto_args,
+    pluto_claim_for,
+    quarantine_pluto_device,
+    release_device,
+)
 from .tx import SignalSource
 
 log = logging.getLogger(__name__)
@@ -103,9 +116,7 @@ class SoapyTxSource(SignalSource):
             raise ConfigError(f"TX örnekleme hızı pozitif olmalı (geldi: {fs})")
         if buffer_len < 64:
             raise ConfigError(f"TX buffer_len en az 64 olmalı (geldi: {buffer_len})")
-        if tone_offset_hz == 0 or abs(tone_offset_hz) > MAX_BASEBAND_FRACTION * fs:
-            raise ConfigError(f"tone_offset_hz sıfır olamaz ve |offset| <= {MAX_BASEBAND_FRACTION}·fs olmalı "
-                              f"(geldi: {tone_offset_hz}, fs={fs})")
+        self._check_offset(tone_offset_hz, fs)
         self._sdr = import_soapy()
         self.args = {str(k): str(v) for k, v in (args if args is not None else {"driver": "plutosdr"}).items()}
         self.channel = int(channel)
@@ -136,14 +147,26 @@ class SoapyTxSource(SignalSource):
         self.digital_amps: list[float] = []
         self.gain_db = 0.0
         self.enabled = False
+        self._requested_hz: float | None = None    # last single-tone RF frequency asked for
+        self._pluto_release: Callable[[], Any] | None = None
 
         from .soapy_backend import resolve_serial_args
 
         self.args = resolve_serial_args(self.args, name=self.name)
+        if is_pluto_args(self.args):
+            self._pluto_release = pluto_claim_for(self, self.name)     # one Pluto per process
         try:
             self._dev: Any = self._sdr.Device(dict(self.args))
         except Exception as e:
+            self._release_pluto_slot()
             raise DeviceNotFound(f"TX cihazı açılamadı (args={self.args}): {e}. Kontrol: SoapySDRUtil --find") from e
+        if self._pluto_release is None and self._driver_key().lower() == PLUTO_DRIVER:
+            try:
+                self._pluto_release = pluto_claim_for(self, self.name)
+            except EDSError:
+                dev, self._dev = self._dev, None      # shares the open Pluto's static context: never destroy
+                quarantine_pluto_device(dev)
+                raise
         try:
             self._setup(fs)
         except Exception as e:
@@ -153,6 +176,25 @@ class SoapyTxSource(SignalSource):
             raise DeviceError(f"TX kurulumu başarısız (args={self.args}): {e}") from e
 
     # ------------------------------------------------------------------ setup / teardown
+    @staticmethod
+    def _check_offset(offset_hz: float, fs: float) -> None:
+        off = float(offset_hz)
+        if not math.isfinite(off) or off == 0 or abs(off) > MAX_BASEBAND_FRACTION * fs:
+            raise ConfigError(f"tone_offset_hz sıfır olamaz ve |offset| <= {MAX_BASEBAND_FRACTION}·fs olmalı "
+                              f"(geldi: {offset_hz}, fs={fs})")
+
+    def _driver_key(self) -> str:
+        try:
+            return str(self._dev.getDriverKey())
+        except Exception as e:  # identity is optional here
+            log.debug("TX getDriverKey başarısız: %s", e)
+            return ""
+
+    def _release_pluto_slot(self) -> None:
+        rel, self._pluto_release = self._pluto_release, None
+        if rel is not None:
+            rel()
+
     def _setup(self, fs: float) -> None:
         d, tx, ch = self._dev, self._TX, self.channel
         d.setSampleRate(tx, ch, fs)
@@ -228,6 +270,7 @@ class SoapyTxSource(SignalSource):
             except Exception as e:
                 log.warning("TX cihazı bırakılamadı: %s", e)
             del d
+        self._release_pluto_slot()
 
     # ------------------------------------------------------------------ writer thread
     def _take_pending(self) -> tuple[np.ndarray, threading.Event] | None:
@@ -339,10 +382,18 @@ class SoapyTxSource(SignalSource):
         self._bb_freqs = bb
         self.tones_hz = [self.lo_hz + f for f in bb]
 
+    def _quantized_offset(self, offset_hz: float | None = None) -> float:
+        off = self.tone_offset_hz if offset_hz is None else float(offset_hz)
+        f_bb = quantize_tone_freq(off, self.fs, self.buffer_len)
+        if f_bb == 0.0:
+            raise ConfigError(f"LO ofseti {fmt_hz(off)} ton tamponunun çözünürlüğünün "
+                              f"({fmt_hz(self.fs / self.buffer_len)}) altında")
+        return f_bb
+
     def set_frequency(self, hz: float) -> float:
         """Single CW tone at ``hz`` (LO = hz − tone_offset). Returns the actual RF frequency."""
         self._check()
-        f_bb = quantize_tone_freq(self.tone_offset_hz, self.fs, self.buffer_len)
+        f_bb = self._quantized_offset()
         level = max(self._levels_rel) if self._levels_rel else self._gmin - self._gmax
         try:
             self._tune(float(hz) - f_bb, [f_bb])
@@ -350,9 +401,34 @@ class SoapyTxSource(SignalSource):
             raise
         except Exception as e:
             raise DeviceError(f"TX frekansı {fmt_hz(float(hz))} ayarlanamadı: {e}") from e
+        self._requested_hz = float(hz)
         self._levels_rel = [level]
         self._apply_levels_safe()
         return self.tones_hz[0]
+
+    def set_lo_offset(self, hz: float) -> float:
+        """Place the TX LO ``hz`` away from the single tone (``LO = f − hz``), keeping the RF tone.
+
+        The LO leakage then sits at ``f − hz`` and the TX IQ image at ``f − 2·hz``; pick ``hz``
+        (sign included) so neither lands on a bin the measurement uses. ``|hz|`` ≤ 0.4·fs and
+        non-zero; it is quantised to an integer number of tone-buffer cycles. A tuned single
+        tone is re-tuned at once (same requested RF frequency, same level, on/off state kept);
+        in two-tone mode (LO at the midpoint) the offset applies to the next single tone.
+        Returns the offset in effect (``f − LO``) for single tones.
+        """
+        self._check()
+        self._check_offset(hz, self.fs)
+        f_bb = self._quantized_offset(hz)
+        old = self.tone_offset_hz
+        self.tone_offset_hz = float(hz)
+        if self._requested_hz is not None and len(self._bb_freqs) == 1:
+            try:
+                self.set_frequency(self._requested_hz)
+            except Exception:
+                self.tone_offset_hz = old
+                raise
+            return float(self.tones_hz[0] - self.lo_hz) if self.lo_hz is not None else f_bb
+        return f_bb
 
     def set_tones(self, freqs_hz: list[float], powers: list[float]) -> None:
         """1–2 tones (two-tone IMD): LO at the midpoint, amplitude split digitally.
@@ -369,6 +445,7 @@ class SoapyTxSource(SignalSource):
             self.set_power(powers[0])
             return
         f1, f2 = (float(f) for f in freqs_hz)
+        self._requested_hz = None
         half = quantize_tone_freq(abs(f2 - f1) / 2.0, self.fs, self.buffer_len)
         if half <= 0 or half > MAX_BASEBAND_FRACTION * self.fs:
             raise ConfigError(f"İki ton aralığı ({fmt_hz(abs(f2 - f1))}) TX bandına sığmıyor / çok küçük "
@@ -426,7 +503,10 @@ class SoapyTxSource(SignalSource):
         return {
             "name": self.name, "absolute_power": self.absolute_power, "args": dict(self.args),
             "fs_hz": self.fs, "lo_hz": self.lo_hz, "tones_hz": list(self.tones_hz),
-            "tone_offset_hz": self.tone_offset_hz, "gain_db": self.gain_db,
+            "tone_offset_hz": self.tone_offset_hz,
+            "lo_offset_hz": (self.tones_hz[0] - self.lo_hz) if (self.lo_hz is not None and len(self.tones_hz) == 1)
+            else None,
+            "gain_db": self.gain_db,
             "gain_range_db": [self._gmin, self._gmax], "digital_amps": list(self.digital_amps),
             "tone_levels_rel_db": list(self.tone_levels_rel_db), "anchor_dbm": self.anchor_dbm,
             "path_loss_db": self.path_loss_db, "power_range_db": list(self.power_range_db),

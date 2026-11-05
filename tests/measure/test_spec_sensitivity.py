@@ -15,13 +15,25 @@ import pytest
 
 from eds.calib.power import PowerCalTable
 from eds.core.units import KT_DBM_HZ
-from eds.dsp.stats import cfar_alpha, effective_averages
+from eds.dsp.stats import cfar_alpha, effective_averages, gamma_quantile
 from eds.measure.base import run_measurement
+from eds.measure.common import LevelRef
 from eds.measure.specs.sensitivity import (
+    fit_pd_probit,
     isotonic_increasing,
+    norm_cdf,
+    norm_ppf,
     patnaik_pd,
     required_snr_db,
+    scalloping_loss_db,
+    stratified_bin_offsets,
     wilson_halfwidth,
+)
+from eds.measure.stimulus import (
+    ANCHOR_UNCERTAINTY_DB,
+    ATTENUATION_LINEARITY_DB_PER_DB,
+    DEFAULT_LEVEL_UNCERTAINTY_DB,
+    level_uncertainty_budget,
 )
 
 from .spec_fixtures import check_contract, run_spec, sim_app, sim_context, source_enabled
@@ -81,12 +93,25 @@ def test_sensitivity_pd_curve_matches_level_equation(tmp_path):
     assert ex["danl_dbm_hz"] == pytest.approx(danl_true, abs=0.7)
     assert ex["nf_db"] == pytest.approx(nf_true, abs=0.7)
     assert ex["calibrated"] is True and ex["level_uncertainty_db"] == 0.0
-    # Pd = 0.9 level vs analytic truth (N_RBW + SNR_req from cfar_alpha)
+    # Pd = 0.9 level vs analytic truth (N_RBW + SNR_req from cfar_alpha); the tone is spread over
+    # ±0.5 bin, so the frequency-averaged value sits about the mean scalloping loss above it
     snr_truth = truth_snr_req_db(app.detect.pfa, app.detect.min_snr_db)
     sens_truth = danl_true + 10.0 * math.log10(RBW) + snr_truth
     assert ex["value_source"] == "pd_curve"
-    assert res.value == pytest.approx(sens_truth, abs=2.0)
-    assert 0.0 < res.uncertainty < 3.0
+    assert res.value == pytest.approx(sens_truth + ex["scalloping_mean_db"], abs=2.0)
+    assert ex["bin_offset"] == "uniform" and "düzgün dağılımlı" in res.summary
+    assert ex["sensitivity_worst_case"] - res.value == pytest.approx(
+        ex["scalloping_worst_db"] - ex["scalloping_mean_db"])
+    # statistical uncertainty = 95 % profile-likelihood interval of the probit crossing
+    lo, hi = ex["snr_ci95_db"]
+    assert lo < ex["snr_at_sensitivity_db"] < hi
+    assert ex["stat_uncertainty_db"] == pytest.approx(max(ex["snr_at_sensitivity_db"] - lo, hi - ex["snr_at_sensitivity_db"]))
+    assert 0.3 < res.uncertainty < 3.0 and res.uncertainty == pytest.approx(ex["stat_uncertainty_db"])
+    assert ex["sensitivity_ci95"][0] < res.value < ex["sensitivity_ci95"][1]
+    # MM-12: the design Pfa is shown next to what the false-alarm test can actually demonstrate
+    n_fa = ex["fa_bins_tested"]
+    assert ex["pfa_empirical_upper95"] == pytest.approx(gamma_quantile(0.95, ex["fa_detections"] + 1.0) / n_fa, rel=1e-6)
+    assert f"Pfa tasarım {app.detect.pfa:g}, ölçülen ≤ {ex['pfa_empirical_upper95']:.1e}" in res.summary
     # MDS formula consistent with its own definition and with the Pd curve
     assert ex["mds_rbw_dbm"] == pytest.approx(ex["danl_dbm_hz"] + 10.0 * math.log10(RBW) + ex["snr_req_db"], abs=1e-6)
     assert ex["snr_req_db"] == pytest.approx(snr_truth, abs=1.0)
@@ -94,7 +119,7 @@ def test_sensitivity_pd_curve_matches_level_equation(tmp_path):
     # the tone sits on a bin centre and the in-situ ppm equals the simulated TCXO error
     assert ex["in_situ_ppm"] == pytest.approx(dev.true_ppm, abs=0.01)
     assert (ex["tone_hz"] - FC) / (FS / NFFT) == pytest.approx(round(0.15 * NFFT), abs=1e-9)
-    # Pd table: monotone fit, crosses from < pd_stop to >= pd_target, quick trials
+    # Pd table: monotone (probit) fit, crosses from < pd_stop to >= pd_target, quick trials
     pd_rows = [r for r in res.table if r["bölüm"] == "Pd"]
     assert len(pd_rows) >= 6 and all(r["trials"] == 10 for r in pd_rows)
     fits = [r["pd_fit"] for r in pd_rows]
@@ -146,6 +171,112 @@ def test_sensitivity_with_power_calibration_table(tmp_path):
     ex = res.extra
     assert ex["level_ref"] == "kalibrasyon tablosu" and ex["level_offset_db"] == pytest.approx(offset)
     assert ex["danl_dbm_hz"] == pytest.approx(KT_DBM_HZ + 5.0, abs=0.7)
-    assert ex["level_uncertainty_db"] == 1.0
+    assert ex["level_uncertainty_db"] == 1.0 and "kalibrasyon tablosu" in ex["level_uncertainty_budget"]
     assert res.uncertainty >= 1.0
     assert not left_on
+
+
+# --------------------------------------------------------------------------- MM-07: Pd fit
+def _procedure_levels(truth: float, rng: np.random.Generator) -> np.ndarray:
+    """SNR grid like the measurement: 2 dB coarse descent to Pd < 0.2, 0.5 dB fine grid."""
+    alpha, n_eff = 10 ** (6.15 / 10), 7.98
+    start = truth + 4.0 + rng.uniform(-1.0, 1.0)
+    coarse = [start]
+    while patnaik_pd(coarse[-1], alpha, n_eff) >= 0.2:
+        coarse.append(coarse[-1] - 2.0)
+    fine = np.arange(coarse[-1] + 0.5, start - 1e-9, 0.5)
+    return np.unique(np.round(np.concatenate([coarse, fine]), 6))
+
+
+def test_probit_fit_interval_has_nominal_coverage_unlike_the_two_point_slope():
+    """Monte Carlo on the detector model of the finding (α = 6.15 dB, n_eff = 7.98, 10 trials):
+    the 95 % profile-likelihood interval covers the true crossing ~95 % of the time; the old
+    'Wilson half-width / slope between two neighbouring isotonic points' interval does not."""
+    alpha, n_eff, trials = 10 ** (6.15 / 10), 7.98, 10
+    truth = required_snr_db(0.9, alpha, n_eff)
+    rng = np.random.default_rng(20261105)
+    cover_new = cover_old = 0
+    runs = 150
+    for _ in range(runs):
+        x = _procedure_levels(truth, rng)
+        h = rng.binomial(trials, [patnaik_pd(v, alpha, n_eff) for v in x])
+        fit = fit_pd_probit(x, h, np.full(x.size, trials), 0.9)
+        cover_new += fit.ci_lo <= truth <= fit.ci_hi
+        iso = isotonic_increasing(h / trials, np.full(x.size, float(trials)))
+        i = int(np.flatnonzero(iso >= 0.9)[0])
+        slope = (iso[i] - iso[i - 1]) / (x[i] - x[i - 1])
+        x90 = x[i - 1] + (0.9 - iso[i - 1]) / slope
+        cover_old += abs(x90 - truth) <= wilson_halfwidth(0.9, trials) / slope
+    assert 0.91 <= cover_new / runs <= 0.99                 # nominal 95 % (binomial sd ≈ 0.018 for 150 runs)
+    assert cover_old / runs < 0.85                          # the old "± 0.3 dB" style interval: ≈ 75 %
+
+
+def test_probit_fit_on_the_saturated_example_is_not_overconfident():
+    """Finding example: 7/10 at 5.5 dB next to 10/10 at 6.0 dB gave '± 0.3 dB'."""
+    fit = fit_pd_probit([4.0, 4.5, 5.0, 5.5, 6.0, 8.0], [1, 2, 4, 7, 10, 10], [10] * 6, 0.9)
+    assert 5.0 < fit.x_target < 6.5 and not fit.open_interval
+    assert fit.halfwidth_db > 0.5 and fit.ci_lo < fit.x_target < fit.ci_hi
+    assert float(fit.pd(fit.x_target, 0.9)) == pytest.approx(0.9, abs=1e-6)
+    assert fit.pd([fit.x_target - 1.0, fit.x_target + 1.0], 0.9).tolist() == sorted(
+        fit.pd([fit.x_target - 1.0, fit.x_target + 1.0], 0.9).tolist())
+    assert norm_ppf(0.9) == pytest.approx(1.2815515655446004, abs=1e-6)
+    assert float(norm_cdf(-1.959963984540054)) == pytest.approx(0.025, abs=1e-7)
+
+
+# --------------------------------------------------------------------------- RF-06: scalloping
+def test_bin_offsets_and_scalloping_loss():
+    offs = stratified_bin_offsets(10)
+    assert offs == pytest.approx(np.arange(-0.45, 0.46, 0.1)) and abs(float(np.mean(offs))) < 1e-12
+    loss = scalloping_loss_db("blackmanharris", NFFT, [0.0, 0.2, 0.4, 0.5])
+    assert loss == pytest.approx([0.0, 0.13, 0.53, 0.83], abs=0.01)
+    mean = float(np.mean(scalloping_loss_db("blackmanharris", NFFT, np.linspace(-0.5, 0.5, 201))))
+    assert mean == pytest.approx(0.28, abs=0.01)
+
+
+def test_sensitivity_spreads_the_tone_over_the_bin(tmp_path):
+    """Every trial of a Pd level uses its own offset inside ±0.5 bin (RF-06)."""
+    app = sim_app(tmp_path, fc=FC)
+    with sim_context(app, quick=True) as ctx:
+        seen: list[float] = []
+        orig = ctx.source.set_frequency
+        ctx.source.set_frequency = lambda hz: (seen.append(float(hz)), orig(hz))[1]
+        res = run_measurement("sensitivity", ctx)
+        e = ctx.dut.true_ppm * 1e-6
+    assert res.status == "ok", res.error
+    ex = res.extra
+    bins = {round((f / (1 + e) - ex["tone_hz"]) / (FS / NFFT), 2) + 0.0 for f in seen
+            if abs(f / (1 + e) - ex["tone_hz"]) < FS / NFFT}
+    trial_offsets = {round(float(v), 2) for v in stratified_bin_offsets(10)}
+    assert bins - {0.0} == trial_offsets            # 0: the high-SNR probe and the screenshot (bin centre)
+
+
+# --------------------------------------------------------------------------- MM-10: level budget
+class _Ctx:
+    def __init__(self, source):
+        self.source = source
+
+
+class _AnchoredTx:
+    name, absolute_power, anchor_dbm, path_loss_db = "pluto_tx", True, -37.5, 0.0
+
+
+class _Generator:
+    name, absolute_power = "scpi", True
+
+
+def test_level_uncertainty_budget_is_source_specific():
+    insitu = LevelRef(0.0, "kaynak referanslı (in-situ)", True, "dBm", setting=-93.0)
+    # anchored Pluto TX: anchor ⊕ 2 %/dB of extrapolation below it
+    u, txt = level_uncertainty_budget(_Ctx(_AnchoredTx()), insitu, None, setting=-133.0)
+    assert u == pytest.approx(math.hypot(ANCHOR_UNCERTAINTY_DB, ATTENUATION_LINEARITY_DB_PER_DB * 95.5))
+    assert u > 2.0 and "çapalı" in txt
+    u_probe, _ = level_uncertainty_budget(_Ctx(_AnchoredTx()), insitu, None)          # default: probe setting
+    assert u_probe == pytest.approx(math.hypot(ANCHOR_UNCERTAINTY_DB, ATTENUATION_LINEARITY_DB_PER_DB * 55.5))
+    assert level_uncertainty_budget(_Ctx(_AnchoredTx()), LevelRef(0.0, "x", True, "dBm"), None)[0] is None
+    # lab generator, calibration table, explicit override, uncalibrated
+    assert level_uncertainty_budget(_Ctx(_Generator()), insitu, None)[0] == DEFAULT_LEVEL_UNCERTAINTY_DB
+    table = LevelRef(0.0, "kalibrasyon tablosu", True, "dBm")
+    assert level_uncertainty_budget(_Ctx(_AnchoredTx()), table, None)[0] == DEFAULT_LEVEL_UNCERTAINTY_DB
+    assert level_uncertainty_budget(_Ctx(_AnchoredTx()), insitu, 0.4, setting=-133.0)[0] == 0.4
+    unc = LevelRef(0.0, "kalibrasyonsuz (dBFS)", False, "dBFS")
+    assert level_uncertainty_budget(_Ctx(None), unc, None)[0] is None

@@ -62,7 +62,12 @@
             "host_drops": {"$ref": "common.schema.json#/$defs/count", "description": "Host kuyruğunda atılan blok (tüketici yavaş)."},
             "discarded_samples": {"$ref": "common.schema.json#/$defs/count"},
             "throughput_sps": {"type": "number", "minimum": 0, "description": "Ölçülen sürdürülebilir hız [S/s]."},
-            "elapsed_s": {"$ref": "common.schema.json#/$defs/seconds"}
+            "elapsed_s": {"$ref": "common.schema.json#/$defs/seconds"},
+            "overflow_source": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Örnek kaybının nasıl algılandığı (RxDevice.overflow_source): 'driver' (Soapy SOAPY_SDR_OVERFLOW / zaman damgası boşluğu), 'dma_status' (Pluto: ince katmandan RX DMA durum yazmacı), 'none' = ALGILANMIYOR — overflows değeri 0 kalır ama BİLİNMİYOR demektir. Yoksa backend bildirmiyor (simülatör: kesin)."
+            }
           }
         },
         "levels": {

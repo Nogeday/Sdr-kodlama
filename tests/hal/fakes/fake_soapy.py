@@ -11,20 +11,35 @@ Mirrors the real binding where EDS depends on it:
   ``writeStream(stream, buffs, numElems, flags=0, timeNs=0, timeoutUs=100000)`` return a
   ``StreamResult`` with ``ret`` / ``flags`` / ``timeNs`` / ``chanMask``; buffers are numpy
   arrays whose dtype must match the stream format (CS16 → interleaved int16, 2·n values).
-* ``getNativeStreamFormat`` returns ``[format, fullScale]``; ``getGainRange`` a ``Range``;
-  ``getFrequencyRange`` / ``getSampleRateRange`` / ``getBandwidthRange`` lists of ``Range``.
+* ``getNativeStreamFormat(direction, channel)`` (``FakeConfig.native_format_api``):
+  ``"typeerror"`` (default) = python3-soapysdr **0.8.1**, whose SWIG wrapper has no typemap
+  for ``double &fullScale`` → ``TypeError`` for the 2-argument call; ``"struct"`` = SoapySDR
+  **0.9** (``NativeStreamFormat`` object with ``.format`` / ``.fullScale``, not iterable);
+  ``"list"`` = ``[format, fullScale]`` (no real binding; kept for tolerance tests).
+  ``getGainRange`` returns a ``Range``; ``getFrequencyRange`` / ``getSampleRateRange`` /
+  ``getBandwidthRange`` lists of ``Range``.
 * SoapyPlutoSDR behaviour: driver key "PlutoSDR", native CS16 full scale 2048, ``bufflen``
   stream arg = MTU, ``kernel_buffers × MTU`` stale (old-frequency) samples after a retune
-  while streaming, CS16 tone of ``tone_counts`` counts. ``find``/``make`` IGNORE the
-  ``serial`` arg (``FakeConfig.filters_serial = False``; set it for drivers such as UHD that
-  filter natively), so ``make({"serial": ...})`` without ``uri`` opens the first device.
-  ``getHardwareInfo`` reports the opened entry's serial (``hw_serial``, from its ``serial``
-  key or the ``serial=...`` field of its libiio ``label``) and ``uri``.
+  while streaming, CS16 tone of ``tone_counts`` counts, constant ``getGainRange(RX)`` 0..73.
+  ``find`` returns ``{device, driver, uri, label="PlutoSDR #i <uri>"}`` — **no serial**
+  (``FakeConfig.enumerate_serial = False``; an entry's ``serial`` key is the hidden
+  ``hw_serial`` of that board, reported only by ``getHardwareInfo``). ``find``/``make``
+  IGNORE the ``serial`` arg (``FakeConfig.filters_serial = False``; set both flags for drivers
+  such as UHD that enumerate and filter serials natively), so ``make({"serial": ...})``
+  without ``uri`` opens the first device. ``readStream`` never returns
+  ``SOAPY_SDR_OVERFLOW`` (``FakeConfig.reports_overflow = False``): a scripted overflow drops
+  samples silently and only calls ``FakeConfig.overflow_hook`` (e.g. the pylibiio fake's
+  ``board.dma_overflow`` = the AXI ADC DMA status register). ONE process-wide libiio
+  context (``FakeConfig.static_context``, ``static iio_context *ctx`` in
+  PlutoSDR_Settings.cpp): while a PlutoSDR device is alive, ``make`` ignores ``uri`` and
+  returns a device bound to the SAME board, and unmaking any of them destroys the shared
+  context (later calls on the others raise ``RuntimeError``).
 
 Scripting: ``dev.rx_script`` / ``dev.tx_script`` (``collections.deque``) entries consumed by
 the next ``readStream`` / ``writeStream``:
 
-* ``"overflow"`` → ret -4 (``overflow_drop`` samples are skipped, i.e. really lost)
+* ``"overflow"`` → ``overflow_drop`` samples are really lost; ret -4 only with
+  ``reports_overflow`` (drivers that report overruns), else the read returns data normally
 * ``"timeout"`` → ret -1 · ``"zero"`` → ret 0 · ``"underflow"`` (TX) → ret -7
 * ``int`` → that return code · ``("short", k)`` → at most ``k`` samples
 * ``("gap", k)`` → silently skip ``k`` samples (only visible through timestamps)
@@ -41,6 +56,7 @@ import time
 import types
 import weakref
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -157,6 +173,16 @@ class StreamResult:
         return f"ret={self.ret}, flags={self.flags}, timeNs={self.timeNs}"
 
 
+class NativeStreamFormat:
+    """SoapySDR 0.9 ``NativeStreamFormat`` (``format``, ``fullScale``; not iterable)."""
+
+    def __init__(self, format: str = "", fullScale: float = 0.0):  # noqa: A002, N803
+        self.format, self.fullScale = str(format), float(fullScale)
+
+    def __str__(self) -> str:
+        return f"format={self.format}, fullScale={self.fullScale:f}"
+
+
 PLUTO_ENTRY = {
     "device": "PlutoSDR", "driver": "plutosdr", "label": "PlutoSDR #0 usb:1.5.5",
     "uri": "usb:1.5.5", "serial": "104473dc5993000917000e00c83b2e5e35",
@@ -198,6 +224,11 @@ class FakeConfig:
     has_dc_offset_mode: bool = True
     has_iq_balance_mode: bool = False
     has_frequency_correction: bool = False
+    native_format_api: str = "typeerror"      # "typeerror" (0.8.1) | "struct" (0.9) | "list"
+    enumerate_serial: bool = False            # SoapyPlutoSDR enumerates no serial
+    reports_overflow: bool = False            # SoapyPlutoSDR never returns SOAPY_SDR_OVERFLOW
+    overflow_hook: Callable[[], Any] | None = None   # called on every (scripted) hardware overflow
+    static_context: bool = True               # SoapyPlutoSDR: one libiio context per process
     missing_methods: tuple[str, ...] = ()
     define_del: bool = True
     sensors: dict[str, str] = field(default_factory=lambda: {"xadc_temp0": "41.5", "temp0": "35.25"})
@@ -291,7 +322,20 @@ def make_module(config: FakeConfig | None = None, **overrides: Any) -> types.Mod
         @staticmethod
         def enumerate(args: Any = None) -> list[SoapySDRKwargs]:
             filt = _parse_args(args)
-            return [SoapySDRKwargs(e) for e in cfg.devices if _matches(e, filt, cfg.filters_serial)]
+            out = []
+            for e in cfg.devices:
+                if _matches(e, filt, cfg.filters_serial):
+                    shown = dict(e) if cfg.enumerate_serial else {k: v for k, v in e.items() if k != "serial"}
+                    out.append(SoapySDRKwargs(shown))
+            return out
+
+        @staticmethod
+        def _live_pluto() -> Any:
+            for ref in state.instances:
+                obj = ref()
+                if obj is not None and id(obj) in state.live and not obj.ctx_destroyed:
+                    return obj
+            return None
 
         @classmethod
         def make(cls, args: Any = None) -> Device:
@@ -301,8 +345,16 @@ def make_module(config: FakeConfig | None = None, **overrides: Any) -> types.Mod
             entry = next((e for e in cfg.devices if _matches(e, a, cfg.filters_serial)), None)
             if entry is None:
                 raise RuntimeError("SoapySDR::Device::make() no match")
+            shared = None
+            if cfg.static_context and cfg.driver_key == "PlutoSDR":
+                shared = cls._live_pluto()
+                if shared is not None:
+                    entry = shared.entry          # static ctx != nullptr: the uri is ignored
             obj = object.__new__(cls)
             obj._fake_init(a, entry)
+            if shared is not None:
+                obj.ctx_group = shared.ctx_group
+                obj.ctx_group.append(weakref.ref(obj))
             state.live.add(id(obj))
             state.made += 1
             state.instances.append(weakref.ref(obj))
@@ -315,6 +367,12 @@ def make_module(config: FakeConfig | None = None, **overrides: Any) -> types.Mod
                 raise RuntimeError("SoapySDR::Device::unmake() unknown device")
             state.live.discard(id(dev))
             state.unmade.append(dev.entry.get("label", ""))
+            if cfg.static_context and cfg.driver_key == "PlutoSDR":
+                # ~SoapyPlutoSDR: iio_context_destroy(ctx) on the process-wide context
+                for ref in dev.ctx_group:
+                    other = ref()
+                    if other is not None:
+                        other.ctx_destroyed = True
 
         # ---------------------------------------------------------------- internals
         def _fake_init(self, args: dict[str, str], entry: dict[str, str]) -> None:
@@ -339,8 +397,15 @@ def make_module(config: FakeConfig | None = None, **overrides: Any) -> types.Mod
             self.tx_calls = 0
             self.tx_lock = threading.Lock()
             self.read_calls = 0
+            self.ctx_destroyed = False
+            self.ctx_group: list[weakref.ref] = [weakref.ref(self)]
+
+        def _alive(self) -> None:
+            if self.ctx_destroyed:
+                raise RuntimeError("PlutoSDR: libiio context already destroyed by another instance (use after free)")
 
         def _rec(self, name: str, *args: Any, **kwargs: Any) -> None:
+            self._alive()
             self.calls.append((name, args, kwargs))
 
         def called(self, name: str) -> list[tuple[tuple, dict]]:
@@ -499,8 +564,13 @@ def make_module(config: FakeConfig | None = None, **overrides: Any) -> types.Mod
         def getStreamFormats(self, direction: int, channel: int) -> list[str]:  # noqa: N802
             return list(cfg.stream_formats)
 
-        def getNativeStreamFormat(self, direction: int, channel: int) -> list[Any]:  # noqa: N802
+        def getNativeStreamFormat(self, direction: int, channel: int, *rest: Any) -> Any:  # noqa: N802
+            if cfg.native_format_api == "typeerror":
+                # python3-soapysdr 0.8.1: SWIG proxy of getNativeStreamFormat(dir, ch, double &fullScale)
+                raise TypeError("Device_getNativeStreamFormat() takes exactly 4 arguments (3 given)")
             self._ch(direction, channel)
+            if cfg.native_format_api == "struct":
+                return NativeStreamFormat(cfg.native_format, cfg.native_full_scale)
             return [cfg.native_format, cfg.native_full_scale]
 
         def setupStream(self, direction: int, format: str, channels: Any = None, args: Any = None) -> _Stream:  # noqa: N802, A002
@@ -546,6 +616,9 @@ def make_module(config: FakeConfig | None = None, **overrides: Any) -> types.Mod
                        timeoutUs: int = 100000) -> StreamResult:  # noqa: N803
             self.read_calls += 1
             self._rec("readStream", int(numElems), flags=flags, timeoutUs=timeoutUs)
+            hook = getattr(self, "on_read", None)
+            if hook is not None:
+                hook(self)
             if stream.direction != SOAPY_SDR_RX or not stream.active or stream.closed:
                 return StreamResult(ret=SOAPY_SDR_STREAM_ERROR)
             if len(buffs) != len(stream.channels):
@@ -558,7 +631,10 @@ def make_module(config: FakeConfig | None = None, **overrides: Any) -> types.Mod
                 return StreamResult(ret=SOAPY_SDR_TIMEOUT)
             if ev == "overflow":
                 self.rx_counter += cfg.overflow_drop
-                return StreamResult(ret=SOAPY_SDR_OVERFLOW)
+                if cfg.overflow_hook is not None:
+                    cfg.overflow_hook()
+                if cfg.reports_overflow:
+                    return StreamResult(ret=SOAPY_SDR_OVERFLOW)
             if ev == "zero":
                 return StreamResult(ret=0)
             if isinstance(ev, int):
@@ -593,6 +669,7 @@ def make_module(config: FakeConfig | None = None, **overrides: Any) -> types.Mod
 
         def writeStream(self, stream: _Stream, buffs: list[Any], numElems: int, flags: int = 0,  # noqa: N802
                         timeNs: int = 0, timeoutUs: int = 100000) -> StreamResult:  # noqa: N803
+            self._alive()
             self.tx_calls += 1
             if stream.direction != SOAPY_SDR_TX or not stream.active or stream.closed:
                 return StreamResult(ret=SOAPY_SDR_STREAM_ERROR)
@@ -642,6 +719,7 @@ def make_module(config: FakeConfig | None = None, **overrides: Any) -> types.Mod
     mod.Range = Range
     mod.SoapySDRKwargs = SoapySDRKwargs
     mod.StreamResult = StreamResult
+    mod.NativeStreamFormat = NativeStreamFormat
     mod.Device = Device
     mod.state = state
     mod.setLogLevel = lambda level: None

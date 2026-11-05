@@ -12,12 +12,14 @@ from eds.core.config import DeviceConfig, RxConfig
 from eds.core.errors import (
     BackendUnavailable,
     ConfigError,
+    DeviceError,
     DeviceNotFound,
     ProfileViolation,
     StreamError,
     StreamTimeout,
 )
 from eds.core.profile import load_profile
+from eds.hal import soapy_backend as sb
 from eds.hal.factory import open_device
 from eds.hal.soapy_backend import SoapyRxDevice, enumerate_soapy, kwargs_to_dict
 from tests.hal.fakes import fake_iio, fake_soapy
@@ -42,6 +44,18 @@ def make_dev(args=None, control_uri="none", profile=PLUTO, channels=None, **kw) 
                        args=dict(args if args is not None else {"driver": "plutosdr", "uri": "usb:1.5.5"}),
                        control_uri=control_uri, channels=list(channels or [0]))
     return SoapyRxDevice(cfg, profile, **kw)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_pluto_registry():
+    """Each test starts with no SoapyPlutoSDR device registered in this process; a device
+    leaked by a failing test (kept alive by its traceback) must not cascade."""
+    gc.collect()
+    with sb._pluto_lock:
+        sb._pluto_owners.clear()
+    yield
+    with sb._pluto_lock:
+        sb._pluto_owners.clear()
 
 
 @pytest.fixture
@@ -81,7 +95,8 @@ def test_backend_unavailable_when_soapysdr_missing(monkeypatch, no_iio):
 
 def test_enumerate_returns_plain_dicts(sdr):
     found = enumerate_soapy({"driver": "plutosdr"})
-    assert found == [fake_soapy.PLUTO_ENTRY]
+    # SoapyPlutoSDR find_PlutoSDR: device, driver, uri, label = "PlutoSDR #i <uri>" — no serial
+    assert found == [{k: v for k, v in fake_soapy.PLUTO_ENTRY.items() if k != "serial"}]
     assert type(found[0]) is dict and all(isinstance(v, str) for v in found[0].values())
     assert enumerate_soapy({"driver": "uhd"}) == []
     assert kwargs_to_dict(fake_soapy.SoapySDRKwargs({"a": 1})) == {"a": "1"}
@@ -117,8 +132,9 @@ def test_factory_opens_soapy_backend(sdr):
 def test_runtime_limits_and_old_binding_fallbacks(monkeypatch, no_iio):
     fake_soapy.install(monkeypatch)
     lim = make_dev().runtime_limits()
+    # SoapyPlutoSDR's constant RX Range(0, 73) is not band-aware: informational only
     assert lim == {"freq_hz": (70e6, 6e9), "sample_rate_hz": (65105.0, 61.44e6),
-                   "bandwidth_hz": (200e3, 56e6), "gain_db": (0.0, 73.0)}
+                   "bandwidth_hz": (200e3, 56e6), "gain_db_driver": (0.0, 73.0)}
     fake_soapy.install(monkeypatch, missing_methods=("getSampleRateRange", "getBandwidthRange"))
     lim = make_dev().runtime_limits()
     assert lim["sample_rate_hz"] == (1e6, 20e6) and lim["bandwidth_hz"] == (200e3, 56e6)
@@ -127,6 +143,30 @@ def test_runtime_limits_and_old_binding_fallbacks(monkeypatch, no_iio):
     lim = dev.runtime_limits()
     assert "sample_rate_hz" not in lim and "gain_db" not in lim
     assert dev.gain_range(2.4e9).max_db == 71.0          # profile alone
+    dev.close()
+
+
+def test_pluto_gain_range_is_the_band_dependent_profile_range(sdr):
+    """AD9363 hardwaregain_available is [-1 1 73] below 1.3 GHz and [-3 1 71] above; the
+    driver's static 0..73 must not cut off the negative minimum (DR_total uses G_min)."""
+    dev = make_dev()
+    assert (dev.gain_range(915e6).min_db, dev.gain_range(915e6).max_db) == (-1.0, 73.0)
+    assert (dev.gain_range(2.4e9).min_db, dev.gain_range(2.4e9).max_db) == (-3.0, 71.0)
+    dev.configure(rxcfg(center_freq_hz=2.4e9, gain_db=10.0))
+    assert dev.set_gain(-3.0) == -3.0
+    assert dev._dev.called("setGain")[-1][0] == (RX, 0, -3.0)
+    dev.close()
+
+
+def test_non_pluto_driver_gain_range_still_intersects_runtime(monkeypatch, no_iio):
+    fake_soapy.install(monkeypatch, num_channels=2, driver_key="UHD", hardware_key="B210",
+                       devices=[{"driver": "uhd", "label": "B210 3141", "serial": "3141"}],
+                       hardware_info={"serial": "3141"}, rx_gain_range=(0.0, 60.0))
+    b210 = load_profile("usrp_b210")
+    dev = make_dev(args={"driver": "uhd"}, profile=b210, channels=[0, 1])
+    assert dev.runtime_limits()["gain_db"] == (0.0, 60.0)
+    assert dev.gain_range(915e6).max_db <= 60.0
+    dev.close()
 
 
 # ----------------------------------------------------------------------------- stream format
@@ -189,7 +229,7 @@ def test_two_channel_layout_uses_native_full_scale(monkeypatch, no_iio):
     fake_soapy.install(
         monkeypatch, num_channels=2, driver_key="UHD", hardware_key="B210",
         devices=[{"driver": "uhd", "label": "B210 3141", "serial": "3141"}], hardware_info={"serial": "3141"},
-        native_full_scale=32768.0, cs16_full_scale=32768.0, tone_counts=16384.0,
+        native_full_scale=32768.0, cs16_full_scale=32768.0, tone_counts=16384.0, native_format_api="struct",
     )
     b210 = load_profile("usrp_b210")
     dev = make_dev(args={"driver": "uhd"}, profile=b210, channels=[0, 1], control_uri="ip:192.168.2.1")
@@ -205,7 +245,7 @@ def test_two_channel_layout_uses_native_full_scale(monkeypatch, no_iio):
 
 
 def test_non_cs16_native_warns_and_assumes_2048(monkeypatch, no_iio):
-    fake_soapy.install(monkeypatch, native_format="CF32", native_full_scale=1.0)
+    fake_soapy.install(monkeypatch, native_format="CF32", native_full_scale=1.0, native_format_api="struct")
     dev = make_dev()
     dev.configure(rxcfg())
     dev.start_stream()
@@ -222,11 +262,76 @@ def test_stream_args_passthrough_and_mtu(sdr):
     assert dev.stream_mtu == 4096 and dev._cap == 4096
     dev.read(4096)
     assert fk.called("readStream")[-1][0][0] == 4096
+    # SoapyPlutoSDR reads only 'bufflen': the unknown stream arg is reported, not silently "applied"
+    assert any("stream:foo" in w and "yok sayar" in w for w in dev.warnings)
+    dev.close()
+
+
+@pytest.mark.parametrize("fmt", ["CS16", "CF32"])
+def test_bufflen_override_extends_the_settle_window(sdr, fmt):
+    """stream:bufflen > buffer_size: the stale data after a retune is kernel_buffers × bufflen,
+    so the settling window must follow the ACTUAL driver buffer (finding HW-05)."""
+    dev = make_dev(args={"driver": "plutosdr", "uri": "usb:1.5.5", "stream:bufflen": "4096"}, stream_format=fmt)
+    dev.configure(rxcfg())                                   # buffer_size 1024, settle_buffers 5
+    dev.start_stream()
+    assert dev.settle_samples == 5 * 4096
+    dev.capture(4096)
+    dev.set_center_freq(2.4e9)
+    stale = 4 * 4096                                         # fake: kernel_buffers × MTU old-LO samples
+    seen, flagged = 0, 0
+    while seen < stale + 4096:
+        blk = dev.read(1024)
+        old = np.abs(blk.samples[0]) < 0.3                  # stale amplitude 300/2048 vs fresh 0.5
+        if old.any():
+            assert blk.settling, "stale (old-frequency) samples in a block not flagged settling"
+            flagged += 1
+        seen += 1024
+    assert flagged == stale // 1024
+    assert dev.capture(1024).settling is False
+    dev.close()
+
+
+def test_unknown_pluto_device_args_warn(sdr):
+    dev = make_dev(args={"driver": "plutosdr", "uri": "usb:1.5.5", "usb_direct": "1", "timestamp_every": "1000"})
+    w = [x for x in dev.warnings if "yok sayar" in x]
+    assert len(w) == 1 and "timestamp_every" in w[0] and "usb_direct" in w[0]
+    dev.close()
+    assert not any("yok sayar" in x for x in make_dev().warnings)
+
+
+# ----------------------------------------------------------------------------- native format bindings
+@pytest.mark.parametrize("api,native,source", [
+    ("typeerror", ("CS16", 2048.0), "plutosdr_default"),     # python3-soapysdr 0.8.1
+    ("struct", ("CS16", 2048.0), "binding"),                 # SoapySDR 0.9 NativeStreamFormat
+    ("list", ("CS16", 2048.0), "binding"),
+])
+def test_native_format_all_binding_flavours_pluto(monkeypatch, no_iio, api, native, source):
+    fake_soapy.install(monkeypatch, native_format_api=api)
+    dev = make_dev()
+    dev.configure(rxcfg())
+    dev.start_stream()                                       # 0.9 used to crash: struct is not iterable
+    assert dev.native_format == native and dev.native_format_source == source
+    assert not any("tam ölçe" in w for w in dev.warnings)   # no bogus "use CF32" warning
+    assert dev.read(256).samples[0][0] == np.complex64(0.5)
+    dev.close()
+
+
+def test_native_format_unknown_on_old_binding_for_other_drivers(monkeypatch, no_iio):
+    fake_soapy.install(monkeypatch, num_channels=1, driver_key="UHD", hardware_key="B210",
+                       devices=[{"driver": "uhd", "label": "B210 3141", "serial": "3141"}],
+                       hardware_info={"serial": "3141"}, native_format_api="typeerror")
+    dev = make_dev(args={"driver": "uhd"}, profile=load_profile("usrp_b210"))
+    dev.configure(rxcfg())
+    dev.start_stream()
+    assert dev.native_format == ("", 0.0) and dev.native_format_source == "unknown"
+    assert any("CF32" in w for w in dev.warnings)            # unknown full scale: CF32 is recommended
+    dev.close()
 
 
 # ----------------------------------------------------------------------------- read semantics
 def test_overflow_mid_read_restarts_block(monkeypatch, no_iio):
-    sdr = fake_soapy.install(monkeypatch, max_per_read=256, overflow_drop=1000)
+    """Drivers that report overruns (SOAPY_SDR_OVERFLOW = -4; not SoapyPlutoSDR)."""
+    sdr = fake_soapy.install(monkeypatch, max_per_read=256, overflow_drop=1000, reports_overflow=True)
     dev = make_dev()
     dev.configure(rxcfg())
     dev.start_stream()
@@ -375,8 +480,8 @@ def test_band_dependent_gain_clamp(sdr):
     assert dev.gains == [71.0]
     assert fk.called("setGain")[-1][0] == (RX, 0, 71.0)
     assert dev.set_gain(73.0) == 71.0
-    assert dev.set_gain(-3.0) == 0.0                         # profile −3 ∩ runtime 0..73
-    assert fk.called("setGain")[-1][0] == (RX, 0, 0.0)
+    assert dev.set_gain(-5.0) == -3.0                        # AD9363 1.3–4 GHz band minimum
+    assert fk.called("setGain")[-1][0] == (RX, 0, -3.0)
 
 
 def test_gain_modes_without_thin_layer(sdr):
@@ -413,12 +518,15 @@ def test_ppm_hardware_xo_correction_exact_int(sdr, board):
     fk.calls.clear()
     assert dev.set_ppm_correction(3.33) == "hardware"
     assert board.value(f"{P}/xo_correction") == "40000133"   # round(40e6·(1+3.33e-6))
-    assert dev.ppm_hw == 3.33 and dev.ppm_hw_via == "hardware" and dev.xo_correction_hz == 40_000_133
+    # ppm_hw is the correction IN EFFECT: the integer-Hz read-back, 133 Hz / 40 MHz = 3.325 ppm
+    assert dev.ppm_hw == 3.325 and dev.ppm_hw_via == "hardware" and dev.xo_correction_hz == 40_000_133
     assert fk.called("setSampleRate")[-1][0] == (RX, 0, FS)          # PLLs re-programmed
     assert fk.called("setFrequency")[-1][0] == (RX, 0, 915e6)
     assert fk.called("setFrequencyCorrection") == []
     blk = dev.read(1024)
-    assert blk.settling and blk.meta["ppm_hw"] == 3.33 and blk.meta["ppm_hw_via"] == "hardware"
+    assert blk.settling and blk.meta["ppm_hw"] == 3.325 and blk.meta["ppm_hw_via"] == "hardware"
+    assert dev.set_ppm_correction(dev.ppm_hw) == "hardware"            # idempotent re-apply
+    assert board.value(f"{P}/xo_correction") == "40000133" and dev.ppm_hw == 3.325
     assert dev.set_ppm_correction(-12.5) == "hardware"
     assert board.value(f"{P}/xo_correction") == "39999500"
     assert dev.set_ppm_correction(0.0) == "hardware"
@@ -586,12 +694,20 @@ def test_describe(sdr):
 # ----------------------------------------------------------------------------- serial selection
 SER_A = "104473dc5993000917000e00c83b2e5e35"
 SER_B = "1044734c9605000f12003300af7c5b6a8e"
+# what SoapyPlutoSDR enumerates (the fake hides each entry's 'serial' = hw_serial of that board)
 TWO_PLUTOS = [
     {"device": "PlutoSDR", "driver": "plutosdr", "label": "PlutoSDR #0 usb:1.5.5", "uri": "usb:1.5.5",
      "serial": SER_A},
     {"device": "PlutoSDR", "driver": "plutosdr", "label": "PlutoSDR #1 usb:1.6.5", "uri": "usb:1.6.5",
      "serial": SER_B},
 ]
+
+
+@pytest.fixture
+def libiio_scan(monkeypatch):
+    """pylibiio whose scan (``iio_info -s``) lists both USB Plutos with their serials."""
+    return fake_iio.install(monkeypatch, fake_iio.make_pluto_board("usb:1.5.5", hw_serial=SER_A),
+                            fake_iio.make_pluto_board("usb:1.6.5", hw_serial=SER_B))
 
 
 def _count_enumerate(sdr) -> list[dict]:
@@ -612,8 +728,9 @@ def _live_devices() -> int:
     return len(sys.modules["SoapySDR"].state.live)
 
 
-def test_soapy_pluto_ignores_serial_so_the_backend_resolves_it(monkeypatch, no_iio):
+def test_soapy_pluto_enumerates_no_serial_so_the_backend_maps_it_with_libiio(monkeypatch, libiio_scan):
     sdr = fake_soapy.install(monkeypatch, devices=[dict(e) for e in TWO_PLUTOS])
+    assert all("serial" not in e for e in enumerate_soapy({"driver": "plutosdr"}))     # like the real driver
     # the driver alone opens the FIRST Pluto whatever serial is asked for (SoapyPlutoSDR)
     raw = sdr.Device({"driver": "plutosdr", "serial": SER_B})
     assert raw.entry["uri"] == "usb:1.5.5"
@@ -621,10 +738,12 @@ def test_soapy_pluto_ignores_serial_so_the_backend_resolves_it(monkeypatch, no_i
     calls = _count_enumerate(sdr)
     dev = make_dev(args={"driver": "plutosdr", "serial": SER_B})
     assert calls == [{"driver": "plutosdr"}]                  # driver filter only
+    assert libiio_scan.scan_calls == 1                        # serial <-> uri from the libiio scan
     fk = dev._dev
     assert fk.entry["uri"] == "usb:1.6.5" and fk.args["uri"] == "usb:1.6.5"
     assert dev.device_args == {"driver": "plutosdr", "serial": SER_B, "uri": "usb:1.6.5"}
     assert dev.info.serial == SER_B and dev.info.uri == "usb:1.6.5"
+    assert not any("yok sayar" in w for w in dev.warnings)   # 'serial' is consumed by EDS, not unknown
     dev.close()
 
 
@@ -633,7 +752,7 @@ def test_soapy_pluto_ignores_serial_so_the_backend_resolves_it(monkeypatch, no_i
     (SER_B[:10].upper(), "usb:1.6.5"),                        # case-insensitive prefix
     (SER_A, "usb:1.5.5"),                                     # exact
 ])
-def test_serial_prefix_and_case_insensitive_match(monkeypatch, no_iio, asked, uri):
+def test_serial_prefix_and_case_insensitive_match(monkeypatch, libiio_scan, asked, uri):
     fake_soapy.install(monkeypatch, devices=[dict(e) for e in TWO_PLUTOS])
     dev = make_dev(args={"driver": "plutosdr", "serial": asked})
     assert dev._dev.entry["uri"] == uri
@@ -641,7 +760,30 @@ def test_serial_prefix_and_case_insensitive_match(monkeypatch, no_iio, asked, ur
     dev.close()
 
 
-def test_serial_from_libiio_label_when_entry_has_no_serial_key(monkeypatch, no_iio):
+def test_serial_without_pylibiio_explains_how_to_map(monkeypatch, no_iio):
+    fake_soapy.install(monkeypatch, devices=[dict(e) for e in TWO_PLUTOS])
+    with pytest.raises(DeviceNotFound) as ei:
+        make_dev(args={"driver": "plutosdr", "serial": SER_B})
+    msg = str(ei.value)
+    assert "serial=? uri=usb:1.6.5" in msg and "libiio" in msg and "iio_info -s" in msg
+    assert _live_devices() == 0
+
+
+def test_serial_of_a_pluto_only_the_scan_sees_is_not_opened(monkeypatch):
+    """A Pluto streaming in another process is skipped by SoapyPlutoSDR's find (its context
+    cannot be opened) but still listed by the libiio USB scan: no false match."""
+    fake_iio.install(monkeypatch, fake_iio.make_pluto_board("usb:1.6.5", hw_serial=SER_B),
+                     scan_extra={"usb:1.5.5": f"0456:b673 (Analog Devices Inc. PlutoSDR (ADALM-PLUTO)), serial={SER_A}"})
+    fake_soapy.install(monkeypatch, devices=[dict(TWO_PLUTOS[1])])
+    with pytest.raises(DeviceNotFound):
+        make_dev(args={"driver": "plutosdr", "serial": SER_A})
+    dev = make_dev(args={"driver": "plutosdr", "serial": SER_B[:8]})
+    assert dev._dev.entry["uri"] == "usb:1.6.5"
+    dev.close()
+
+
+def test_serial_from_label_when_a_driver_puts_it_there(monkeypatch, no_iio):
+    """Drivers whose enumeration label carries 'serial=...' need no libiio scan."""
     devices = [
         {"device": "PlutoSDR", "driver": "plutosdr", "uri": "usb:3.4.5",
          "label": f"0456:b673 (Analog Devices Inc. PlutoSDR (ADALM-PLUTO)), serial={SER_A}"},
@@ -654,7 +796,7 @@ def test_serial_from_libiio_label_when_entry_has_no_serial_key(monkeypatch, no_i
     dev.close()
 
 
-def test_ambiguous_serial_prefix_lists_candidates(monkeypatch, no_iio):
+def test_ambiguous_serial_prefix_lists_candidates(monkeypatch, libiio_scan):
     fake_soapy.install(monkeypatch, devices=[dict(e) for e in TWO_PLUTOS])
     with pytest.raises(DeviceNotFound) as ei:
         make_dev(args={"driver": "plutosdr", "serial": "10447"})        # prefix of both
@@ -663,7 +805,7 @@ def test_ambiguous_serial_prefix_lists_candidates(monkeypatch, no_iio):
     assert _live_devices() == 0                                       # nothing was opened
 
 
-def test_unknown_serial_lists_candidates(monkeypatch, no_iio):
+def test_unknown_serial_lists_candidates(monkeypatch, libiio_scan):
     fake_soapy.install(monkeypatch, devices=[dict(e) for e in TWO_PLUTOS])
     with pytest.raises(DeviceNotFound) as ei:
         make_dev(args={"driver": "plutosdr", "serial": "deadbeef"})
@@ -674,16 +816,16 @@ def test_unknown_serial_lists_candidates(monkeypatch, no_iio):
         make_dev(args={"driver": "plutosdr", "serial": "  "})
 
 
-def test_uri_or_hostname_given_skips_serial_resolution(monkeypatch, no_iio):
+def test_uri_or_hostname_given_skips_serial_resolution(monkeypatch, libiio_scan):
     sdr = fake_soapy.install(monkeypatch, devices=[dict(e) for e in TWO_PLUTOS])
     calls = _count_enumerate(sdr)
     dev = make_dev(args={"driver": "plutosdr", "uri": "usb:1.6.5", "serial": SER_B})
-    assert calls == [] and dev._dev.entry["uri"] == "usb:1.6.5"
+    assert calls == [] and dev._dev.entry["uri"] == "usb:1.6.5" and libiio_scan.scan_calls == 0
     assert dev.device_args == {"driver": "plutosdr", "uri": "usb:1.6.5", "serial": SER_B}
     dev.close()
 
 
-def test_same_device_listed_twice_is_not_ambiguous(monkeypatch, no_iio):
+def test_same_device_listed_twice_is_not_ambiguous(monkeypatch, libiio_scan):
     dup = [dict(TWO_PLUTOS[0]), dict(TWO_PLUTOS[0]), dict(TWO_PLUTOS[1])]
     fake_soapy.install(monkeypatch, devices=dup)
     dev = make_dev(args={"driver": "plutosdr", "serial": SER_A[:9]})
@@ -692,15 +834,328 @@ def test_same_device_listed_twice_is_not_ambiguous(monkeypatch, no_iio):
 
 
 def test_serial_for_driver_without_uri_keeps_native_filtering(monkeypatch, no_iio):
-    """UHD-like drivers filter by serial themselves and enumerate no 'uri': the prefix is
-    expanded to the full serial and passed on."""
+    """UHD-like drivers enumerate and filter by serial themselves and enumerate no 'uri': the
+    prefix is expanded to the full serial and passed on."""
     fake_soapy.install(
-        monkeypatch, filters_serial=True, num_channels=2, driver_key="UHD", hardware_key="B210",
-        devices=[{"driver": "uhd", "label": "B210 31415A", "serial": "31415A"},
-                 {"driver": "uhd", "label": "B210 27182B", "serial": "27182B"}],
+        monkeypatch, filters_serial=True, enumerate_serial=True, num_channels=2, driver_key="UHD",
+        hardware_key="B210", devices=[{"driver": "uhd", "label": "B210 31415A", "serial": "31415A"},
+                                      {"driver": "uhd", "label": "B210 27182B", "serial": "27182B"}],
         hardware_info={"serial": "x"}, native_full_scale=32768.0, cs16_full_scale=32768.0,
     )
     dev = make_dev(args={"driver": "uhd", "serial": "2718"}, profile=load_profile("usrp_b210"), channels=[0, 1])
     assert dev.device_args == {"driver": "uhd", "serial": "27182B"} and "uri" not in dev._dev.args
     assert dev._dev.entry["serial"] == "27182B"
     dev.close()
+
+
+# ----------------------------------------------------------------------------- overflow (Pluto DMA status)
+def pluto_with_dma(monkeypatch, **kw):
+    """Real-SoapyPlutoSDR-like fake (readStream never reports overflow) + its board's AXI ADC
+    DMA status register through the thin layer."""
+    board = fake_iio.make_pluto_board(IP)
+    fake_iio.install(monkeypatch, board)
+    sdr = fake_soapy.install(monkeypatch, overflow_hook=board.dma_overflow, overflow_drop=3000, **kw)
+    return sdr, board
+
+
+def test_pluto_overflow_detected_from_dma_status_register(monkeypatch):
+    sdr, board = pluto_with_dma(monkeypatch)
+    dev = make_dev(control_uri=IP, overflow_poll_s=0.0)
+    dev.configure(rxcfg())                                   # buffer 1024, settle 5×1024
+    dev.capture(2048)
+    assert dev.overflow_source == "dma_status"
+    assert ("w", "cf-ad9361-lpc", 0x80000088, 0x4) in board.reg_log    # stale bit cleared at start
+    fk = sdr.state.last()
+    fk.rx_script.append("overflow")                          # driver: data as usual, 3000 samples lost
+    b1 = dev.read(1024)
+    assert not b1.overflow                                   # the gap is detected by the poll after it
+    assert board.dma_overflows == 1 and not board.rx_overflow_bit       # read + cleared (W1C)
+    b2 = dev.read(1024)
+    assert b2.overflow and b2.settling                       # gap before it; position uncertain → settling
+    assert dev.stats.overflows == 1 and dev.dma_overflow_events == 1
+    # the uncertain span (settle_samples from b2 on) is settling, then clean data again
+    assert dev._settle_until == b2.index + dev.settle_samples
+    blk = dev.capture(1024)
+    assert not blk.settling and blk.index >= b2.index + dev.settle_samples
+    assert dev.describe()["overflow_source"] == "dma_status"
+    dev.close()
+
+
+def test_driver_never_reports_pluto_overflow_without_the_register(monkeypatch, no_iio):
+    """Without the thin layer the loss is invisible (what the review found): EDS says so."""
+    sdr = fake_soapy.install(monkeypatch, overflow_drop=3000)
+    dev = make_dev(control_uri="none")
+    dev.configure(rxcfg())
+    dev.capture(2048)
+    sdr.state.last().rx_script.append("overflow")
+    assert not any(dev.read(1024).overflow for _ in range(4))
+    assert dev.stats.overflows == 0 and dev.overflow_source == "none"
+    assert any("RAPORLAMAZ" in w and "BİLİNMİYOR" in w for w in dev.warnings)
+    dev.close()
+
+
+def test_dma_poll_is_rate_limited(monkeypatch):
+    pluto_with_dma(monkeypatch)
+    dev = make_dev(control_uri=IP, overflow_poll_s=3600.0)
+    dev.configure(rxcfg())
+    dev.start_stream()
+    for _ in range(20):
+        dev.read(1024)
+    reads = [e for e in sys_board(dev).reg_log if e[0] == "r"]
+    assert len(reads) == 1                                   # first read polls, then the interval blocks
+    dev.close()
+
+
+def sys_board(dev):
+    import sys
+    return sys.modules["iio"].boards[dev.thin_uri()]
+
+
+def test_dma_poll_failure_disables_detection_without_stalling(monkeypatch):
+    sdr, board = pluto_with_dma(monkeypatch)
+    dev = make_dev(control_uri=IP, overflow_poll_s=0.0)
+    dev.configure(rxcfg())
+    dev.start_stream()
+    dev.read(1024)
+    board.reg_error = (110, "Connection timed out")
+    dev.read(1024)
+    assert dev.overflow_source == "none" and any("KAPATILDI" in w for w in dev.warnings)
+    n = len(board.reg_log)
+    for _ in range(5):
+        dev.read(1024)
+    assert len(board.reg_log) == n                           # no further register traffic
+    dev.close()
+
+
+def test_old_board_without_register_access(monkeypatch):
+    board = fake_iio.make_pluto_board(IP, dma_regs=False)
+    fake_iio.install(monkeypatch, board)
+    fake_soapy.install(monkeypatch)
+    dev = make_dev(control_uri=IP)
+    dev.configure(rxcfg())
+    dev.start_stream()
+    assert dev.overflow_source == "none"
+    dev.read(1024)
+    dev.close()
+
+
+def test_non_pluto_driver_overflow_source_is_driver(monkeypatch, no_iio):
+    fake_soapy.install(monkeypatch, num_channels=1, driver_key="UHD", hardware_key="B210",
+                       devices=[{"driver": "uhd", "label": "B210 3141", "serial": "3141"}],
+                       hardware_info={"serial": "3141"}, reports_overflow=True, native_format_api="struct",
+                       native_full_scale=32768.0, cs16_full_scale=32768.0)
+    dev = make_dev(args={"driver": "uhd"}, profile=load_profile("usrp_b210"))
+    dev.configure(rxcfg())
+    dev.start_stream()
+    assert dev.overflow_source == "driver"
+    dev.close()
+
+
+def test_group_of_pluto_like_members_flags_dma_overflow(monkeypatch):
+    """DeviceGroup sees a member's DMA overflow (misalignment) and the uncertain span as settling."""
+    from eds.hal.group import DeviceGroup
+
+    sdr, board = pluto_with_dma(monkeypatch)
+    dev = make_dev(control_uri=IP, overflow_poll_s=0.0)
+    grp = DeviceGroup([dev])
+    grp.configure(rxcfg())
+    grp.capture(1024)
+    sdr.state.last().rx_script.append("overflow")
+    flags = [(b.overflow, b.settling) for b in (grp.read(1024) for _ in range(3))]
+    assert (True, True) in flags
+    grp.close()
+
+
+# ----------------------------------------------------------------------------- reference clock state
+def test_boot_xo_correction_is_accounted_for_as_ppm_hw(monkeypatch):
+    """A non-nominal xo_correction left by a previous run / the firmware environment is IN EFFECT:
+    it must appear as ppm_hw before any estimation (finding HW-02)."""
+    board = fake_iio.make_pluto_board(IP, xo_correction=40_000_468)
+    fake_iio.install(monkeypatch, board)
+    fake_soapy.install(monkeypatch)
+    dev = make_dev(control_uri=IP)
+    dev.configure(rxcfg())
+    assert dev.ppm_hw == pytest.approx(11.7, abs=1e-12) and dev.ppm_hw_via == "hardware"
+    assert dev.xo_boot_hz == 40_000_468 and dev.xo_correction_hz == 40_000_468
+    assert board.value(f"{P}/xo_correction") == "40000468"  # nothing written at open
+    assert any("40000468" in w and "ppm_hw" in w for w in dev.warnings)
+    blk = dev.capture(1024)
+    assert blk.meta["ppm_hw"] == pytest.approx(11.7, abs=1e-12)
+    # a later calibration composes on top of it; applying the stored TOTAL changes nothing here
+    assert dev.set_ppm_correction(11.7) == "hardware" and board.value(f"{P}/xo_correction") == "40000468"
+    dev.set_ppm_correction(0.0)                              # e.g. a measurement that wants nominal
+    assert board.value(f"{P}/xo_correction") == "40000000" and dev.ppm_hw == 0.0
+    dev.close()
+    assert board.value(f"{P}/xo_correction") == "40000468"  # device left as found
+
+
+def test_close_does_not_touch_xo_it_never_wrote(monkeypatch, board):
+    fake_soapy.install(monkeypatch)
+    dev = make_dev(control_uri=IP)
+    dev.configure(rxcfg())
+    dev.close()
+    assert not any(path.endswith("xo_correction") for path, _ in board.writes)
+
+
+def test_unreachable_xo_write_keeps_hardware_state(monkeypatch):
+    """No Soapy correction (SoapyPlutoSDR has none) and the xo write fails: 'none', and ppm_hw
+    keeps the correction that is still in the hardware."""
+    board = fake_iio.make_pluto_board(IP, xo_correction=40_000_200)
+    fake_iio.install(monkeypatch, board)
+    fake_soapy.install(monkeypatch)
+    dev = make_dev(control_uri=IP)
+    dev.configure(rxcfg())
+    assert dev.set_ppm_correction(500.0) == "none"           # outside ±200 ppm → EINVAL
+    assert dev.ppm_hw == pytest.approx(5.0) and dev.ppm_hw_via == "hardware"
+    dev.close()
+
+
+def test_boot_xo_from_firmware_env_without_thin_layer(monkeypatch, no_iio):
+    info = dict(fake_soapy.FakeConfig().hardware_info, **{"ad9361-phy,xo_correction": "39999500"})
+    fake_soapy.install(monkeypatch, hardware_info=info)
+    dev = make_dev(control_uri="none")
+    dev.configure(rxcfg())
+    assert dev.ppm_hw == pytest.approx(-12.5) and dev.ppm_hw_via == "hardware"
+    assert any("doğrulanamıyor" in w for w in dev.warnings)
+    assert dev.set_ppm_correction(3.0) == "none" and dev.ppm_hw == pytest.approx(-12.5)
+    dev.close()
+
+
+def test_soapy_correction_composes_with_xo_in_effect(monkeypatch):
+    """Without a writable xo (old firmware) the Soapy correction covers only the residual."""
+    board = fake_iio.make_pluto_board(IP, has_xo=False)
+    fake_iio.install(monkeypatch, board)
+    sdr = fake_soapy.install(monkeypatch, has_frequency_correction=True,
+                             hardware_info=dict(fake_soapy.FakeConfig().hardware_info))
+    dev = make_dev(control_uri=IP)
+    dev._xo_ppm = 5.0                                        # e.g. a driver default already in effect
+    assert dev.set_ppm_correction(12.0) == "soapy"
+    corr = sdr.state.last().called("setFrequencyCorrection")[-1][0][2]
+    assert corr == pytest.approx((12.0 - 5.0) / (1 + 5e-6))
+    assert dev.ppm_hw == pytest.approx(12.0, abs=1e-9)
+    dev.close()
+
+
+def test_thin_layer_of_another_pluto_is_refused(monkeypatch):
+    """control_uri pointing at the OTHER Pluto (USB address swapped after re-plug): no write
+    may reach the wrong radio (finding HW-04)."""
+    other = fake_iio.make_pluto_board(IP, hw_serial="1044734c9605000f12003300af7c5b6a8e")
+    fake_iio.install(monkeypatch, other)
+    fake_soapy.install(monkeypatch)
+    dev = make_dev(control_uri=IP)
+    dev.configure(rxcfg())
+    assert dev.thin_layer() is None
+    assert dev.set_ppm_correction(11.7) == "none"
+    assert other.writes == [] and other.reg_log == []
+    msg = [w for w in dev.warnings if "BAŞKA bir Pluto" in w]
+    assert len(msg) == 1 and "1044734c9605" in msg[0] and fake_soapy.PLUTO_ENTRY["serial"] in msg[0]
+    dev.close()
+
+
+def test_thin_layer_same_serial_is_verified(sdr, board):
+    dev = make_dev(control_uri=IP)
+    assert dev.thin_layer() is not None and dev.thin_serial_verified
+    dev.close()
+
+
+# ----------------------------------------------------------------------------- one Pluto per process
+def test_second_pluto_in_the_same_process_is_refused(monkeypatch, no_iio):
+    sdr = fake_soapy.install(monkeypatch, devices=[dict(e) for e in TWO_PLUTOS])
+    a = make_dev(args={"driver": "plutosdr", "uri": "usb:1.5.5"})
+    with pytest.raises(DeviceError) as ei:
+        SoapyRxDevice(DeviceConfig(name="rx1", backend="soapy", args={"driver": "plutosdr", "uri": "usb:1.6.5"},
+                                   control_uri="none"), PLUTO)
+    msg = str(ei.value)
+    assert "rx1" in msg and "rx0" in msg and 'isolation = "subprocess"' in msg and "süreç" in msg
+    assert len(sdr.state.live) == 1                          # the driver was never asked for a 2nd instance
+    assert sb.open_pluto_owners() == ["rx0"]
+    a.close()
+    assert sb.open_pluto_owners() == []
+    b = make_dev(args={"driver": "plutosdr", "uri": "usb:1.6.5"})
+    assert b._dev.entry["uri"] == "usb:1.6.5"
+    b.close()
+
+
+def test_pluto_slot_released_on_open_failure_and_garbage_collection(monkeypatch, no_iio):
+    fake_soapy.install(monkeypatch)
+    with pytest.raises(DeviceNotFound):
+        make_dev(args={"driver": "plutosdr", "uri": "usb:9.9.9"})
+    assert sb.open_pluto_owners() == []
+    make_dev().describe()                                    # dropped without close()
+    gc.collect()
+    assert sb.open_pluto_owners() == []
+    make_dev().close()
+
+
+def test_fake_models_the_static_context_aliasing(monkeypatch, no_iio):
+    """Why the guard exists: SoapyPlutoSDR binds a 2nd instance to the 1st Pluto and frees the
+    shared context when either is destroyed."""
+    sdr = fake_soapy.install(monkeypatch, devices=[dict(e) for e in TWO_PLUTOS])
+    first = sdr.Device({"driver": "plutosdr", "uri": "usb:1.5.5"})
+    second = sdr.Device({"driver": "plutosdr", "uri": "usb:1.6.5"})
+    assert second.entry["uri"] == "usb:1.5.5"                # uri ignored: same radio
+    del second
+    with pytest.raises(RuntimeError, match="destroyed"):
+        first.setFrequency(RX, 0, 1e9)
+    del first
+
+
+def test_other_drivers_are_not_limited(monkeypatch, no_iio):
+    fake_soapy.install(monkeypatch, driver_key="UHD", hardware_key="B210", filters_serial=True,
+                       enumerate_serial=True, static_context=False,
+                       devices=[{"driver": "uhd", "label": "B210 a", "serial": "a"},
+                                {"driver": "uhd", "label": "B210 b", "serial": "b"}],
+                       hardware_info={"serial": "x"})
+    b210 = load_profile("usrp_b210")
+    d1 = make_dev(args={"driver": "uhd", "serial": "a"}, profile=b210)
+    d2 = make_dev(args={"driver": "uhd", "serial": "b"}, profile=b210)
+    assert sb.open_pluto_owners() == []
+    d1.close()
+    d2.close()
+
+
+# ----------------------------------------------------------------------------- stop vs in-flight read
+def test_read_returning_after_stop_is_discarded(sdr):
+    """A readStream that returns after stop_stream() (SoapyPlutoSDR: refill completes late) must
+    not produce a 0-channel block (finding STR-07)."""
+    import threading
+
+    dev = make_dev()
+    dev.configure(rxcfg())
+    dev.start_stream()
+    fk = dev._dev
+    entered, release = threading.Event(), threading.Event()
+
+    def stall(_fk):
+        if not entered.is_set():
+            entered.set()
+            release.wait(5.0)
+
+    fk.on_read = stall
+    out: list = []
+
+    def reader():
+        try:
+            out.append(dev.read(1024, timeout_s=0.5))
+        except Exception as e:  # noqa: BLE001 - collected for the assertion
+            out.append(e)
+
+    t = threading.Thread(target=reader)
+    t.start()
+    assert entered.wait(5.0)
+    dev.stop_stream()
+    release.set()
+    t.join(5.0)
+    assert len(out) == 1 and isinstance(out[0], StreamError) and "durduruldu" in str(out[0])
+    dev.close()
+
+
+def test_aliased_static_context_is_reported(monkeypatch, no_iio):
+    """A Pluto opened outside EDS in this process (guard bypassed): the driver hands EDS that
+    context whatever uri is asked for — the hardware-info URI exposes it."""
+    sdr = fake_soapy.install(monkeypatch, devices=[dict(e) for e in TWO_PLUTOS])
+    raw = sdr.Device({"driver": "plutosdr", "uri": "usb:1.5.5"})
+    dev = make_dev(args={"driver": "plutosdr", "uri": "usb:1.6.5"})
+    assert any("usb:1.6.5" in w and "usb:1.5.5" in w and "ayrı süreç" in w for w in dev.warnings)
+    dev.close()
+    del raw

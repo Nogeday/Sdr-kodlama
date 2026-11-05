@@ -168,3 +168,106 @@ def test_invalid_arguments() -> None:
         effective_averages(0, 0.5, "hann", 64)
     with pytest.raises(ConfigError):
         os_cfar_alpha(1e-3, 1.0, 16, 17)
+
+
+# =========================================================================== weighted gamma sums (RF-03)
+def _bh_block_eigenvalues(d: int, nfft: int = 4096) -> np.ndarray:
+    """Eigenvalues of the d x d amplitude-correlation matrix of adjacent Blackman-Harris bins
+    (independent re-statement: r = DFT(w^2) / sum(w^2), Toeplitz)."""
+    w2 = get_window("blackmanharris", nfft) ** 2
+    r = np.fft.fft(w2).real / w2.sum()
+    lag = np.abs(np.arange(d)[:, None] - np.arange(d)[None, :])
+    return np.linalg.eigvalsh(np.where(lag < 8, r[np.minimum(lag, 7)], 0.0))
+
+
+def _exact_sf_exponential_sum(x: float, a: np.ndarray) -> float:
+    """Exact P(sum a_i E_i > x), E_i ~ Exp(1), distinct a_i (partial fractions, 80 digits)."""
+    from decimal import Decimal, localcontext
+
+    with localcontext() as ctx:
+        ctx.prec = 80
+        aa = [Decimal(float(v)) for v in a if v > 1e-9]
+        xx = Decimal(float(x))
+        total = Decimal(0)
+        for i, ai in enumerate(aa):
+            c = Decimal(1)
+            for j, aj in enumerate(aa):
+                if j != i:
+                    c *= ai / (ai - aj)
+            total += c * (-xx / ai).exp()
+        return float(total)
+
+
+def test_weighted_gamma_sf_reduces_to_the_gamma_survival() -> None:
+    from eds.dsp.stats import weighted_gamma_sf
+
+    for shape in (1.0, 2.0, 4.0, 13.7):
+        for x in (0.3, 1.0, 3.0, 10.0, 40.0):
+            xs = x * shape
+            exact = regularized_gamma_q(shape, xs)
+            tol = 0.008 if shape < 2 else 0.002
+            assert weighted_gamma_sf(xs, [1.0], shape) == pytest.approx(exact, rel=tol), (shape, x)
+    # D equal weights of shape n == Gamma(n D); vectorized form; limits
+    v = weighted_gamma_sf(np.array([0.0, 2.0, 5.0, np.inf]), [0.25] * 4, 1.0)
+    assert v.shape == (4,) and v[0] == 1.0 and v[-1] == 0.0
+    assert v[1] == pytest.approx(regularized_gamma_q(4.0, 8.0), rel=2e-3)
+    assert v[2] == pytest.approx(regularized_gamma_q(4.0, 20.0), rel=2e-3)
+
+
+def test_block_mean_tail_is_heavier_than_the_moment_matched_gamma() -> None:
+    """RF-03: the D = 16 Blackman-Harris block mean (n = 1) against its exact distribution."""
+    from eds.dsp.stats import weighted_gamma_sf
+
+    d = 16
+    lam = _bh_block_eigenvalues(d)
+    a = lam / d                                              # mean 1
+    d_eff = d * d / float(np.sum(lam ** 2))
+    assert d_eff == pytest.approx(6.10, abs=0.01) and a.max() * d_eff == pytest.approx(1.426, abs=0.005)
+    for target in (1e-2, 1e-4, 1e-7, 1e-10):
+        x = gamma_isf(target, d_eff) / d_eff                 # moment-matched threshold
+        exact = _exact_sf_exponential_sum(x, a)
+        assert weighted_gamma_sf(x, a, 1.0) == pytest.approx(exact, rel=0.01), target
+        if target <= 1e-7:
+            assert exact > 3.0 * target                      # the old model's false-alarm excess
+
+
+def test_block_mean_tail_monte_carlo() -> None:
+    """Saddlepoint tail of the eigen model = empirical tail of real windowed-FFT block means."""
+    from eds.dsp.stats import weighted_gamma_sf
+
+    rng = np.random.default_rng(3)
+    nfft, d = 1024, 16
+    w = get_window("blackmanharris", nfft)
+    vals = []
+    for _ in range(8):
+        x = rng.standard_normal((256, nfft)) + 1j * rng.standard_normal((256, nfft))
+        p = np.abs(np.fft.fft(x * w, axis=1)) ** 2 / (2.0 * np.sum(w * w))
+        vals.append(p.reshape(-1, d).mean(axis=1))
+    v = np.concatenate(vals)                                  # 131072 block means, mean 1
+    lam = _bh_block_eigenvalues(d, nfft)
+    for q in (1e-2, 1e-3):
+        x = float(np.quantile(v, 1.0 - q))
+        assert weighted_gamma_sf(x, lam / d, 1.0) == pytest.approx(q, rel=0.25 if q < 1e-2 else 0.08)
+
+
+def test_cfar_alphas_with_a_cut_model() -> None:
+    from eds.dsp.stats import CellModel
+
+    # a single component of shape n and weight 1/n IS Gamma(n, 1/n): same multipliers
+    for n in (1.0, 4.0):
+        cut = CellModel((1.0 / n,), n)
+        assert os_cfar_alpha(1e-5, n, 32, 24, cut=cut) == pytest.approx(os_cfar_alpha(1e-5, n, 32, 24), rel=3e-3)
+        assert ca_cfar_alpha(1e-5, n, 32.0, cut=cut) == pytest.approx(ca_cfar_alpha(1e-5, n, 32.0), rel=3e-3)
+    # heavier CUT tail -> larger multiplier
+    lam = _bh_block_eigenvalues(16)
+    heavy = CellModel(tuple(lam / 16), 1.0)
+    d_eff = 16 * 16 / float(np.sum(lam ** 2))
+    assert os_cfar_alpha(1e-6, d_eff, 62, 46, cut=heavy) > 1.05 * os_cfar_alpha(1e-6, d_eff, 62, 46)
+    with pytest.raises(ConfigError):
+        CellModel((), 1.0)
+    with pytest.raises(ConfigError):
+        CellModel((0.5, -0.1), 1.0)
+    with pytest.raises(ConfigError):
+        CellModel((0.5,), 0.0)
+    with pytest.raises(ConfigError):                          # must be normalised to mean 1
+        os_cfar_alpha(1e-3, 1.0, 32, 24, cut=CellModel((0.5,), 1.0))

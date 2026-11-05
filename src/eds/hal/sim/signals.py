@@ -22,6 +22,15 @@ import numpy as np
 #: sample indices, so the waveform does not depend on how a consumer slices its reads.
 FRAME: int = 16384
 
+#: Consecutive noise frames overlap by this many samples and are crossfaded with the
+#: power-complementary taper of :func:`crossfade_tapers`: independent frames spliced
+#: end-to-end would put a waveform discontinuity at every boundary, whose leakage fills
+#: the spectrum outside an emitter's band (skirts only ~30 dB down).
+FRAME_XFADE: int = 1024
+
+#: Frame ``j`` occupies absolute samples ``[j * FRAME_HOP, j * FRAME_HOP + FRAME)``.
+FRAME_HOP: int = FRAME - FRAME_XFADE
+
 #: Block length of the outer-product tone synthesizer (see :func:`tone_bank`).
 TONE_BLOCK: int = 1024
 
@@ -91,6 +100,34 @@ def butterworth_mag(f_hz, corner_hz: float, order: int = LPF_ORDER):
         return 1.0 / math.sqrt(1.0 + r ** (2 * order))
     r = np.asarray(f_hz, dtype=np.float64) / float(corner_hz)
     return 1.0 / np.sqrt(1.0 + r ** (2 * order))
+
+
+def pole_mag(f_hz, corner_hz: float):
+    """|H(f)| of a single real pole with -3 dB corner ``corner_hz`` (``corner_hz <= 0``: 1)."""
+    if corner_hz <= 0.0:
+        return 1.0 if np.ndim(f_hz) == 0 else np.ones(np.shape(f_hz))
+    if np.ndim(f_hz) == 0:
+        r = abs(float(f_hz)) / float(corner_hz)
+        return 1.0 / math.sqrt(1.0 + r * r)
+    r = np.asarray(f_hz, dtype=np.float64) / float(corner_hz)
+    return 1.0 / np.sqrt(1.0 + r * r)
+
+
+#: AD936x RX analog baseband defaults (relative to the baseband bandwidth ``BBBW = bw/2``):
+#: the 3rd-order Butterworth BB LPF is calibrated to a -3 dB corner of 1.4 x BBBW (ad9361
+#: driver ``ad9361_rx_bb_analog_filter_calib``: "1.4 * BBBW * 2PI / ln(2)"), the TIA adds a
+#: single pole at 2.5 x BBBW (``ad9361_rx_tia_calib``).
+ANALOG_CORNER_FACTOR: float = 1.4
+TIA_POLE_FACTOR: float = 2.5
+
+
+def rx_analog_mag(f_hz, bw_hz: float, corner_factor: float = ANALOG_CORNER_FACTOR,
+                  tia_factor: float = TIA_POLE_FACTOR):
+    """|H(f)| of the RX analog baseband chain for RF bandwidth ``bw_hz``: Butterworth
+    (:data:`LPF_ORDER`) with corner ``corner_factor * bw/2`` times the TIA pole at
+    ``tia_factor * bw/2`` (``tia_factor = 0``: no TIA pole). Scalar -> float, array -> array."""
+    half = 0.5 * float(bw_hz)
+    return butterworth_mag(f_hz, corner_factor * half) * pole_mag(f_hz, tia_factor * half)
 
 
 #: Defaults of the AD9363 RX digital decimation chain model (fractions of the output rate).
@@ -271,6 +308,67 @@ def _fm_sidebands_cached(beta: float, tol: float) -> tuple[np.ndarray, np.ndarra
     n_out.flags.writeable = False
     j_out.flags.writeable = False
     return n_out, j_out
+
+
+# --------------------------------------------------------------------------- RF compression
+def rapp_saturation(p1db_lin: float, smoothness: float) -> float:
+    """Saturation amplitude ``A_sat`` of the Rapp AM-AM curve whose 1 dB compression point is
+    at amplitude ``sqrt(p1db_lin)`` (``|x|^2`` = CW power): ``A_1dB / (10^(p/10) - 1)^(1/(2p))``."""
+    p = float(smoothness)
+    return math.sqrt(float(p1db_lin)) / (10.0 ** (p / 10.0) - 1.0) ** (1.0 / (2.0 * p))
+
+
+def rapp_gain_db(power_lin: float, a_sat: float, smoothness: float) -> float:
+    """Gain change (dB, <= 0) of the Rapp curve for a constant-envelope input of power ``|x|^2``."""
+    p = float(smoothness)
+    return -10.0 / p * math.log10(1.0 + (float(power_lin) / (a_sat * a_sat)) ** p)
+
+
+def rapp_compress_inplace(x: np.ndarray, a_sat: float, smoothness: float) -> bool:
+    """Rapp AM-AM (no AM-PM) on complex samples: ``y = x / (1 + (|x|/A_sat)^(2p))^(1/(2p))``.
+
+    Smooth: 1 dB compression at ``0.8745 A_sat`` for ``p = 2``, output amplitude tends to
+    ``A_sat``. Returns False (and leaves ``x`` untouched) when every ``|x|`` is so far below
+    ``A_sat`` that the gain change is under 1e-7 (float32 resolution).
+    """
+    if x.size == 0:
+        return False
+    p = float(smoothness)
+    r_skip = (2.0 * p * 1e-7) ** (1.0 / (2.0 * p))
+    v = x.view(np.float32) if x.dtype == np.complex64 else np.abs(x)
+    if math.sqrt(2.0) * float(np.max(np.abs(v))) < r_skip * a_sat:
+        return False
+    ft = np.float32 if x.dtype == np.complex64 else np.float64
+    re = x.real.astype(ft)
+    im = x.imag.astype(ft)
+    m2 = re * re
+    m2 += im * im
+    m2 *= ft(1.0 / (a_sat * a_sat))
+    np.minimum(m2, ft(1e18), out=m2)                 # (|x|/A_sat)^2 beyond 1e18 cannot occur physically
+    if p == 2.0:
+        t = m2 * m2
+    else:
+        t = np.power(m2, ft(p))
+    t += ft(1.0)
+    g = np.power(t, ft(-0.5 / p))
+    x *= g
+    return True
+
+
+# --------------------------------------------------------------------------- noise frames
+@lru_cache(maxsize=4)
+def crossfade_tapers(n: int = FRAME_XFADE) -> tuple[np.ndarray, np.ndarray]:
+    """Power-complementary fade-in / fade-out tapers of length ``n`` (float32, read-only):
+    ``w_in = sin(pi/2 sin^2(pi t/2))``, ``w_out = cos(...)``, ``t = (k + 1/2)/n``, so
+    ``w_in^2 + w_out^2 = 1`` (two independent frames keep the variance) and both are smooth
+    at the ends (no slope discontinuity -> fast spectral decay of the splice)."""
+    t = (np.arange(n, dtype=np.float64) + 0.5) / n
+    ph = 0.5 * np.pi * np.sin(0.5 * np.pi * t) ** 2
+    w_in = np.sin(ph).astype(np.float32)
+    w_out = np.cos(ph).astype(np.float32)
+    w_in.flags.writeable = False
+    w_out.flags.writeable = False
+    return w_in, w_out
 
 
 # --------------------------------------------------------------------------- ADC

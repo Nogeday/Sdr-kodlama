@@ -36,15 +36,19 @@
   after the DSP. Together with the envelope ``t_ns`` and the subscriber's receive time they
   give the latency budget measured by ``eds measure latency``.
 * **Status.** Every ``bus.status_period_s`` an ``rx.status`` (state, tuning, gains, ppm
-  {value, via, age_s}, the 8 stream counters accumulated since the node started, levels of
-  the last block, sensors, warnings).
+  {value, via, age_s}, the 8 stream counters accumulated since the node started plus the
+  device's ``overflow_source`` when it states one (``"none"`` = sample loss NOT detected: the
+  overflow counter is unknown, not 0), levels of the last block, sensors, warnings — the
+  device's own later warnings included).
 * **Control.** ``ctl.rx`` commands (proxy mode: ``bus.proxy_backend``; direct mode: every
   ``bus.ctl_endpoints``; none → remote control disabled) are executed by
   :meth:`RxNode.handle_command`, which publishes a ``ctl.ack`` for each command addressed to
   ``"*"`` or to this node. Device errors become ``ok = false`` acks with the Turkish message;
   the node keeps running. A ``sweep`` stops the streamer, runs the
   :class:`~eds.rx.sweep.Sweeper` (state ``sweeping``), publishes ``rx.sweep``, restores the RX
-  settings (``app.rx`` plus every change made over ``ctl.rx``) and restarts the pipeline.
+  settings (``app.rx`` plus every change made over ``ctl.rx``) and restarts the pipeline —
+  also when the stream was in ``error`` before the sweep. If the restore or the restart fails
+  the node enters ``error`` and the retry loop re-applies the settings before restarting.
   Sweeps received over the bus run in a worker thread so that ``ping`` / ``stop`` stay
   responsive; ``stop`` aborts a running sweep and stops the node.
 
@@ -330,6 +334,8 @@ class RxNode:
         self._agc: GainController | None = None
         self._soft_agc = False
         self._last_restart = 0.0
+        self._reconfigure_pending = False        # RX settings must be re-applied before restarting
+        self._dev_warn_seen = 0                  # device.warnings already copied into the node warnings
         self._acc_stats: dict[str, float] = {k: 0 for k in _COUNTER_KEYS}
         self._acc_stats["elapsed_s"] = 0.0
         self._counters: dict[str, int] = collections.Counter()
@@ -337,6 +343,8 @@ class RxNode:
         try:
             self._dev = device if device is not None else self._open_device(app)
             self.name = str(name) if name else self._dev.name
+            # warnings a passed-in device raised before this node existed are not reported
+            self._dev_warn_seen = len(getattr(self._dev, "warnings", None) or [])
             if not self.name:
                 raise ConfigError("RX düğümü adı boş olamaz")
             self._rx_cfg = dataclasses.replace(app.rx)
@@ -431,7 +439,9 @@ class RxNode:
         if via not in PPM_VIA:
             self._warn(f"{self.name}: PPM düzeltme yolu tanınmadı ({via!r}); 'none' raporlanıyor")
         if cal.ppm is None and app.cal.ppm_mode != "off":
-            self._warn(f"{self.name}: PPM kalibrasyonu yok — frekans ekseni düzeltilmiyor (eds cal ppm)")
+            # apply_ppm_to_device has logged the same fact; here it only goes to rx.status
+            self._warn(f"{self.name}: PPM kalibrasyonu yok — frekans ekseni düzeltilmiyor (eds cal ppm)",
+                       log_it=False)
         t = check_temperature(cal, dev, app.cal.temp_warn_delta_c)
         if t:
             self._warn(t, log_it=False)
@@ -530,6 +540,9 @@ class RxNode:
             self._started = True
         try:
             with self._cmd_lock:
+                if self._reconfigure_pending:              # a sweep could not restore the RX settings
+                    self._restore_after_sweep()
+                    self._reconfigure_pending = False
                 self._start_streamer(first=True)
             self._spawn("proc", self._proc_loop)
             self._spawn("status", self._status_loop)
@@ -657,16 +670,19 @@ class RxNode:
                     self._acc_stats["elapsed_s"] += float(st.elapsed_s)
 
     def _pause_pipeline(self, new_state: str) -> bool:
-        """Stop the running streamer (if any) and enter ``new_state``. Returns whether a
-        pipeline was running (and must be restarted afterwards)."""
+        """Stop the running streamer (if any) and enter ``new_state``. Returns whether the
+        pipeline must be (re)started afterwards: the node is started and not stopping —
+        whether or not a streamer was running. A node in ``state = "error"`` (stream failed,
+        restart pending) has no streamer but must still resume streaming after the pause."""
         with self._lock:
             streamer, self._streamer = self._streamer, None
-            was = streamer is not None and self._started
+            resume = self._started and not self._stop_evt.is_set()
+            fold = streamer is not None and self._started
             self._state = new_state
             self._gen += 1
         if streamer is not None:
-            self._retire_streamer(streamer, fold=was)
-        return was
+            self._retire_streamer(streamer, fold=fold)
+        return resume
 
     def _on_block(self, blk: IQBlock) -> None:
         """Reader-thread hook: software AGC (``soft_agc``)."""
@@ -805,6 +821,9 @@ class RxNode:
                 if self._state != "error" or self._stop_evt.is_set():
                     return
             try:
+                if self._reconfigure_pending:          # RX settings not restored after a sweep
+                    self._restore_after_sweep()
+                    self._reconfigure_pending = False
                 self._start_streamer()
             except EDSError as e:
                 log.error("%s: akış yeniden başlatılamadı: %s", self.name, e)
@@ -845,6 +864,11 @@ class RxNode:
                       "clip_fraction": float(min(max(lv.clip_fraction, 0.0), 1.0))}
         if state != "sweeping":
             self._last_sensors = self._read_sensors()
+        self._import_device_warnings()
+        stream = self.stream_counters()
+        ovf_src = self.overflow_source
+        if ovf_src is not None:
+            stream["overflow_source"] = ovf_src
         ppm = self._cal.ppm
         value = float(ppm.ppm) if (ppm is not None and self._ppm_via != "none") else None
         age = max((now_ns() - ppm.t_ns) / 1e9, 0.0) if (ppm is not None and ppm.t_ns > 0) else None
@@ -855,9 +879,31 @@ class RxNode:
             "state": state, "fc_hz": max(float(dev.fc), 0.0), "fs_hz": max(float(dev.fs), 0.0),
             "bw_hz": max(float(dev.bw), 0.0), "gain_db": gains, "gain_mode": self._gain_mode,
             "ppm": {"value": value, "via": self._ppm_via, "age_s": age},
-            "stream": self.stream_counters(), "levels": levels, "sensors": dict(self._last_sensors),
+            "stream": stream, "levels": levels, "sensors": dict(self._last_sensors),
             "warnings": self.warnings,
         }
+
+    @property
+    def overflow_source(self) -> str | None:
+        """How the device detects sample loss (``RxDevice.overflow_source``: ``"driver"``,
+        ``"dma_status"`` or ``"none"`` = NOT detected, the overflow counter stays 0 whatever
+        happens); ``None`` when the backend does not say (simulator: exact)."""
+        v = getattr(self._dev, "overflow_source", None)
+        return v if isinstance(v, str) and v else None
+
+    def _import_device_warnings(self) -> None:
+        """Report warnings the device raised after ``configure`` (e.g. at stream start: overflow
+        detection unavailable) in ``rx.status`` too."""
+        dev_warns = getattr(self._dev, "warnings", None)
+        if not isinstance(dev_warns, list):
+            return
+        with self._lock:
+            if len(dev_warns) < self._dev_warn_seen:   # the device reset its list
+                self._dev_warn_seen = 0
+            new = list(dev_warns[self._dev_warn_seen:])
+            self._dev_warn_seen += len(new)
+            for w in new:
+                self._warn(str(w), log_it=False)        # the device logged it already
 
     def publish_status(self) -> dict[str, Any] | None:
         """Build and publish one ``rx.status``; returns the envelope (``None`` if not sent)."""
@@ -1078,7 +1124,12 @@ class RxNode:
         base = dataclasses.asdict(self.app.sweep)
         if overrides:
             base.update(dict(overrides))
-        return config_from_dict({"sweep": base}, source="ctl.rx sweep").sweep
+        cfg = config_from_dict({"sweep": base}, source="ctl.rx sweep").sweep
+        # checked BEFORE the sweep runs: an invalid value would otherwise fail only when the
+        # finished sweep is packed into rx.sweep, losing the result
+        if cfg.publish_max_points < 1:
+            raise ConfigError(f"sweep.publish_max_points pozitif tamsayı olmalı, {cfg.publish_max_points!r} geldi")
+        return cfg
 
     def calibrate_spectrum(self, spec: Spectrum) -> Spectrum:
         """Calibration closure for the sweeper (ppm residual w.r.t. the hardware correction
@@ -1094,7 +1145,7 @@ class RxNode:
                               agc=self.app.agc, timeout_s=float(self.app.rx.read_timeout_s))
             if self._gain_mode in ("manual", "soft_agc") and dev.gains:
                 self._rx_cfg.gain_db = float(dev.gains[0])
-            restart = self._pause_pipeline("sweeping")
+            resume = self._pause_pipeline("sweeping")
             self._sweeper = sweeper
         log.info("%s: tarama başladı %s – %s (%d adım)", self.name, fmt_hz(cfg.start_hz), fmt_hz(cfg.stop_hz),
                  len(sweeper.plan()))
@@ -1104,18 +1155,30 @@ class RxNode:
         finally:
             with self._cmd_lock:
                 self._sweeper = None
+                restore_err: Exception | None = None
                 try:
                     self._restore_after_sweep()
-                finally:
-                    if restart and not self._stop_evt.is_set():
+                except Exception as e:  # never leave the node 'sweeping'
+                    # e.g. USB still down: never stream with the sweep's last settings — the
+                    # retry loop (or start()) re-applies the RX settings before streaming
+                    restore_err = e
+                    self._reconfigure_pending = True
+                # Resume whenever the node runs — also when it was in 'error' before the sweep
+                # (no streamer): a failed (re)start enters 'error' and keeps retrying.
+                if resume and not self._stop_evt.is_set():
+                    if restore_err is not None:
+                        self._stream_restart_failed(restore_err)
+                    else:
                         try:
                             self._start_streamer()
                         except EDSError as e:
                             self._stream_restart_failed(e)
-                    else:
-                        with self._lock:
-                            if self._state == "sweeping":
-                                self._state = "idle"
+                else:
+                    with self._lock:
+                        if self._state == "sweeping":
+                            self._state = "idle"
+                    if restore_err is not None:
+                        self._warn(f"{self.name}: tarama sonrası RX ayarları geri yüklenemedi: {restore_err}")
         self._count("sweeps")
         payload = result.to_bus_payload(self.name, int(cfg.publish_max_points))
         self._publish(RX_SWEEP, payload)

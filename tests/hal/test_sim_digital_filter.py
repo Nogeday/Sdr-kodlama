@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 from eds.core.config import load_config
+from eds.core.errors import ConfigError
 from eds.core.units import KT_DBM_HZ
 from eds.hal import open_device
 from eds.hal.sim import Emitter, SimWorld
@@ -35,8 +36,10 @@ def _scene_emitters() -> list[Emitter]:
 
 
 def _analytic_db(f: float, fs: float, bw: float, digital: bool = True) -> float:
-    """Independent re-statement of the documented model (not the device code path)."""
-    a = -10.0 * math.log10(1.0 + (abs(f) / (bw / 2.0)) ** 6)
+    """Independent re-statement of the documented model (not the device code path): AD936x
+    BB Butterworth at 1.4 x bw/2, TIA pole at 2.5 x bw/2, digital decimation chain."""
+    a = (-10.0 * math.log10(1.0 + (abs(f) / (1.4 * bw / 2.0)) ** 6)
+         - 10.0 * math.log10(1.0 + (abs(f) / (2.5 * bw / 2.0)) ** 2))
     if not digital:
         return a
     x = min(max((abs(f) / fs - 0.40) / 0.20, 0.0), 1.0)
@@ -51,11 +54,16 @@ def test_response_db_matches_documented_model():
     assert isinstance(d.response_db(1e6), float)
     arr = d.response_db(np.array([0.0, 8e6, 10e6, 12e6]))
     assert isinstance(arr, np.ndarray) and arr.shape == (4,)
-    # flat to 0.4 fs (analog only), -40 dB digital at fs/2, -80 dB digital from 0.6 fs on
+    # flat to 0.4 fs (analog only), -40 dB digital at fs/2, -80 dB digital from 0.6 fs on;
+    # analog: Butterworth corner 1.4 x 10 MHz, TIA pole 2.5 x 10 MHz (RF-04)
+    def analog(f_mhz: float) -> float:
+        return -10 * math.log10(1 + (f_mhz / 14.0) ** 6) - 10 * math.log10(1 + (f_mhz / 25.0) ** 2)
+
     assert arr[0] == 0.0
-    assert arr[1] == pytest.approx(-10 * math.log10(1 + 0.8 ** 6), abs=1e-12)
-    assert arr[2] == pytest.approx(-10 * math.log10(2.0) - 40.0, abs=1e-12)
-    assert arr[3] == pytest.approx(-10 * math.log10(1 + 1.2 ** 6) - 80.0, abs=1e-12)
+    assert arr[1] == pytest.approx(analog(8.0), abs=1e-12)
+    assert arr[2] == pytest.approx(analog(10.0) - 40.0, abs=1e-12)
+    assert arr[3] == pytest.approx(analog(12.0) - 80.0, abs=1e-12)
+    assert analog(10.0) == pytest.approx(-1.19, abs=0.01)             # band edge: -1.2 dB, not -3 dB
     # response follows the commanded state (fs, bw)
     d.set_sample_rate(4e6)
     d.set_bandwidth(2e6)
@@ -79,8 +87,15 @@ def test_digital_filter_kernel_shape_and_parameters():
     # custom per-device parameters reach the response
     d = make_device(make_world(), fs=10e6, bw=10e6, ppm=0.0, dig_pass_frac=0.3, dig_stop_frac=0.45,
                     dig_stop_db=-60.0)
-    a = -10 * math.log10(1 + (4e6 / 5e6) ** 6)
+    a = _analytic_db(4e6, 10e6, 10e6, digital=False)
     assert d.response_db(4e6) == pytest.approx(a - 60.0 * 0.5 * (1 - math.cos(math.pi * (0.4 - 0.3) / 0.15)))
+    # analog corner / TIA pole factors are per-device parameters too
+    d2 = make_device(make_world(), fs=10e6, bw=10e6, ppm=0.0, digital_filter=False, analog_corner_factor=1.0,
+                     tia_pole_factor=0.0)
+    assert d2.response_db(5e6) == pytest.approx(-10 * math.log10(2.0), abs=1e-12)
+    for bad in ({"analog_corner_factor": 0.0}, {"tia_pole_factor": -1.0}):
+        with pytest.raises(ConfigError):
+            make_device(make_world(), **bad)
 
 
 # =========================================================================== tones
@@ -95,8 +110,8 @@ def test_tone_levels_follow_response_db_including_aliased_ones():
         expected = d.level_dbfs(-50.0) + d.response_db(f)
         meas = tone_power_db(x, fs, alias, nfft=65536)
         assert meas == pytest.approx(expected, abs=0.3), f"{f / 1e3:.0f} kHz"
-    assert d.response_db(offsets[2]) < -60.0                        # alias image: > 60 dB down
-    assert d.response_db(offsets[0]) > -0.25                         # usable band: flat
+    assert d.response_db(offsets[2]) < -55.0                        # alias image: > 55 dB down
+    assert d.response_db(offsets[0]) > -0.35                         # usable band: TIA droop only
 
 
 def _difference(dev_scene, dev_empty, n: int) -> np.ndarray:

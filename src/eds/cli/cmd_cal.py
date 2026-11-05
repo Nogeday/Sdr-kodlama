@@ -4,9 +4,11 @@ calibration store ``[cal] dir`` and, on request, to the bus as ``cal.result``)."
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import math
 import sys
+from collections.abc import Iterator
 from typing import Any
 
 from ..bus.topics import CAL_RESULT
@@ -141,6 +143,33 @@ def cmd_cal_power(args: argparse.Namespace) -> int:
 
 
 # =============================================================================== coherence
+@contextlib.contextmanager
+def _cabled_setup(app: AppConfig) -> Iterator[None]:
+    """The coherence check needs ONE common signal on every input (splitter + equal cables,
+    antennas disconnected): an over-the-air emitter adds its geometric phase difference and
+    lowers the coherence. Simulator: the scene's non-``cabled`` emitters are switched off for
+    the check and restored afterwards. Hardware: the operator is reminded of the setup."""
+    from ..hal.factory import get_sim_world
+
+    if not all(d.backend == "sim" for d in app.devices):
+        print("Kurulum: ortak kalibrasyon sinyalini güç bölücü ve eş boylu kablolarla TÜM RX girişlerine verin "
+              "(antenler sökülü); havadan gelen sinyaller koherens ölçümünü bozar.", file=sys.stderr)
+        yield
+        return
+    world = get_sim_world(app)
+    ota = [e.name for e in world.emitters if e.enabled and not e.cabled]
+    if not ota:
+        yield
+        return
+    print(f"Simülatör: kablolu kalibrasyon kurulumu — havadan gelen {len(ota)} emitter ({', '.join(ota)}) kontrol "
+          "süresince kapatıldı", file=sys.stderr)
+    world.set_enabled_many(ota, False)
+    try:
+        yield
+    finally:
+        world.set_enabled_many(ota, True)
+
+
 def cmd_cal_coherence(args: argparse.Namespace) -> int:
     from ..df.coherence import check_coherence
     from ..hal.factory import open_group
@@ -149,7 +178,8 @@ def cmd_cal_coherence(args: argparse.Namespace) -> int:
     grp = open_group(app)
     try:
         grp.configure(app.rx)
-        rep = check_coherence(grp, n=int(args.n), blocks=int(args.blocks))
+        with _cabled_setup(app):
+            rep = check_coherence(grp, n=int(args.n), blocks=int(args.blocks))
         name, serial = grp.name, str(grp.info.serial or "")
         print(f"Koherens ({name}, {grp.num_channels} kanal): {'KOHERENT' if rep.coherent else 'KOHERENT DEĞİL'}")
         print(f"  gecikme {rep.delay_samples:+.3f} örnek, faz {rep.phase_deg:+.2f}° (σ {rep.phase_std_deg:.2f}°), "

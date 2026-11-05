@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import builtins
+import dataclasses
+import math
 import struct
 import sys
 from pathlib import Path
@@ -219,3 +221,144 @@ def test_missing_matplotlib_raises_backend_unavailable(tmp_path, monkeypatch):
     from eds.measure import plots
 
     assert plots.available() is False
+
+
+# ----------------------------------------------------------------------------- spectrum instrument scales
+from eds.measure import plots  # noqa: E402
+from eds.measure.plots import ROLE_COLORS, SA_DB_PER_DIV, sa_scale, series_role  # noqa: E402
+
+
+@pytest.mark.parametrize(("hint", "top", "unit", "expected"), [
+    ((-120.0, 10.0), -3.0, "dBFS", (0.0, 20.0, 8)),         # SFDR: never above full scale, 160 dB deep
+    ((-100.0, -0.0), -11.6, "dBFS@50dB", (0.0, 10.0, 10)),   # sweep: no "-0"
+    ((-190.0, -90.0), -101.3, "dBm", (-90.0, 10.0, 10)),     # absolute units are not capped
+    ((-50.0, 10.0), -14.8, "dBFS", (0.0, 10.0, 8)),          # 60 dB zoom → 8 × 10 dB
+    ((-40.0, 0.0), -3.0, "dBFS", (0.0, 5.0, 8)),
+    (None, -23.4, "dBFS", (-10.0, 10.0, 10)),                # no hint: Ref 5..15 dB above the peak
+    (None, 2.5, "dBFS", (10.0, 10.0, 10)),                   # trace above 0 dBFS stays on screen
+    ((-12.5, 0.0), -0.4, "dB", (0.0, 2.0, 8)),
+])
+def test_sa_scale_uses_instrument_values(hint, top, unit, expected):
+    ref, div, n = sa_scale(hint, top, unit)
+    assert (ref, div, n) == expected
+    assert div in SA_DB_PER_DIV and n in (8, 10)
+    assert math.copysign(1.0, ref) > 0 or ref < 0               # never -0.0
+    assert ref >= top and (ref - div * n) <= (hint[0] if hint else ref - 100.0)
+
+
+def test_spectrum_tick_labels_and_x_range():
+    assert plots._fmt_tick(-0.0) == "0" and plots._fmt_tick(-160.0) == "-160" and plots._fmt_tick(0.25) == "0.25"
+    fig = spectrum_fig(info={"Center": "915 MHz", "Span": "4 MHz"})
+    fx = np.array([913.0, 916.998047])                           # fftshift grid: +fs/2 excluded
+    assert plots._sa_x_range(fig, fx, 1e6) == (913.0, 917.0)     # Start/Stop = Center ∓ Span/2
+    fig = spectrum_fig(info={"Center": "915 MHz", "Span": "40 MHz"})
+    assert plots._sa_x_range(fig, fx, 1e6) == (913.0, 916.998047)  # Span not matching the data: data extent
+    assert plots._parse_hz("1.00049927 GHz") == pytest.approx(1.00049927e9) and plots._parse_hz("auto") is None
+
+
+def _sfdr_fig(markers: list[tuple[float, float, str]]) -> FigureSpec:
+    rng = np.random.default_rng(1)
+    f = 935.0 + (np.arange(4096) - 2048) * 4.0 / 4096
+    p = -104.0 + 2.0 * rng.standard_normal(f.size)
+    p[2525], p[1440] = -3.0, -58.1
+    return FigureSpec(name="sfdr", title="SFDR", kind="spectrum", series=[Series(x=f.tolist(), y=p.tolist(), label="dBFS")],
+                      xlabel="Frekans [MHz]", ylabel="Seviye [dBFS]", markers=markers,
+                      info={"Center": "935 MHz", "Span": "4 MHz", "RBW": "1 kHz", "Ref": "10 dBFS"}, ylim=(-120.0, 10.0))
+
+
+def test_marker_readout_never_hides_a_marker(tmp_path):
+    """JURY-05: the carrier marker near the top right stays visible (readout is a table strip)."""
+    from matplotlib.image import imread
+
+    f = 935.0 + (np.arange(4096) - 2048) * 4.0 / 4096
+    one = imread(render(_sfdr_fig([(f[1440], -58.1, "imaj")]), tmp_path / "a.png"))[..., :3]
+    two = imread(render(_sfdr_fig([(f[2525], -3.0, "taşıyıcı"), (f[1440], -58.1, "imaj")]), tmp_path / "b.png"))[..., :3]
+    white = [int(np.all(img > 0.995, axis=-1).sum()) for img in (one, two)]   # diamond fills are pure white
+    assert white[0] > 50 and white[1] >= 1.8 * white[0]
+
+
+# ----------------------------------------------------------------------------- semantic colours
+@pytest.mark.parametrize(("label", "role", "shown"), [
+    ("GEÇTİ", "pass", "GEÇTİ"), ("GEÇTİ (DSP hattından çıkarım) — yalnız taşıma", "pass", None),
+    ("KALDI — yalnız taşıma", "fail", None), ("kaldı", "fail", None), ("Kırpma", "warn", None),
+    ("≥ 1 dB sıkışma", "warn", None), ("kayıp örnek — yalnız taşıma", "", None), ("Pd", "", None),
+    ("ölçülen {fail}", "fail", "ölçülen"), ("{ref} ideal", "ref", "ideal"),
+])
+def test_series_role_from_label(label, role, shown):
+    assert series_role(Series(x=[], y=[], label=label)) == (role, label if shown is None else shown)
+
+
+def test_series_role_attribute_wins():
+    s = Series(x=[], y=[], label="GEÇTİ")
+    s.role = "warn"                     # forward compatible with an optional Series.role field
+    assert series_role(s)[0] == "warn"
+
+
+def test_pass_fail_colours_do_not_depend_on_series_order():
+    """JURY-06: with transport-only trials KALDI is series 2 — it must still be red, not green."""
+    series = [Series(x=[1], y=[1], label="gerekli veri hızı"), Series(x=[1], y=[1], label="GEÇTİ — yalnız taşıma"),
+              Series(x=[1], y=[1], label="KALDI — yalnız taşıma", style="marker"), Series(x=[1], y=[1], label="Kırpma")]
+    styles = plots._series_styles(series)
+    assert [s.color for s in styles[1:]] == [ROLE_COLORS["pass"], ROLE_COLORS["fail"], ROLE_COLORS["warn"]]
+    assert styles[0].color not in ROLE_COLORS.values() and styles[0].color not in ("#1baf7a", "#008300", "#e34948")
+    plain = plots._series_styles([Series(x=[1], y=[1], label="a"), Series(x=[1], y=[1], label="b")])
+    assert [s.color for s in plain] == [plots.PALETTE[0], plots.PALETTE[1]]     # no roles: unchanged
+
+
+def test_role_colours_rendered(tmp_path):
+    from matplotlib.image import imread
+
+    fig = FigureSpec(name="thr", title="t", kind="xy", series=[
+        Series(x=[1, 2, 3], y=[1, 2, 3], label="gerekli", style="line"),
+        Series(x=[1, 2], y=[1, 2], label="GEÇTİ", style="marker"),
+        Series(x=[3], y=[3], label="KALDI", style="marker")])
+    img = (imread(render(fig, tmp_path / "t.png"))[..., :3] * 255).round().astype(int)
+
+    def count(hex_color: str) -> int:
+        rgb = np.array([int(hex_color[i:i + 2], 16) for i in (1, 3, 5)])
+        return int(np.all(np.abs(img - rgb) <= 3, axis=-1).sum())
+
+    assert count(ROLE_COLORS["pass"]) > 50 and count(ROLE_COLORS["fail"]) > 30
+    assert count("#1baf7a") == 0                                 # the categorical green is not used
+
+
+# ----------------------------------------------------------------------------- layout / footer flags
+def test_flags_footer_and_png_description(tmp_path):
+    from matplotlib.image import imread
+
+    flags = "SİMÜLASYON · HIZLI MOD - KTR'de kullanılmaz"
+    for make in (xy_fig, spectrum_fig):
+        fig = make()
+        fig.info["flags"] = flags
+        out = render(fig, tmp_path / f"{fig.name}.png")
+        assert png_text_chunks(out)["Description"] == flags
+        img = imread(out)[..., :3]
+        corner = img[-25:, :300]
+        red = (corner[..., 0] > 0.75) & (corner[..., 1] < 0.5) & (corner[..., 2] < 0.5)
+        assert red.sum() > 100                                   # bold red tag, bottom left
+    assert "Description" not in png_text_chunks(render(xy_fig(), tmp_path / "plain.png"))
+
+
+@pytest.mark.parametrize("kind", ["xy", "spectrum"])
+def test_long_title_fits_the_canvas(tmp_path, kind):
+    """JURY-07: a ~95-character title is wrapped by rendered width instead of being cut."""
+    from matplotlib.image import imread
+
+    title = "Birleştirilmiş tarama spektrumu (max-hold) — 64 adım × 7.988 MHz, 0.95 s, 0.529 GHz/s, 3 tespit"
+    fig = spectrum_fig(title=title) if kind == "spectrum" else dataclasses.replace(xy_fig(), title=title)
+    img = imread(render(fig, tmp_path / "t.png"))[..., :3]
+    edge = img[:100, -10:]
+    text_px = (edge > 0.6).any(axis=-1) if kind == "spectrum" else (edge < 0.5).any(axis=-1)
+    assert text_px.sum() == 0
+
+
+def test_axis_label_not_pushed_off_canvas(tmp_path):
+    """JURY-07: tick labels like −0.006 must not push the y label past the left edge."""
+    from matplotlib.image import imread
+
+    ang = np.arange(-60.0, 61.0, 10.0)
+    fig = FigureSpec(name="dferr", title="DF hata", kind="xy",
+                     series=[Series(x=ang.tolist(), y=(0.006 * np.sin(ang / 20.0)).tolist(), style="marker")],
+                     xlabel="Gerçek açı [°]", ylabel="Hata θ̂ − θ [°]")
+    img = imread(render(fig, tmp_path / "e.png"))[..., :3]
+    assert not (img[:, :4] < 0.6).any()

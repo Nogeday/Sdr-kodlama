@@ -9,7 +9,14 @@ import pytest
 from eds.measure.base import run_measurement
 from eds.measure.specs.inst_bw import bracket, crossings
 
-from .spec_fixtures import check_contract, sim_app, sim_context, source_enabled
+from .spec_fixtures import (
+    DelayedSimSource,
+    check_contract,
+    replace_source,
+    sim_app,
+    sim_context,
+    source_enabled,
+)
 
 FC = 915e6
 
@@ -96,3 +103,22 @@ def test_inst_bw_skips_configuration_outside_profile(tmp_path):
     assert [(c["fs_hz"], c["bw_hz"]) for c in res.extra["configs"]] == [(10e6, 10e6)]
     assert "atlandı" in res.summary and "profil ihlali" in res.summary
     assert res.value * 1e6 == pytest.approx(w3, rel=0.01)
+
+
+def test_inst_bw_with_a_slow_switching_source_measures_the_new_tone_only(tmp_path):
+    """MM-01: a source whose on/off reaches the RF 80 ms after the call (Pluto TX libiio queue at
+    20 MS/s RX: far longer than the RX stale-buffer window). Every point waits the source's
+    settle time, so the response still matches the analytic truth."""
+    cfg = [[10e6, 10e6]]
+    params = {"inst_bw": {"configs": cfg, "quick_configs": cfg, "quick_points": 11, "quick_refine_steps": 1}}
+    app = sim_app(tmp_path, fc=FC, params=params)
+    with sim_context(app, quick=True) as ctx:
+        replace_source(ctx, lambda w: DelayedSimSource(w, delay_s=0.08, settle_s=0.1, freq_hz=FC))
+        res = run_measurement("inst_bw", ctx)
+        w3 = truth_width(ctx.dut, 10e6, 10e6, -3.0)
+        settle = res.conditions.get("source_settle_s")
+    assert res.status == "ok", res.error
+    c = res.extra["configs"][0]
+    assert c["bw_3db_hz"] == pytest.approx(w3, rel=0.02)
+    assert c["flatness_db"] < 3.0
+    assert settle == pytest.approx(0.1)

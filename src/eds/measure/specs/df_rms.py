@@ -34,7 +34,20 @@ Steps
    the operator rotates the array on the turntable). ``repeats`` captures of ``n`` samples →
    :meth:`Interferometer2.bearing` with an FFT band mask around the tone (its baseband
    frequency is located in each capture, so a TCXO offset never pushes it out of the mask).
-4. :func:`eds.df.metrics.summarize` → value = RMS; bias, std, max |error| as extras.
+4. :func:`eds.df.metrics.summarize` → value = RMS; bias, std, max |error| as extras. The
+   uncertainty of the RMS treats the M angles as the independent units (the K repeats at one
+   angle share that angle's bias): ``u = std_m(mean_k err²) / (2·RMS·√M)``.
+
+SNR. Every SNR is reported in a STATED bandwidth ``snr_bw_hz`` (default 25 kHz, a narrow-band
+channel) besides the per-capture FFT-bin value. On the simulator the over-the-air tone is set
+to ``sim_snr_db`` in that bandwidth (default 10 dB → about −9 dB per sample at 2 MS/s; the
+level is found from a reference capture), the cabled calibration signal stays strong
+(``sim_cal_power_dbm``) as on a real bench, and — outside ``--quick`` — the angle scan is
+repeated for every ``snr_sweep_db`` value (RMS–SNR curve). The simulator models ONLY thermal
+noise: no multipath, no antenna mutual coupling / element patterns, no antenna/cable phase
+mismatch after calibration and no LO phase drift. Its RMS is therefore a lower bound of a
+real array's error; the result says so and carries a blocker (no target verdict). Channels
+that are not coherent also block the verdict.
 """
 
 from __future__ import annotations
@@ -60,10 +73,15 @@ from ...dsp.psd import welch
 from ...dsp.windows import get_window, window_info
 from ..base import FigureSpec, Measurement, MeasurementResult, Series, register
 from ..common import base_conditions, spectrum_screenshot
+from ..targets import REASON_NO_COHERENCE
 
 log = logging.getLogger(__name__)
 
 NO_COHERENCE_FLAG = "KOHERENS YOK - ortak 40 MHz referans gerekli"
+SIM_FLAG = ("SİMÜLASYON: yalnız termal gürültü modellendi — çok yollu yayılım, anten karşılıklı kuplajı/eleman "
+            "örüntüleri, anten/kablo faz uyumsuzluğu ve LO faz kayması yok; değer gerçek bir dizinin hatasının alt "
+            "sınırıdır")
+BLOCKER_SIM = "simülasyon: yalnız termal gürültü (çok yollu yayılım, kuplaj, kablo/LO faz kayması modellenmedi)"
 #: The tone search half-width never exceeds this fraction of fs (pilot, target, DC and
 #: images stay separated for offsets that differ by ≥ 0.1·fs).
 MAX_SEARCH_FRACTION = 0.05
@@ -150,6 +168,10 @@ class Bench(ABC):
     @abstractmethod
     def ota_off(self) -> None: ...
 
+    def set_ota_power(self, dbm: float) -> None:
+        """Level of the over-the-air tone (simulator only)."""
+        raise MeasurementError(f"{self.kind}: havadan ton seviyesi bu tezgahta ayarlanamaz")
+
     @abstractmethod
     def close(self) -> None:
         """Switch everything off / restore the scene."""
@@ -164,7 +186,7 @@ class SimBench(Bench):
 
     kind = "sim"
 
-    def __init__(self, world: Any, power_dbm: float):
+    def __init__(self, world: Any, power_dbm: float, ota_power_dbm: float | None = None):
         from ...hal.sim.world import Emitter
 
         self._world = world
@@ -172,12 +194,18 @@ class SimBench(Bench):
         tag = uuid.uuid4().hex[:8]
         self.pilot = f"df_rms_pilot_{tag}"
         self.ota = f"df_rms_ota_{tag}"
+        self.ota_power_dbm = float(power_dbm if ota_power_dbm is None else ota_power_dbm)
         if self._saved:
             world.set_enabled_many(list(self._saved), False)
         world.replace_emitters(add=[
             Emitter(name=self.pilot, freq_hz=1e9, power_dbm=power_dbm, kind="cw", cabled=True, enabled=False),
-            Emitter(name=self.ota, freq_hz=1e9, power_dbm=power_dbm, kind="cw", cabled=False, enabled=False),
+            Emitter(name=self.ota, freq_hz=1e9, power_dbm=self.ota_power_dbm, kind="cw", cabled=False,
+                    enabled=False),
         ])
+
+    def set_ota_power(self, dbm: float) -> None:
+        self.ota_power_dbm = float(dbm)
+        self._world.update(self.ota, power_dbm=self.ota_power_dbm)
 
     def cabled_on(self, f_hz: float) -> None:
         self._world.update(self.pilot, freq_hz=float(f_hz), enabled=True)
@@ -338,7 +366,12 @@ class DfRmsMeasurement(Measurement):
         "pilot_offset_frac": 0.1,      # coherence pilot at fc + 0.1·fs
         "target_offset_frac": 0.2,     # calibration + over-the-air tone at fc + 0.2·fs
         "coherence_blocks": 8,
-        "sim_power_dbm": -60.0,        # simulator: pilot / target power at the RX inputs
+        "snr_bw_hz": 25e3,             # bandwidth every reported SNR refers to (narrow-band channel)
+        "sim_snr_db": 10.0,            # simulator: over-the-air tone SNR in snr_bw_hz (headline)
+        "snr_sweep_db": [-10.0, 0.0, 10.0, 20.0, 30.0],   # simulator: RMS–SNR curve (in snr_bw_hz)
+        "quick_snr_sweep_db": [],
+        "sim_power_dbm": None,         # simulator: fixed over-the-air tone power (overrides sim_snr_db)
+        "sim_cal_power_dbm": -60.0,    # simulator: cabled pilot / calibration power (strong, as on a bench)
         "source_power_dbm": -40.0,     # hardware: ctx.source level setting
         "max_recalibrations": 3,       # per angle, after alignment losses (overflow)
     }
@@ -375,11 +408,21 @@ class DfRmsMeasurement(Measurement):
             "fc": fc, "fs": fs, "f_pilot": fc + pilot_frac * fs, "f_target": f_target, "baseline_m": baseline,
             "angles": angles, "repeats": repeats, "n": n, "gain_db": gain,
             "coherence_blocks": _int(p["coherence_blocks"], "coherence_blocks", 3),
-            "sim_power_dbm": _num(p["sim_power_dbm"], "sim_power_dbm"),
+            "snr_bw_hz": _num(p["snr_bw_hz"], "snr_bw_hz", 1.0),
+            "sim_snr_db": _num(p["sim_snr_db"], "sim_snr_db", -40.0, 80.0),
+            "snr_sweep_db": self._sweep(p["quick_snr_sweep_db"] if quick else p["snr_sweep_db"]),
+            "sim_power_dbm": None if p["sim_power_dbm"] is None else _num(p["sim_power_dbm"], "sim_power_dbm"),
+            "sim_cal_power_dbm": _num(p["sim_cal_power_dbm"], "sim_cal_power_dbm"),
             "source_power_dbm": _num(p["source_power_dbm"], "source_power_dbm"),
             "max_recal": _int(p["max_recalibrations"], "max_recalibrations", 0),
             "timeout_s": max(float(app.rx.read_timeout_s), 4.0 * n / fs),
         }
+
+    @staticmethod
+    def _sweep(raw: Any) -> list[float]:
+        if not isinstance(raw, (list, tuple)):
+            raise ConfigError(f"df_rms.snr_sweep_db bir liste olmalı, {raw!r} geldi")
+        return sorted({_num(v, "snr_sweep_db[]", -40.0, 80.0) for v in raw})
 
     # ------------------------------------------------------------------ array
     def _array(self) -> tuple[Any, bool, int]:
@@ -491,11 +534,15 @@ class DfRmsMeasurement(Measurement):
         cal_log: list[dict[str, Any]] = []
         angles: list[AngleResult] = []
         shot: tuple[float, np.ndarray, float] | None = None
+        level: dict[str, Any] = {}
+        sweep: list[dict[str, Any]] = []
         try:
             self._setup(dev, prm)
             search = self._search_hz(dev, prm)
-            bench: Bench = (SimBench(ctx.world, prm["sim_power_dbm"]) if ctx.is_sim else
-                            HardwareBench(ctx, dev, prm["source_power_dbm"], prm["baseline_m"], prm["timeout_s"]))
+            cap = float(dev.profile.rx_max_input_dbm)
+            bench: Bench = (SimBench(ctx.world, min(prm["sim_cal_power_dbm"], cap)) if ctx.is_sim else
+                            HardwareBench(ctx, dev, min(prm["source_power_dbm"], cap), prm["baseline_m"],
+                                          prm["timeout_s"]))
             try:
                 dev.start_stream()
                 bench.cabled_on(prm["f_pilot"])
@@ -507,6 +554,8 @@ class DfRmsMeasurement(Measurement):
                     bench.cabled_off()
                 cal = self._calibrate(dev, bench, interf, prm, chans, search)
                 first_cal = dict(cal)
+                if ctx.is_sim:
+                    level = self._sim_level(dev, bench, prm, chans, search, prm["sim_snr_db"], cap)
                 for ang in prm["angles"]:
                     r, x, f_bb, cal = self._measure_angle(dev, bench, interf, prm, chans, search, ang, cal, cal_log)
                     angles.append(r)
@@ -514,14 +563,73 @@ class DfRmsMeasurement(Measurement):
                         shot = (float(ang), x, f_bb)
                     log.info("df_rms %+6.1f°: kestirim %+.2f° ± %.2f°", ang, float(np.mean(r.est_deg)),
                              float(np.std(r.est_deg)))
+                if ctx.is_sim and prm["sim_power_dbm"] is None:
+                    for snr in prm["snr_sweep_db"]:
+                        lv = self._sim_level(dev, bench, prm, chans, search, snr, cap, ref=level)
+                        rs = []
+                        for ang in prm["angles"]:
+                            r, _x, _f, cal = self._measure_angle(dev, bench, interf, prm, chans, search, ang, cal,
+                                                                 cal_log)
+                            rs.append(r)
+                        sweep.append({"snr_target_db": snr, **self._stats(rs, prm), "ota_power_dbm": lv["power_dbm"]})
+                        log.info("df_rms SNR %+.0f dB / %s: RMS %.3f°", snr, fmt_hz(prm["snr_bw_hz"]), sweep[-1]["rms_deg"])
             finally:
                 bench.close()
         finally:
             release_errors = self._release(dev, owned)
-        res = self._result(dev, prm, coh, first_cal, cal_log, angles, shot, geo_warn, bench.describe(), chans)
+        res = self._result(dev, prm, coh, first_cal, cal_log, angles, shot, geo_warn, bench.describe(), chans,
+                           level, sweep)
         if release_errors:
             res.extra["release_errors"] = release_errors
         return res
+
+    def _rbw(self, prm: dict[str, Any]) -> float:
+        return window_info("blackmanharris", prm["n"]).enbw_bins * prm["fs"] / prm["n"]
+
+    def _to_bw(self, snr_rbw_db: float, prm: dict[str, Any]) -> float:
+        """SNR measured in the FFT RBW → SNR in the stated bandwidth ``snr_bw_hz``."""
+        return snr_rbw_db + 10.0 * math.log10(self._rbw(prm) / prm["snr_bw_hz"])
+
+    def _sim_level(self, dev: Any, bench: Bench, prm: dict[str, Any], chans: tuple[int, int], search: float,
+                   snr_db: float, cap_dbm: float, ref: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Simulator: over-the-air tone level for ``snr_db`` in ``snr_bw_hz`` (fixed
+        ``sim_power_dbm`` when given). One reference capture at broadside measures the SNR
+        of the reference level; the receiver is linear far below compression, so the level
+        follows by difference. ``ref`` reuses an earlier reference capture."""
+        if prm["sim_power_dbm"] is not None:
+            p = min(prm["sim_power_dbm"], cap_dbm)
+            bench.set_ota_power(p)
+            return {"power_dbm": p, "snr_target_db": None}
+        if ref is None or "ref_power_dbm" not in ref:
+            p_ref = min(prm["sim_cal_power_dbm"], cap_dbm)
+            bench.set_ota_power(p_ref)
+            bench.ota_on(prm["f_target"], 0.0)
+            try:
+                dev.mark_settling()
+                blk = dev.capture(prm["n"], prm["timeout_s"])
+                _f, snr_ref = locate_tone(blk.samples[chans[0]], prm["fs"], prm["f_target"] - prm["fc"], search)
+            finally:
+                bench.ota_off()
+            ref = {"ref_power_dbm": p_ref, "ref_snr_bw_db": self._to_bw(snr_ref, prm)}
+        p = min(ref["ref_power_dbm"] + snr_db - ref["ref_snr_bw_db"], cap_dbm)
+        bench.set_ota_power(p)
+        return {"power_dbm": p, "snr_target_db": snr_db, "ref_power_dbm": ref["ref_power_dbm"],
+                "ref_snr_bw_db": ref["ref_snr_bw_db"]}
+
+    def _stats(self, angles: list[AngleResult], prm: dict[str, Any]) -> dict[str, Any]:
+        """RMS / bias / max of a scan; the uncertainty of the RMS from the M per-angle mean
+        squared errors (the K repeats at one angle are not independent of each other)."""
+        est = np.concatenate([r.est_deg for r in angles])
+        truth = np.concatenate([np.full(len(r.bearings), r.true_deg) for r in angles])
+        s = summarize(est, truth)
+        rms = s["rms"]
+        e2 = np.array([float(np.mean(angle_errors(r.est_deg, r.true_deg) ** 2)) for r in angles])
+        unc = (float(np.std(e2, ddof=1)) / (2.0 * rms * math.sqrt(e2.size)) if e2.size >= 2 and rms > 0 else None)
+        snr = [v for r in angles for v in r.snr_db]
+        snr_rbw = float(np.mean(snr)) if snr else math.nan
+        return {"rms_deg": rms, "bias_deg": s["mean"], "std_deg": s["std"], "max_abs_deg": s["max_abs"],
+                "n": s["n"], "rms_unc_deg": unc, "snr_rbw_db": snr_rbw,
+                "snr_bw_db": self._to_bw(snr_rbw, prm) if snr else math.nan}
 
     @staticmethod
     def _release(dev: Any, owned: bool) -> list[str]:
@@ -541,25 +649,23 @@ class DfRmsMeasurement(Measurement):
     # ------------------------------------------------------------------ result
     def _result(self, dev: Any, prm: dict[str, Any], coh: CoherenceReport, cal: dict[str, Any],
                 cal_log: list[dict[str, Any]], angles: list[AngleResult], shot: tuple[float, np.ndarray, float] | None,
-                geo_warn: list[str], bench: str, chans: tuple[int, int]) -> MeasurementResult:
-        est = np.concatenate([r.est_deg for r in angles])
-        truth = np.concatenate([np.full(len(r.bearings), r.true_deg) for r in angles])
-        s = summarize(est, truth)
-        err = angle_errors(est, truth)
-        rms = s["rms"]
-        unc = (float(np.std(err * err, ddof=1)) / (2.0 * rms * math.sqrt(err.size))
-               if err.size >= 2 and rms > 0 else None)
+                geo_warn: list[str], bench: str, chans: tuple[int, int], level: dict[str, Any],
+                sweep: list[dict[str, Any]]) -> MeasurementResult:
+        st = self._stats(angles, prm)
+        rms, unc = st["rms_deg"], st["rms_unc_deg"]
         lam = wavelength(prm["f_target"])
         d = prm["baseline_m"]
-        snr_all = [v for r in angles for v in r.snr_db]
-        snr_mean = float(np.mean(snr_all)) if snr_all else math.nan
+        rbw = self._rbw(prm)
+        bw_txt = fmt_hz(prm["snr_bw_hz"], 4)
+        is_sim = bool(self.ctx.is_sim)
         a_min, a_max = min(prm["angles"]), max(prm["angles"])
         # grating lobes (d > λ/2) appear for |sin θ| >= λ/d − 1
         unamb = 90.0 if d / lam <= 0.5 else math.degrees(math.asin(min(1.0, lam / d - 1.0)))
         steps = np.diff(sorted(prm["angles"]))
         step_txt = f" {float(steps[0]):g}° adımla" if steps.size and np.allclose(steps, steps[0]) else ""
         extra: dict[str, Any] = {
-            "rms_deg": rms, "bias_deg": s["mean"], "std_deg": s["std"], "max_abs_deg": s["max_abs"], "n": s["n"],
+            "rms_deg": rms, "bias_deg": st["bias_deg"], "std_deg": st["std_deg"], "max_abs_deg": st["max_abs_deg"],
+            "n": st["n"], "n_angles": len(angles),
             "coherent": bool(coh.coherent), "coherence": coh.coherence,
             "phase_drift_deg_per_s": coh.phase_drift_deg_per_s, "phase_std_deg": coh.phase_std_deg,
             "delay_samples": coh.delay_samples, "delay_resolvable": coh.delay_resolvable,
@@ -568,50 +674,93 @@ class DfRmsMeasurement(Measurement):
             "pilot_phase_deg": coh.phase_deg,
             "pilot_to_target_phase_deg": float(wrap_deg(cal["phase_cal_deg"] - coh.phase_deg)),
             "recalibrations": len(cal_log), "baseline_m": d, "wavelength_m": lam, "d_over_lambda": d / lam,
-            "unambiguous_max_deg": unamb, "ambiguous": max(abs(a_min), abs(a_max)) >= unamb, "snr_db_mean": snr_mean, "f_target_hz": prm["f_target"],
-            "f_pilot_hz": prm["f_pilot"], "angle_range_deg": [a_min, a_max],
-            "mask_bw_hz": DEFAULT_MASK_BINS * prm["fs"] / prm["n"],
+            "unambiguous_max_deg": unamb, "ambiguous": max(abs(a_min), abs(a_max)) >= unamb,
+            "snr_db_mean": st["snr_rbw_db"], "snr_rbw_hz": rbw, "snr_bw_db": st["snr_bw_db"],
+            "snr_bw_hz": prm["snr_bw_hz"], "snr_per_sample_db": st["snr_bw_db"] + 10.0 * math.log10(
+                prm["snr_bw_hz"] / prm["fs"]) if math.isfinite(st["snr_bw_db"]) else math.nan,
+            "f_target_hz": prm["f_target"], "f_pilot_hz": prm["f_pilot"], "angle_range_deg": [a_min, a_max],
+            "mask_bw_hz": DEFAULT_MASK_BINS * prm["fs"] / prm["n"], "simulated": is_sim,
         }
+        if level:
+            extra["sim_level"] = level
+        if sweep:
+            extra["snr_sweep"] = sweep
         if cal_log:
             extra["recalibration_log"] = cal_log
         if geo_warn:
             extra["geometry_warnings"] = geo_warn
+        if is_sim:
+            extra["model_limitations"] = SIM_FLAG
 
         conditions = base_conditions(dev)
         conditions.update({
             "fc_hz": prm["fc"], "fs_hz": prm["fs"], "f_target_hz": prm["f_target"], "f_pilot_hz": prm["f_pilot"],
             "baseline_m": d, "wavelength_m": lam, "d_over_lambda": d / lam, "angles_deg": prm["angles"],
-            "repeats": prm["repeats"], "n": prm["n"], "mask_bw_hz": extra["mask_bw_hz"],
-            "rbw_hz": window_info("blackmanharris", prm["n"]).enbw_bins * prm["fs"] / prm["n"],
+            "repeats": prm["repeats"], "n": prm["n"], "mask_bw_hz": extra["mask_bw_hz"], "rbw_hz": rbw,
             "window": "blackmanharris", "channels": [dev.name, chans[0], chans[1]], "source": bench,
             "coherent": bool(coh.coherent), "calibration": "kablolu referans, hedef frekansında (φ_cal, gerçek açı 0°)",
+            "snr_db": st["snr_bw_db"], "snr_bw_hz": prm["snr_bw_hz"],
         })
+        if is_sim and level.get("snr_target_db") is not None:
+            conditions["sim_snr_target_db"] = level["snr_target_db"]
+        snr_txt = (f"SNR {st['snr_bw_db']:.1f} dB / {bw_txt} (FFT bininde {st['snr_rbw_db']:.1f} dB / "
+                   f"{fmt_hz(rbw, 3)}, örnek başına {extra['snr_per_sample_db']:.1f} dB / {fmt_hz(prm['fs'], 3)})")
         summary = (
             f"{prm['f_target'] / 1e9:.4f} GHz'te d = {d:.3f} m ({d / lam:.2f} λ) iki elemanlı interferometre ile "
-            f"{a_min:+.0f}°…{a_max:+.0f}° aralığında{step_txt} (açı başına {prm['repeats']} ölçüm, SNR "
-            f"{snr_mean:.0f} dB) ölçülen yön bulma RMS hatası {fmt_deg(rms)}°, sapma "
-            f"{'+' if s['mean'] >= 0 else '−'}{fmt_deg(abs(s['mean']))}°, en büyük |hata| {fmt_deg(s['max_abs'])}° "
-            f"(faz kalibrasyonu kablolu referansla; koherens {coh.coherence:.3f}, faz kayması "
-            f"{coh.phase_drift_deg_per_s:+.3g} °/s)."
+            f"{a_min:+.0f}°…{a_max:+.0f}° aralığında{step_txt} (açı başına {prm['repeats']} ölçüm, {snr_txt}) "
+            f"ölçülen yön bulma RMS hatası {fmt_deg(rms)}°"
+            + (f" ± {fmt_deg(unc)}°" if unc is not None else "")
+            + f", sapma {'+' if st['bias_deg'] >= 0 else '−'}{fmt_deg(abs(st['bias_deg']))}°, en büyük |hata| "
+            f"{fmt_deg(st['max_abs_deg'])}° (faz kalibrasyonu kablolu referansla; koherens {coh.coherence:.3f}, "
+            f"faz kayması {coh.phase_drift_deg_per_s:+.3g} °/s)."
         )
+        if sweep:
+            summary += (f" RMS–SNR ({bw_txt}): " + ", ".join(f"{w['snr_target_db']:+.0f} dB → {fmt_deg(w['rms_deg'])}°"
+                                                             for w in sweep) + ".")
         if not coh.coherent:
             summary = f"{NO_COHERENCE_FLAG}: sonuç koşulsuz kullanılamaz — {summary}"
+        if is_sim:
+            summary = f"{SIM_FLAG}. {summary}"
         if geo_warn:
             summary += " UYARI: " + "; ".join(geo_warn) + "."
         method = (
-            "İki kanal aynı fc/fs/manuel kazançla çalıştırılır ve akış ölçüm boyunca kesintisiz tutulur; bölücüden "
+            ("SİMÜLASYON (yalnız termal gürültü; çok yollu yayılım, anten kuplajı, anten/kablo faz uyumsuzluğu, LO "
+             f"faz kayması modellenmedi): havadan ton {bw_txt} bantta {prm['sim_snr_db']:g} dB SNR'a ayarlanır "
+             "(broadside referans yakalamasından), kablolu kalibrasyon sinyali güçlü tutulur. " if is_sim and
+             prm["sim_power_dbm"] is None else ("SİMÜLASYON (yalnız termal gürültü). " if is_sim else ""))
+            + "İki kanal aynı fc/fs/manuel kazançla çalıştırılır ve akış ölçüm boyunca kesintisiz tutulur; bölücüden "
             "beslenen ortak kablolu sinyalle koherens (faz kayması, koherens, faz kararlılığı) ölçülür. Faz "
             "kalibrasyonu (φ_cal, gerçek açı 0°) kablolu sinyal hedefle aynı frekansta verilerek yapılır — CW pilotla "
             "örnek gecikmesi çözülemediğinden başka frekansta kalibrasyon 2π·Δf·gecikme/fs faz hatası bırakırdı. Her "
             f"gerçek açıda havadan gelen ton için {prm['repeats']} yakalamada Interferometer2 kerterizi FFT bant "
             f"maskesiyle (±{DEFAULT_MASK_BINS // 2} bin) hesaplanır; hata wrap(θ̂ − θ), RMS = √(ortalama hata²). "
+            f"SNR {bw_txt} bantta verilir (FFT bininde ölçülen SNR + 10·log10(RBW/{bw_txt})). Belirsizlik açı başına "
+            "ortalama kare hatalardan (M açı bağımsız birim; aynı açıdaki tekrarlar aynı sapmayı paylaşır). "
             "Overflow (hizalama kaybı) görülürse faz kalibrasyonu yinelenir."
         )
         res = self.new_result(rms, summary=summary, method=method, conditions=conditions, extra=extra, uncertainty=unc)
         res.device = dev.describe()                  # the array (group: both members), not only devices[0]
+        if not coh.coherent:
+            res.blockers.append(REASON_NO_COHERENCE)
+        if is_sim:
+            res.blockers.append(BLOCKER_SIM)
         res.table = [r.row() for r in angles]
         res.figures = self._figures(prm, angles, rms, shot, d / lam)
+        if sweep:
+            res.figures.append(self._sweep_figure(sweep, prm, level))
         return res
+
+    def _sweep_figure(self, sweep: list[dict[str, Any]], prm: dict[str, Any], level: dict[str, Any]) -> FigureSpec:
+        bw = fmt_hz(prm["snr_bw_hz"], 4)
+        x = [w["snr_bw_db"] for w in sweep]
+        return FigureSpec(
+            name="df_rms_vs_snr", title=f"Yön bulma RMS hatası – SNR ({bw} bantta; simülasyon, yalnız termal gürültü)",
+            kind="xy", series=[Series(x=x, y=[w["rms_deg"] for w in sweep],
+                                      yerr=[w["rms_unc_deg"] or 0.0 for w in sweep], label="RMS hata", style="marker")],
+            xlabel=f"SNR [dB] ({bw} bantta, ölçülen)", ylabel="RMS hata [°]", logy=True,
+            vlines=[(prm["sim_snr_db"], f"başlık SNR {prm['sim_snr_db']:g} dB")] if level.get("snr_target_db")
+            is not None else [],
+            info={"f": fmt_hz(prm["f_target"], 7), "K": str(prm["repeats"]), "M": str(len(prm["angles"]))})
 
     def _figures(self, prm: dict[str, Any], angles: list[AngleResult], rms: float,
                  shot: tuple[float, np.ndarray, float] | None, d_lam: float) -> list[FigureSpec]:

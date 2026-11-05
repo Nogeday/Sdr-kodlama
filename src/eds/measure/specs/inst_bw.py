@@ -12,7 +12,9 @@ With a stimulus source (tone stepping)
     from the centre on each side, linearly interpolated in dB; each crossing bracket is then
     bisected ``refine_steps`` times with extra tone points (the response falls steeply at the
     band edge — the doc's "kenarlarda sıklaştırılmış" sampling). Flatness = peak-to-peak of
-    ``H`` within ``±flat_frac·fs``.
+    ``H`` within ``±flat_frac·fs``. Every tone point waits the source's settle time
+    (:func:`eds.measure.common.stimulus_changed`): at 20 MS/s the RX stale-buffer window is
+    far shorter than a Pluto TX's queue latency.
 
 Without a source (noise shape — approximate)
     Terminated input at the band's maximum gain, long-average spectrum, linear moving average
@@ -37,7 +39,7 @@ from ...core.errors import ConfigError, MeasurementError, ProfileViolation
 from ...core.units import db10, fmt_hz
 from ...dsp.psd import Spectrum, spectrum_from_block
 from ..base import FigureSpec, Measurement, MeasurementResult, Series, register
-from ..common import base_conditions, setup_rx, spectrum_screenshot, tone, welch_len
+from ..common import base_conditions, setup_rx, source_conditions, spectrum_screenshot, tone, welch_len
 from ..stimulus import (
     TONE_HALFWIDTH_BINS,
     adjust_tone,
@@ -359,15 +361,14 @@ class InstBwMeasurement(Measurement):
             "best_config": {"fs_hz": best.fs, "bw_hz": best.bw}, "configs": per_cfg,
             "method": "gürültü şekli (yaklaşık)" if noise_method else "ton adımlama",
             "capped_at_profile": w3 > bw_max, "profile_bw_max_hz": bw_max, "lower_bound": lower,
+            "value_bound": "lower" if lower else "",
         }
-        src = ctx.source
         conditions = base_conditions(
             dev, None, nfft=prm["nfft"], averages=prm["averages"] if not noise_method else prm["noise_averages"],
             window=prm["window"], rbw_hz=best.rbw_hz, configs=[[c.fs, c.bw] for c in results],
             points=prm["points"], refine_steps=prm["refine_steps"], span_frac=prm["span_frac"],
-            ref_frac=prm["ref_frac"], flat_frac=prm["flat_frac"],
-            source=getattr(src, "name", "yok") if src is not None else "yok",
-            gain_used_db=float(dev.gains[0]),
+            ref_frac=prm["ref_frac"], flat_frac=prm["flat_frac"], gain_used_db=float(dev.gains[0]),
+            **source_conditions(ctx),
         )
         conditions.update({"fs_hz": best.fs, "bw_hz": best.bw})
         cfg_txt = ", ".join(f"fs {c.fs / 1e6:g} MS/s/BW {c.bw / 1e6:g} MHz: {c.edges[-3.0].width_hz / 1e6:.2f} MHz"

@@ -36,6 +36,13 @@ from tests.hal.sim_fixtures import (
 F0 = 1e9
 
 
+def _analog_db(f: float, bw: float) -> float:
+    """Documented AD936x analog chain (independent of the device code): 3rd-order Butterworth
+    with corner 1.4 x bw/2 times the TIA pole at 2.5 x bw/2."""
+    return (-10 * math.log10(1 + (abs(f) / (0.7 * bw)) ** 6)
+            - 10 * math.log10(1 + (abs(f) / (1.25 * bw)) ** 2))
+
+
 # =========================================================================== levels
 @pytest.mark.parametrize("p_dbm,gain", [(-40.0, 10.0), (-70.0, 40.0), (-100.0, 70.0), (-80.0, 60.0), (-60.0, 20.0)])
 def test_tone_level_follows_level_equation(p_dbm, gain):
@@ -61,21 +68,85 @@ def test_tone_at_bin_centre_reads_power_in_single_bin():
 
 
 def test_analog_lpf_attenuation_and_aliasing():
-    """Analog Butterworth alone (digital decimation chain off; the combined response is
-    covered by tests/hal/test_sim_digital_filter.py)."""
+    """Analog chain alone (digital decimation chain off; the combined response is covered by
+    tests/hal/test_sim_digital_filter.py): Butterworth at 1.4 x bw/2 x TIA pole at 2.5 x bw/2
+    (RF-04: the AD936x BB LPF is calibrated to 1.4 x BBBW, so bw/2 itself is only ~-1.2 dB)."""
     fs = 2e6
-    corner = fs / 2.0                                    # bw = fs -> corner bw/2 = 1 MHz
-    w = make_world(Emitter("edge", F0 + corner, -60.0), Emitter("alias", F0 + 1.6e6, -60.0))
+    half = fs / 2.0                                      # bw = fs -> BBBW = 1 MHz
+    w = make_world(Emitter("edge", F0 + half, -60.0), Emitter("alias", F0 + 1.6e6, -60.0))
     d = make_device(w, fs=fs, gain=40, ppm=0.0, digital_filter=False)
+    for f in (half, 1.6e6, 1.4 * half, 3e6):
+        assert d.response_db(f) == pytest.approx(_analog_db(f, fs), abs=1e-9)
+    assert d.response_db(half) == pytest.approx(-1.19, abs=0.01)
     x = d.capture(65536).samples[0]
-    # exactly at the corner the 3rd-order Butterworth is -3.01 dB; at fs/2 the tone sits on
-    # the Nyquist edge (+-fs/2 alias), so measure on both edges together
-    edge = 10 * np.log10(10 ** (tone_power_db(x, fs, corner - 1e3 * 0, half_bw=3e3) / 10)
-                         + 10 ** (tone_power_db(x, fs, -corner, half_bw=3e3) / 10))
-    assert edge == pytest.approx(-25.0 - 10 * math.log10(2.0), abs=0.25)
+    # at fs/2 the tone sits on the Nyquist edge (+-fs/2 alias): measure both edges together
+    edge = 10 * np.log10(10 ** (tone_power_db(x, fs, half, half_bw=3e3) / 10)
+                         + 10 ** (tone_power_db(x, fs, -half, half_bw=3e3) / 10))
+    assert edge == pytest.approx(-25.0 + _analog_db(half, fs), abs=0.25)
     # +1.6 MHz is outside +-fs/2: attenuated by |H(1.6 MHz)| then aliased to -0.4 MHz
-    h_db = -10 * math.log10(1 + (1.6e6 / corner) ** 6)
-    assert tone_power_db(x, fs, 1.6e6 - fs) == pytest.approx(-25.0 + h_db, abs=0.2)
+    assert tone_power_db(x, fs, 1.6e6 - fs) == pytest.approx(-25.0 + _analog_db(1.6e6, fs), abs=0.2)
+    # the corner and the TIA pole are per-device parameters
+    old = make_device(make_world(), fs=fs, ppm=0.0, digital_filter=False, analog_corner_factor=1.0,
+                      tia_pole_factor=0.0)
+    assert old.response_db(half) == pytest.approx(-10 * math.log10(2.0), abs=1e-9)
+
+
+# =========================================================================== RF compression (RF-01)
+def test_input_p1db_depends_on_gain_and_band():
+    d = make_device(make_world(), gain=40.0)                    # 1 GHz: full gain table -1..73 dB
+    assert d.input_p1db_dbm(-1.0) == pytest.approx(0.0)
+    assert d.input_p1db_dbm(73.0) == pytest.approx(-20.0)
+    assert d.input_p1db_dbm(36.0) == pytest.approx(-10.0)
+    assert d.input_p1db_dbm() == pytest.approx(-20.0 * 41.0 / 74.0)  # current gain
+    assert d.input_p1db_dbm(-30.0) == pytest.approx(0.0)              # clamped outside the table
+    p1 = d.input_p1db_dbm(0.0)
+    assert d.compression_db(p1, 0.0) == pytest.approx(1.0, abs=1e-12)  # definition of P1dB
+    assert d.compression_db(p1 - 10.0, 0.0) == pytest.approx(0.0127, abs=5e-4)   # Rapp p = 2
+    assert d.compression_db(p1 + 10.0, 0.0) > 8.5                     # saturating
+    d.set_center_freq(2.4e9)                                     # 1.3-4 GHz band: -3..71 dB
+    assert d.input_p1db_dbm(-3.0) == pytest.approx(0.0) and d.input_p1db_dbm(71.0) == pytest.approx(-20.0)
+    off = make_device(make_world(), rf_compression=False)
+    assert off.input_p1db_dbm(0.0) == math.inf and off.compression_db(10.0, 0.0) == 0.0
+    custom = make_device(make_world(), p1db_min_gain_dbm=3.0, p1db_max_gain_dbm=-25.0)
+    assert custom.input_p1db_dbm(-1.0) == pytest.approx(3.0) and custom.input_p1db_dbm(73.0) == pytest.approx(-25.0)
+
+
+@pytest.mark.parametrize("p_dbm", [-20.0, -6.0, 0.0, 5.0])
+def test_cw_gain_compression_at_low_gain(p_dbm):
+    """At low gain the front end compresses before the ADC clips (real AD936x): the tone reads
+    level_dbfs - compression_db and never reaches full scale."""
+    w = make_world(Emitter("t", F0 + 100e3, p_dbm))
+    d = make_device(w, gain=0.0)
+    x = d.capture(65536).samples[0]
+    lvl = tone_power_db(x, d.fs, apparent_bb(d, F0 + 100e3))
+    assert lvl == pytest.approx(d.level_dbfs(p_dbm) - d.compression_db(p_dbm), abs=0.1)
+    assert np.max(np.abs(x.view(np.float32))) < 2047 / 2048          # compression, not the ADC
+    if p_dbm >= 0.0:
+        assert d.compression_db(p_dbm) > 1.0
+    # without the compression model the same input is linear (5 dBm: 0 dBFS, on the clip edge)
+    if p_dbm < 5.0:
+        lin = make_device(make_world(Emitter("t", F0 + 100e3, p_dbm)), gain=0.0, rf_compression=False)
+        y = lin.capture(65536).samples[0]
+        assert tone_power_db(y, d.fs, apparent_bb(lin, F0 + 100e3)) == pytest.approx(lin.level_dbfs(p_dbm), abs=0.1)
+
+
+def test_two_tones_near_p1db_produce_intermodulation():
+    tones = (Emitter("a", F0 + 100e3, -6.0), Emitter("b", F0 + 150e3, -6.0))
+    im3 = {}
+    for comp in (True, False):
+        d = make_device(make_world(*tones), gain=0.0, ppm=0.0, rf_compression=comp)
+        x = d.capture(1 << 17).samples[0]
+        im3[comp] = tone_power_db(x, d.fs, 50e3) - tone_power_db(x, d.fs, 100e3)    # 2 f1 - f2
+    assert im3[True] > -50.0
+    assert im3[False] < -75.0                                        # only the noise floor
+
+
+def test_compression_leaves_small_signals_bit_identical():
+    def run(comp: bool) -> np.ndarray:
+        w = make_world(Emitter("t", F0 + 100e3, -60.0), Emitter("n", F0 - 300e3, -65.0, kind="noise", bw_hz=200e3))
+        return make_device(w, gain=40.0, rf_compression=comp).capture(65536).samples[0]
+
+    assert np.array_equal(run(True), run(False))
 
 
 # =========================================================================== noise
@@ -90,16 +161,18 @@ def test_thermal_noise_density_at_high_gain():
     assert d.noise_density_dbfs_hz() == pytest.approx(expected)
 
 
-def test_noise_is_shaped_by_butterworth():
+def test_noise_is_shaped_by_the_analog_chain():
     fs, bw = 4e6, 2e6
     d = make_device(make_world(seed=7), fs=fs, bw=bw, gain=70.0, digital_filter=False)
     x = d.capture(1 << 19).samples[0]
     s = psd(x, fs, 4096)
     centre = s.density_db(-200e3, 200e3)
-    at_corner = 10 * math.log10((10 ** (s.density_db(-1.05e6, -0.95e6) / 10) + 10 ** (s.density_db(0.95e6, 1.05e6) / 10)) / 2)
-    assert at_corner - centre == pytest.approx(-3.0, abs=0.5)
-    far = s.density_db(1.7e6, 1.9e6) - centre               # (1.8/1)^6 -> -15.3 dB
-    assert far == pytest.approx(-10 * math.log10(1 + 1.8 ** 6), abs=1.0)
+    at_bbbw = 10 * math.log10((10 ** (s.density_db(-1.05e6, -0.95e6) / 10) + 10 ** (s.density_db(0.95e6, 1.05e6) / 10)) / 2)
+    assert at_bbbw - centre == pytest.approx(_analog_db(1e6, bw), abs=0.4)       # -1.2 dB
+    at_corner = 10 * math.log10((10 ** (s.density_db(-1.45e6, -1.35e6) / 10) + 10 ** (s.density_db(1.35e6, 1.45e6) / 10)) / 2)
+    assert at_corner - centre == pytest.approx(_analog_db(1.4e6, bw), abs=0.5)   # -3 dB - 1.1 dB TIA
+    far = s.density_db(1.7e6, 1.9e6) - centre
+    assert far == pytest.approx(_analog_db(1.8e6, bw), abs=1.0)
 
 
 def test_noise_floor_at_minimum_gain_is_adc_limited():
@@ -203,8 +276,8 @@ def test_hardware_ppm_correction_removes_offset():
     w = make_world(Emitter("t", f_true, -60.0))
     d = make_device(w, fs=1e6, gain=40, ppm=-8.3)
     idx_before = d._index
-    assert d.set_ppm_correction(-8.3) == "hardware"
-    assert d.ppm_hw == -8.3 and d.ppm_hw_via == "hardware"
+    assert d.set_ppm_correction(-8.3) == "hardware"                # 40 MHz x -8.3 ppm = -332 Hz exactly
+    assert d.ppm_hw == pytest.approx(-8.3, abs=1e-9) and d.ppm_hw_via == "hardware"
     assert d._settle_until >= idx_before + d.settle_samples   # marked settling
     x = d.capture(1 << 18).samples[0]
     assert F0 + estimate_tone_freq(x, d.fs) == pytest.approx(f_true, abs=1.0)
@@ -222,11 +295,29 @@ def test_hardware_ppm_correction_removes_offset():
 
 
 def test_xo_correction_step_quantization():
-    """Pluto's xo_correction is integer Hz on 40 MHz: residual <= 0.0125 ppm."""
-    d = make_device(make_world(), fs=1e6, ppm=7.3456, xo_correction_step_hz=1.0)
+    """RF-02: Pluto's xo_correction is integer Hz on 40 MHz (the default): residual <= 0.0125
+    ppm, and ppm_hw reports the correction IN EFFECT (read-back), not the request, so
+    ppm_hw (+) residual composes back to the true TCXO error."""
+    f_true = F0 + 50e3
+    d = make_device(make_world(Emitter("t", f_true, -60.0)), fs=1e6, gain=40, ppm=7.3456)
+    assert d.sim_params["xo_correction_step_hz"] == 1.0
     d.set_ppm_correction(7.3456)
-    assert d.xo_correction_hz == round(40e6 * (1 + 7.3456e-6))
+    xo = round(40e6 * (1 + 7.3456e-6))
+    assert d.xo_correction_hz == xo
+    assert d.ppm_hw == pytest.approx((xo / 40e6 - 1) * 1e6, abs=1e-12)
+    assert d.ppm_hw != pytest.approx(7.3456, abs=1e-4)                  # quantised: 7.35 ppm, not 7.3456
     assert 0 < abs(d.residual_ppm) <= 0.0125 + 1e-9
+    total = ((1 + d.ppm_hw * 1e-6) * (1 + d.residual_ppm * 1e-6) - 1) * 1e6
+    assert total == pytest.approx(7.3456, abs=1e-9)
+    blk = d.capture(1 << 18)
+    assert blk.meta["ppm_hw"] == pytest.approx(d.ppm_hw, abs=1e-12)
+    e_res = d.residual_ppm * 1e-6                                       # what the spectrum still shows
+    assert F0 + estimate_tone_freq(blk.samples[0], d.fs) == pytest.approx(f_true / (1 + e_res), abs=1.0)
+    assert abs(f_true * e_res) > 3.0                                    # visible: 0.176 Hz of 40 MHz -> 4.4 Hz
+    # continuous correction (step 0) applies exactly what was asked
+    c = make_device(make_world(), fs=1e6, ppm=7.3456, xo_correction_step_hz=0.0)
+    c.set_ppm_correction(7.3456)
+    assert c.ppm_hw == 7.3456 and abs(c.residual_ppm) < 1e-9
 
 
 # =========================================================================== stale buffers
@@ -561,6 +652,39 @@ def test_noise_emitter_band_power_and_shape():
     assert s.density_db(-700e3, -300e3) < inband - 30.0
 
 
+def test_noise_emitter_has_no_frame_splice_skirts():
+    """RF-05: consecutive noise frames are crossfaded, so a 10 MHz LTE-like emitter leaves no
+    spectral skirt outside its band (independent frames spliced end to end gave skirts only
+    ~30 dB below the in-band density). Thermal noise cancels in the scene - empty difference."""
+    fs = 20e6
+    kw = dict(fc=1.8e9, fs=fs, bw=fs, gain=20.0, ppm=0.0, spurs=[])
+    scene = make_device(make_world(Emitter("lte", 1.8e9, -30.0, kind="noise", bw_hz=10e6)), **kw)
+    empty = make_device(make_world(), **kw)
+    n = 1 << 20
+    diff = scene.capture(n).samples[0].astype(np.complex128) - empty.capture(n).samples[0].astype(np.complex128)
+    s = psd(diff, fs, 2048)
+    inband = s.density_db(-4e6, 4e6)
+    assert inband == pytest.approx(-30.0 + 20.0 - 5.0 - 70.0, abs=0.3)          # -85 dBFS/Hz
+    for lo, hi in ((5.3e6, 6e6), (7e6, 8e6), (-8e6, -5.3e6)):
+        assert s.density_db(lo, hi) < inband - 55.0, (lo, hi)
+
+
+def test_noise_frame_crossfade_keeps_the_variance_stationary():
+    from eds.hal.sim.signals import FRAME_HOP, FRAME_XFADE
+
+    d = make_device(make_world(Emitter("n", F0, -40.0, kind="noise", bw_hz=1.6e6), seed=3), fs=2e6, gain=40.0,
+                    ppm=0.0, spurs=[])
+    x = d.capture(FRAME_HOP * 64).samples[0].astype(np.complex128)
+    pos = (d.abs_index - x.size + np.arange(x.size)) % FRAME_HOP               # world index = device index
+    p = np.abs(x) ** 2
+    fade = np.mean(p[pos < FRAME_XFADE])
+    mid = np.mean(p[(pos >= FRAME_XFADE // 4) & (pos < 3 * FRAME_XFADE // 4)])   # deepest part of the fade
+    rest = np.mean(p[pos >= FRAME_XFADE])
+    assert 10 * np.log10(fade / rest) == pytest.approx(0.0, abs=0.1)
+    assert 10 * np.log10(mid / rest) == pytest.approx(0.0, abs=0.15)
+    assert 10 * np.log10(rest) == pytest.approx(-5.0, abs=0.4)                # -40 dBm + 40 - 5 (band-edge droop)
+
+
 def test_gsm_fcch_bursts():
     f_rf = 935.2e6
     w = make_world(Emitter("bcch", f_rf, -50.0, kind="gsm_fcch"))
@@ -587,7 +711,8 @@ def test_gsm_fcch_bursts():
         assert 10 * np.log10(abs(c) ** 2) == pytest.approx(-15.0, abs=0.2)        # same power as the noise
         assert np.std(core) / abs(c) < 0.01                                        # pure tone at fc + 67.708 kHz
         inside = np.abs(z[b0 - 50:b1 + 50] - c) ** 2 < p_lin / 30
-        first = int(np.argmax(inside))                                             # burst start
+        # burst start = first run of 8 samples on the tone (a single noise sample may touch it)
+        first = int(np.argmax(np.convolve(inside, np.ones(8, dtype=int), "valid") == 8))
         length = int(np.argmin(inside[first:]))                                    # contiguous run
         assert first - 50 == pytest.approx(0, abs=1)
         assert length == pytest.approx(b1 - b0, abs=1)
@@ -656,6 +781,12 @@ def test_identity_sensors_and_tracking():
     {"dig_pass_frac": 0.55, "dig_stop_frac": 0.9},       # pass edge beyond Nyquist
     {"dig_stop_db": 10.0},
     {"dig_stop_frac": "0.6"},
+    {"analog_corner_factor": -1.4},
+    {"tia_pole_factor": -2.5},
+    {"rf_compression": 1},
+    {"rapp_smoothness": 0.0},
+    {"p1db_min_gain_dbm": "0"},
+    {"xo_correction_step_hz": -1.0},
 ])
 def test_sim_params_validated(sim):
     with pytest.raises(ConfigError):

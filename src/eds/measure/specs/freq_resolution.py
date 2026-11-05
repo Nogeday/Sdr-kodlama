@@ -17,11 +17,16 @@
 
 (c) Frequency accuracy: a CW tone at a known frequency (the source is the truth — on hardware
     it MUST be locked to a GPSDO/10 MHz reference) at ``fc + accuracy_frac[1]·fs``, measured
-    with :func:`eds.dsp.peaks.tone_frequency` on ``accuracy_n`` samples:
-    raw error, error after the stored calibration ppm (``ctx.cal.ppm``, if any) and after an
-    in-situ ppm estimate (:func:`eds.calib.ppm.estimate_ppm_from_samples`) made on an
-    INDEPENDENT capture of a tone at ``fc + accuracy_frac[0]·fs`` (so the correction is
-    validated, not fitted to the same record).
+    with :func:`eds.dsp.peaks.tone_frequency` on ``accuracy_n`` samples: the raw error and the
+    error after the stored calibration ppm (``ctx.cal.ppm``, if any — an independently
+    obtained correction, so this is the operational accuracy). The in-situ ppm estimate
+    (:func:`eds.calib.ppm.estimate_ppm_from_samples`, on a separate capture of a tone at
+    ``fc + accuracy_frac[0]·fs`` from the SAME source) shares the source/receiver reference
+    ratio with the validation tone, so the error after it is a *self-consistency* figure
+    (estimator noise only), reported as such and never as accuracy. ``reference_locked``
+    states whether the source is locked to a reference (auto: simulator yes, ``pluto_tx`` no —
+    its TCXO is ±25 ppm itself, so its "raw error" is only the TX-vs-RX reference difference;
+    other sources: unknown); without a locked source no absolute accuracy is claimed.
 """
 
 from __future__ import annotations
@@ -41,7 +46,15 @@ from ...dsp.peaks import interp_peak, tone_frequency
 from ...dsp.psd import Spectrum, spectrum_from_block
 from ...dsp.windows import canonical_window_name, get_window, window_info
 from ..base import FigureSpec, Measurement, MeasurementResult, Series, register
-from ..common import base_conditions, setup_rx, spectrum_screenshot, tone, welch_len
+from ..common import (
+    base_conditions,
+    setup_rx,
+    source_conditions,
+    spectrum_screenshot,
+    stimulus_changed,
+    tone,
+    welch_len,
+)
 from ..stimulus import (
     adjust_tone,
     as_float,
@@ -188,6 +201,7 @@ class FreqResolutionMeasurement(Measurement):
         "center_frac": 0.2,
         "accuracy_n": 2 ** 18,
         "accuracy_frac": [0.15, -0.1],  # [in-situ ppm estimate tone, validation tone] (× fs)
+        "reference_locked": None,       # source locked to a GPSDO/10 MHz reference? None → auto (see module doc)
     }
 
     # ------------------------------------------------------------------ parameters
@@ -220,6 +234,10 @@ class FreqResolutionMeasurement(Measurement):
             "accuracy_n": as_int(p["accuracy_n"], "freq_resolution.accuracy_n", 1024),
             "accuracy_frac": acc,
         }
+        locked = p["reference_locked"]
+        if locked is not None and not isinstance(locked, bool):
+            raise ConfigError(f"freq_resolution.reference_locked true/false olmalı, {locked!r} geldi")
+        prm["reference_locked"] = locked
         if prm["sep_max_rbw"] <= prm["sep_min_rbw"]:
             raise ConfigError("freq_resolution.sep_max_rbw, sep_min_rbw'den büyük olmalı")
         if prm["accuracy_n"] < prm["nfft"]:
@@ -256,6 +274,20 @@ class FreqResolutionMeasurement(Measurement):
         return self._result(dev, prm, out)
 
     # ------------------------------------------------------------------ (a) + (c)
+    def _reference_locked(self, prm: dict[str, Any]) -> bool | None:
+        """Is the source locked to a reference (its frequency = the truth)? Parameter first;
+        auto: simulator source yes, Pluto TX (own ±25 ppm TCXO) no, anything else unknown."""
+        if prm["reference_locked"] is not None:
+            return bool(prm["reference_locked"])
+        from ...hal.sim.source import SimSignalSource
+
+        src = self.ctx.source
+        if isinstance(src, SimSignalSource):
+            return True
+        if str(getattr(src, "name", "")) == "pluto_tx":
+            return False
+        return None
+
     def _record(self, dev: Any, prm: dict[str, Any], f_src: float, setting: float) -> np.ndarray:
         with tone(self.ctx, f_src, setting):
             blk = settled_capture(dev, prm["accuracy_n"])
@@ -288,10 +320,15 @@ class FreqResolutionMeasurement(Measurement):
         err_raw = f_meas - f2
         f_corr = float(correct_freq(f_meas, ppm_est))
         err_corr = f_corr - f2
+        locked = self._reference_locked(prm)
         acc: dict[str, Any] = {
             "f_ref_hz": f2, "f_measured_hz": f_meas, "freq_error_raw_hz": err_raw,
             "freq_error_raw_ppm": err_raw / f2 * 1e6, "ppm_estimate": ppm_est, "ppm_estimate_tone_hz": f1,
-            "freq_error_corrected_hz": err_corr, "residual_ppm": err_corr / f2 * 1e6, "ppm_hw": float(dev.ppm_hw),
+            # same source reference for the ppm tone and the validation tone: self-consistency, NOT accuracy
+            "freq_error_corrected_hz": err_corr, "freq_error_self_consistency_hz": err_corr,
+            "freq_error_corrected_is_self_consistency": True,
+            "residual_ppm": err_corr / f2 * 1e6, "ppm_hw": float(dev.ppm_hw),
+            "reference_locked": locked, "accuracy_verified": locked is True,
         }
         cal_ppm = getattr(getattr(ctx.cal, "ppm", None), "ppm", None) if ctx.cal is not None else None
         if cal_ppm is not None and math.isfinite(float(cal_ppm)):
@@ -311,7 +348,7 @@ class FreqResolutionMeasurement(Measurement):
         src.set_tones([fa * (1.0 + e), fb * (1.0 + e)], [setting, setting])
         src.set_enabled(True)
         try:
-            dev.mark_settling()
+            stimulus_changed(self.ctx)
             acc = None
             n_tot = 0
             for _ in range(prm["captures"]):
@@ -383,6 +420,7 @@ class FreqResolutionMeasurement(Measurement):
         extra: dict[str, Any] = {
             "rbw_hz": rbw, "enbw_bins": out["enbw_bins"], "bin_hz": float(dev.fs) / prm["nfft"],
             "value_source": value_source, "zero_pad": prm["zero_pad"],
+            "value_bound": "upper" if (hi is not None and lo is None) else "",
         }
         if "line_width_hz" in out:
             extra.update({"line_3db_hz": out["line_width_hz"], "line_3db_bins": out["line_width_hz"] * prm["nfft"] / float(dev.fs)})
@@ -396,10 +434,12 @@ class FreqResolutionMeasurement(Measurement):
         conditions = base_conditions(
             dev, None, nfft=prm["nfft"], rbw_hz=rbw, averages=prm["averages"], window=prm["window"],
             overlap=prm["overlap"], zero_pad=prm["zero_pad"], dip_db=prm["dip_db"], captures=prm["captures"],
-            tone_dbfs=prm["tone_dbfs"], source=getattr(src, "name", "yok") if src is not None else "yok",
-            source_max_tones=int(getattr(src, "max_tones", 0)) if src is not None else 0,
+            tone_dbfs=prm["tone_dbfs"], source_max_tones=int(getattr(src, "max_tones", 0)) if src is not None else 0,
             reference_note="donanımda kaynak GPSDO/10 MHz referansa kilitli olmalı (frekans doğruluğu için gerçek değer)",
+            **source_conditions(self.ctx),
         )
+        if acc is not None:
+            conditions["source_reference_locked"] = acc["reference_locked"]
         parts = [f"Frekans çözünürlüğü {value:.0f} Hz ({value_source}; RBW {rbw:.0f} Hz = {out['enbw_bins']:.3f} bin × "
                  f"{fmt_hz(float(dev.fs))}/{prm['nfft']}, {prm['window']}, {fmt_hz(prm['fc'])})"]
         if hi is not None:
@@ -407,11 +447,23 @@ class FreqResolutionMeasurement(Measurement):
         if "line_width_hz" in out:
             parts.append(f"tek ton −3 dB çizgi genişliği {out['line_width_hz']:.0f} Hz")
         if acc is not None:
-            s = (f"{fmt_hz(acc['f_ref_hz'], 10)} referansında frekans hatası ham {acc['freq_error_raw_hz']:+.1f} Hz "
-                 f"({acc['freq_error_raw_ppm']:+.3f} ppm), yerinde ppm ({acc['ppm_estimate']:+.4f}) sonrası "
-                 f"{acc['freq_error_corrected_hz']:+.3f} Hz")
-            if "freq_error_cal_hz" in acc:
-                s += f", kalibrasyon ppm'i ({acc['ppm_cal']:+.4f}) sonrası {acc['freq_error_cal_hz']:+.1f} Hz"
+            locked = acc["reference_locked"]
+            if locked is True:
+                s = (f"{fmt_hz(acc['f_ref_hz'], 10)} referansında frekans hatası ham {acc['freq_error_raw_hz']:+.1f} Hz "
+                     f"({acc['freq_error_raw_ppm']:+.3f} ppm)")
+                if "freq_error_cal_hz" in acc:
+                    s += (f", kalibrasyon ppm'i ({acc['ppm_cal']:+.4f}) sonrası {acc['freq_error_cal_hz']:+.1f} Hz "
+                          "(doğruluk)")
+                else:
+                    s += "; kayıtlı kalibrasyon ppm'i yok — düzeltme sonrası doğruluk ölçülmedi"
+            else:
+                why = ("kaynak referansa kilitli değil (örn. pluto_tx TCXO ±25 ppm)" if locked is False
+                       else "kaynağın referans kilidi bildirilmedi (freq_resolution.reference_locked)")
+                s = (f"{why}: {fmt_hz(acc['f_ref_hz'], 10)} tonunda ham fark {acc['freq_error_raw_hz']:+.1f} Hz "
+                     f"({acc['freq_error_raw_ppm']:+.3f} ppm) yalnızca kaynak–alıcı bağıl referans farkıdır, mutlak "
+                     "frekans doğruluğu iddia edilmez")
+            s += (f"; yerinde ppm ({acc['ppm_estimate']:+.4f}) ile öz-tutarlılık {acc['freq_error_corrected_hz']:+.3f} Hz "
+                  "(aynı kaynak referansı — doğruluk değildir)")
             parts.append(s)
         summary = "; ".join(parts + notes)
         method = (
@@ -422,8 +474,11 @@ class FreqResolutionMeasurement(Measurement):
             "ortalama spektrumunda her tonun ±RBW'si içinde iki tepe ve aralarında ≥ "
             f"{prm['dip_db']:g} dB çukur aranır, sınır {prm['bisect_steps']} geometrik ikiye bölmeyle daraltılır. "
             "Frekans doğruluğu: bilinen frekanstaki ton (kaynak = gerçek değer; donanımda GPSDO kilitli olmalı) "
-            "tone_frequency ile ölçülür; ham hata, kalibrasyon ppm'i ve bağımsız bir yakalamadan yerinde ppm "
-            "kestirimi (estimate_ppm_from_samples) sonrası hata raporlanır.")
+            "tone_frequency ile ölçülür; ham hata ve kayıtlı kalibrasyon ppm'i (bağımsız referans) sonrası hata "
+            "doğruluk olarak raporlanır. Aynı kaynağın başka bir tonundan yerinde ppm kestirimi (estimate_ppm_from_"
+            "samples) sonrası kalan hata, kaynak ile alıcının ortak referans oranını paylaştığından yalnızca "
+            "öz-tutarlılıktır (doğruluk değildir). Kaynak referansa kilitli değilse (pluto_tx) mutlak doğruluk iddia "
+            "edilmez; ham fark kaynak–alıcı bağıl hatasıdır.")
         if hi is None:
             method += " İki-ton ölçümü yapılamadı (çoklu ton kaynağı yok): değer hesaplanan RBW'dir."
         res = self.new_result(float(value), summary=summary, method=method, conditions=conditions, extra=extra,
@@ -483,9 +538,12 @@ class FreqResolutionMeasurement(Measurement):
         if seps:
             series.insert(0, Series(x=[q.sep_hz / rbw for q in seps], y=[q.dip_db for q in seps],
                                     label="Ölçülen çukur", style="marker"))
+        # y range from the data: every measured dip stays in view (the theory may leave the frame)
+        top = max([prm["dip_db"]] + [q.dip_db for q in seps if math.isfinite(q.dip_db)]) if seps else 40.0
+        y_hi = 10.0 * math.ceil((max(top, prm["dip_db"]) + 5.0) / 10.0)
         figs.append(FigureSpec(
             name="freq_resolution_dip_vs_separation", title="İki-ton çukur derinliği – ayrım", kind="xy", series=series,
-            xlabel="Ayrım Δf / RBW", ylabel="Çukur [dB]", ylim=(-2.0, 45.0),
+            xlabel="Ayrım Δf / RBW", ylabel="Çukur [dB]", ylim=(-2.0, y_hi),
             xlim=(0.0, prm["sep_max_rbw"] * 1.03),
             hlines=[(prm["dip_db"], f"{prm['dip_db']:g} dB ölçütü")],
             vlines=[(value / rbw, f"Δf_min = {value:.0f} Hz")],

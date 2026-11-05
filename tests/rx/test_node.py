@@ -461,3 +461,112 @@ def test_stream_failure_enters_error_state_and_recovers(bus, tmp_path, monkeypat
         assert s["stream_errors"] == 3 and s["stream_restarts"] == 3 and s["state"] == "streaming"
     finally:
         node.stop()
+
+
+def _flaky_reads(monkeypatch, dev):
+    """Make ``dev.read`` raise ``StreamError`` while ``fail['n'] > 0`` (one failure per call)."""
+    from eds.core.errors import StreamError
+
+    orig = dev.read
+    fail = {"n": 0}
+
+    def flaky(n=None, timeout_s=2.0):
+        if fail["n"] > 0:
+            fail["n"] -= 1
+            raise StreamError("USB bağlantısı koptu (test)")
+        return orig(n, timeout_s)
+
+    monkeypatch.setattr(dev, "read", flaky)
+    return fail
+
+
+def test_sweep_in_error_state_resumes_streaming(bus, tmp_path, monkeypatch):
+    """STR-04: a sweep received while the stream is in 'error' (restart pending) must not leave
+    the node silently 'idle': it resumes the pipeline afterwards."""
+    import eds.rx.node as node_mod
+
+    monkeypatch.setattr(node_mod, "RESTART_BACKOFF_S", 30.0)      # the retry loop must not do the work
+    node = RxNode(make_app(False, tmp_cal=str(tmp_path)), publisher=bus.pub)
+    fail = _flaky_reads(monkeypatch, node.device)
+    node.start()
+    try:
+        assert bus.wait(lambda m: m.topic == T.RX_DETECTIONS) is not None
+        fail["n"] = 1
+        assert bus.wait(lambda m: m.topic == T.RX_STATUS and m.data["state"] == "error") is not None
+        assert node.state == "error"
+        a = node.handle_command({"req_id": "s", "target": "*", "cmd": "sweep",
+                                 "args": {"start_hz": 905e6, "stop_hz": 925e6}})
+        assert a["ok"], a
+        assert node.state == "streaming"
+        t_after = time.time_ns()
+        assert bus.wait(lambda m: m.topic == T.RX_DETECTIONS and m.data["t_acq_ns"] > t_after) is not None
+        assert node.stats["stream_restarts"] == 0                  # resumed by the sweep, not the retry loop
+    finally:
+        node.stop()
+
+
+def test_sweep_restore_failure_enters_error_and_retry_reapplies_settings(bus, tmp_path, monkeypatch):
+    """A failed restore of the RX settings after a sweep → state 'error' (never streaming at the
+    sweep's last frequency); the retry loop re-applies the settings, then restarts the stream."""
+    import eds.rx.node as node_mod
+    from eds.core.errors import DeviceError
+
+    monkeypatch.setattr(node_mod, "RESTART_BACKOFF_S", 0.3)
+    node = RxNode(make_app(False, tmp_cal=str(tmp_path)), publisher=bus.pub)
+    dev = node.device
+    orig_configure = dev.configure
+    broken = {"n": 0}
+
+    def configure(rx):
+        if broken["n"] > 0:
+            broken["n"] -= 1
+            raise DeviceError("cihaz yanıt vermiyor (test)")
+        return orig_configure(rx)
+
+    monkeypatch.setattr(dev, "configure", configure)
+    node.start()
+    try:
+        assert bus.wait(lambda m: m.topic == T.RX_DETECTIONS) is not None
+        broken["n"] = 1
+        a = node.handle_command({"req_id": "s", "target": "*", "cmd": "sweep",
+                                 "args": {"start_hz": 905e6, "stop_hz": 925e6}})
+        assert a["ok"], a                                          # the sweep itself succeeded
+        assert node.state == "error" and dev.fc != FC              # not streaming at the sweep's frequency
+        assert any("yeniden başlatılamadı" in w for w in node.warnings)
+        ok = bus.wait(lambda m: m.topic == T.RX_STATUS and m.data["state"] == "streaming", timeout_s=10.0)
+        assert ok is not None and ok.data["fc_hz"] == FC
+        assert dev.fc == FC and node.stats["stream_restarts"] == 1
+    finally:
+        node.stop()
+
+
+def test_status_reports_overflow_source_and_late_device_warnings(bus, tmp_path):
+    """A device that cannot detect sample loss (SoapyPlutoSDR without the thin layer:
+    ``overflow_source = "none"``) is reported in rx.status, together with the warning the
+    device raised at stream start (after configure)."""
+    node = RxNode(make_app(False, tmp_cal=str(tmp_path)), publisher=bus.pub)
+    try:
+        s = node.status_payload()
+        assert "overflow_source" not in s["stream"] and node.overflow_source is None   # sim: exact, not stated
+        dev = node.device
+        dev.overflow_source = "none"
+        late = "overflow sayısı BİLİNMİYOR (test)"
+        dev.warnings.append(late)
+        s = node.status_payload()
+        validate_message(T.RX_STATUS, {"topic": T.RX_STATUS, "v": 1, "src": "rx0", "seq": 0, "t_ns": 1, "data": s})
+        assert s["stream"]["overflow_source"] == "none" and s["stream"]["overflows"] == 0
+        assert s["warnings"].count(late) == 1
+        assert node.status_payload()["warnings"].count(late) == 1                  # imported once
+    finally:
+        node.stop()
+
+
+def test_sweep_invalid_publish_max_points_rejected_before_running(bus, tmp_path):
+    node = RxNode(make_app(False, tmp_cal=str(tmp_path)), publisher=bus.pub)
+    try:
+        a = node.handle_command({"req_id": "s", "target": "*", "cmd": "sweep",
+                                 "args": {"start_hz": 905e6, "stop_hz": 925e6, "publish_max_points": 0}})
+        assert a["ok"] is False and "publish_max_points" in a["error"]
+        assert node.stats["sweeps"] == 0 and node.state == "idle"
+    finally:
+        node.stop()

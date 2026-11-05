@@ -16,8 +16,8 @@ import pytest
 from eds.core.config import DetectConfig, load_config
 from eds.core.errors import ConfigError
 from eds.dsp import detect, welch
-from eds.dsp.detect import coarse_statistics, resolution_passes
-from eds.dsp.windows import bin_correlation
+from eds.dsp.detect import coarse_cell_model, coarse_statistics, resolution_passes
+from eds.dsp.windows import bin_correlation, get_window, window_info
 from eds.hal import open_device
 from eds.rx import Sweeper
 from tests.dsp.helpers import synthetic_spectrum
@@ -202,6 +202,48 @@ def test_coarse_false_alarm_rate_on_correlated_welch_bins():
             hits[rp.d][1] += rp.p_lin.size
     for d, (h, b) in hits.items():
         assert 0.3 * cfg.pfa / 3 < h / b < 1.3 * cfg.pfa / 3, d
+
+
+@pytest.mark.parametrize("method", ["os_cfar", "ca_cfar"])
+def test_coarse_pass_false_alarm_rate_with_the_exact_block_tail(method):
+    """RF-03: single Blackman-Harris periodograms (n = 1), D = 16, per-pass pfa 2e-4. The
+    moment-matched Gamma(n D_eff) cell model exceeded the budget (x1.4 here, x1.9 at 1e-5);
+    the eigenvalue model of the block mean keeps every pass within it."""
+    rng = np.random.default_rng(5)
+    nfft, pfa_pass = 16384, 2e-4
+    cfg = DetectConfig(method=method, pfa=2 * pfa_pass, resolutions=[1, 16], min_snr_db=0.0, exclude_dc=False)
+    w = get_window("blackmanharris", nfft)
+    enbw = window_info("blackmanharris", nfft).enbw_bins
+    hits = bins = 0
+    for _ in range(16):
+        x = rng.standard_normal((64, nfft)) + 1j * rng.standard_normal((64, nfft))
+        for row in np.abs(np.fft.fft(x * w, axis=1)) ** 2:
+            spec = synthetic_spectrum(np.fft.fftshift(row), window="blackmanharris", enbw_bins=enbw)
+            (rp,) = resolution_passes(spec, cfg)
+            assert rp.pfa == pytest.approx(pfa_pass)
+            hits += int(np.count_nonzero(rp.p_lin > rp.threshold_lin))
+            bins += rp.p_lin.size
+    assert bins == 1024 * 1024
+    assert 0.4 * pfa_pass < hits / bins <= pfa_pass
+
+
+def test_coarse_cell_model_from_the_window_correlation():
+    for d in (16, 128):
+        m = coarse_cell_model("blackmanharris", 4096, d, 2.5)
+        assert m.shape == 2.5 and m.mean == pytest.approx(1.0, abs=1e-12)
+        d_eff, _ = coarse_statistics("blackmanharris", 4096, d, 32)
+        lam = np.asarray(m.weights) * m.shape                 # normalised eigenvalues (sum 1)
+        assert 1.0 / np.sum(lam ** 2) == pytest.approx(d_eff, rel=1e-9)     # same D_eff
+        assert lam[0] * d_eff > 1.4                           # largest component -> heavier tail
+    rect = coarse_cell_model("rect", 4096, 16, 1.0)
+    assert np.allclose(rect.weights, 1.0 / 16)                # independent bins: Gamma(n D)
+    # eigenvalues sample the symbol max(w^2) / mean(w^2) (Hann: 8/3), exact (eigvalsh) and
+    # circulant (very large blocks) alike
+    for d in (2048, 3000):
+        lam = np.asarray(coarse_cell_model("hann", 1 << 16, d, 1.0).weights)
+        assert lam.sum() == pytest.approx(1.0) and lam.max() * d == pytest.approx(8.0 / 3.0, rel=1e-3)
+    with pytest.raises(ConfigError):
+        coarse_cell_model("blackmanharris", 4096, 0, 1.0)
 
 
 # =========================================================================== configuration

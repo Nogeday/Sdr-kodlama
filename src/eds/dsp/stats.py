@@ -27,12 +27,29 @@ CFAR multipliers
   (``alpha_CA = M (pfa^{-1/M} - 1)``; OS: ``prod_{i<k} (M-i)/(M-i+beta) = pfa``). The
   correction in dB is ``10 log10(alpha_finite / alpha_ideal)`` (positive).
 
+Cells under test that are weighted gamma sums
+---------------------------------------------
+A bin of a block-averaged (coarse) spectrum is the mean of ``D`` *correlated* native bins.
+For Gaussian noise it is a quadratic form whose eigen-decomposition gives independent
+components: ``X = sum_i a_i G_i`` with ``G_i ~ Gamma(n, 1)`` iid and ``a_i`` proportional
+to the eigenvalues of the ``D x D`` bin covariance (:class:`CellModel`). Its tail is
+governed by the *largest* eigenvalue and is heavier than that of the moment-matched
+``Gamma(n D_eff)``, so CFAR multipliers derived from the moment-matched model give a
+false-alarm rate several times the design value at ``pfa <= 1e-5``. The ``cut=`` argument
+of :func:`ca_cfar_alpha` / :func:`os_cfar_alpha` replaces the CUT's gamma survival by the
+survival of such a sum, computed with the second-order Lugannani-Rice saddlepoint
+approximation (:func:`weighted_gamma_sf`; relative error < 1 % in the tail, exact
+cumulant generating function ``K(s) = -n sum_i log(1 - a_i s)``). The training-cell
+estimate keeps its moment-matched gamma model (its distribution is set by the body, not
+the tail, of the cell distribution).
+
 Only numpy + :mod:`math` are used (no scipy in ``src/``).
 """
 
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from functools import lru_cache
 
 import numpy as np
@@ -250,6 +267,190 @@ def gamma_isf(q: float, k: float) -> float:
     return _gamma_inverse(_check_prob(q, "Olasılık q"), _check_shape(k), upper=True)
 
 
+# --------------------------------------------------------------------------- weighted gamma sums
+_SQRT_2PI = math.sqrt(2.0 * math.pi)
+_LOG_SQRT_2PI = 0.5 * math.log(2.0 * math.pi)
+_W_SMALL = 0.05              # |w| below this: limit form of the saddlepoint correction
+_MILLS_CF_FROM = 8.0         # Mills ratio by continued fraction from here on
+_MILLS_CF_TERMS = 80
+_TABLE_TAIL_DECADES = 14.0   # saddlepoint table: 1 - a_max s from 1 down to 1e-14 ...
+_TABLE_BODY_DECADES = 8.0    # ... and from 1 up to 1e8 (s < 0, x below the mean)
+_TABLE_POINTS = 6001
+
+
+@dataclass(frozen=True)
+class CellModel:
+    """Cell-under-test distribution ``X = sum_i weights[i] * G_i``, ``G_i ~ Gamma(shape, 1)`` iid.
+
+    The mean is ``shape * sum(weights)`` (normally 1: the CFAR noise estimates are noise
+    *means*). Hashable, so CFAR multipliers that use it are cached. See the module
+    docstring; built e.g. by :func:`eds.dsp.detect.coarse_cell_model`.
+    """
+
+    weights: tuple[float, ...]
+    shape: float
+
+    def __post_init__(self) -> None:
+        w = tuple(float(v) for v in self.weights)
+        if not w or any(not (math.isfinite(v) and v >= 0.0) for v in w) or max(w) <= 0.0:
+            raise ConfigError(f"CellModel ağırlıkları sonlu, negatif olmayan ve en az biri pozitif olmalı, "
+                              f"{self.weights!r} geldi")
+        object.__setattr__(self, "weights", w)
+        object.__setattr__(self, "shape", _check_shape(self.shape))
+
+    @property
+    def mean(self) -> float:
+        return self.shape * math.fsum(self.weights)
+
+
+def _cgf_parts(a: np.ndarray, c: np.ndarray, v: np.ndarray) -> tuple[np.ndarray, ...]:
+    """``(s, K, K', K'', K''', K'''')`` at ``s = (1 - v) / a_max`` (``v > 0``; rows = ``v``).
+
+    ``1 - a_i s`` is formed as ``(a_max - a_i + a_i v) / a_max`` so it stays exact for the
+    largest component when ``v`` is tiny (far tail).
+    """
+    a_max = float(a[0])
+    vv = v[:, None]
+    om = (a_max - a[None, :] + a[None, :] * vv) / a_max          # 1 - a_i s  (> 0)
+    r = a[None, :] / om
+    s = (1.0 - v) / a_max
+    k0 = -np.sum(c * np.log(om), axis=1)
+    k1 = np.sum(c * r, axis=1)
+    r2 = r * r
+    k2 = np.sum(c * r2, axis=1)
+    k3 = 2.0 * np.sum(c * r2 * r, axis=1)
+    k4 = 6.0 * np.sum(c * r2 * r2, axis=1)
+    return s, k0, k1, k2, k3, k4
+
+
+def _mills_ratio(w: np.ndarray) -> np.ndarray:
+    """``Q_N(w) / phi(w)`` for ``w > 0`` (no underflow for large ``w``)."""
+    out = np.empty_like(w)
+    small = w < _MILLS_CF_FROM
+    if np.any(small):
+        ws = w[small]
+        q = 0.5 * np.array([math.erfc(float(t) / math.sqrt(2.0)) for t in ws])
+        out[small] = q * _SQRT_2PI * np.exp(0.5 * ws * ws)
+    if not np.all(small):
+        wl = w[~small]
+        t = np.zeros_like(wl)
+        for k in range(_MILLS_CF_TERMS, 0, -1):
+            t = k / (wl + t)
+        out[~small] = 1.0 / (wl + t)
+    return out
+
+
+def _lr_log_sf(a: np.ndarray, c: np.ndarray, v: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """``(x, log P(X > x))`` at the saddlepoints ``s = (1 - v)/a_max`` (second-order
+    Lugannani-Rice, Daniels 1987)."""
+    s, k0, x, k2, k3, k4 = _cgf_parts(a, c, v)
+    w = np.sign(s) * np.sqrt(np.maximum(2.0 * (s * x - k0), 0.0))
+    u = s * np.sqrt(k2)
+    l3 = k3 / k2 ** 1.5
+    l4 = k4 / (k2 * k2)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        corr = ((1.0 / u - 1.0 / w) + (l4 / 8.0 - 5.0 * l3 * l3 / 24.0) / u - 1.0 / u ** 3
+                - l3 / (2.0 * u * u) + 1.0 / w ** 3)
+    near = np.abs(w) < _W_SMALL
+    corr = np.where(near, -l3 / 6.0, corr)                  # lim_{w->0} (1/u - 1/w) = -lambda_3 / 6
+    log_phi = -0.5 * w * w - _LOG_SQRT_2PI
+    log_sf = np.empty_like(w)
+    pos = w > 0.0
+    if np.any(pos):
+        m = _mills_ratio(w[pos]) + corr[pos]
+        bad = m <= 0.0                                       # never seen in practice: LR1, then plain normal tail
+        if np.any(bad):
+            m1 = _mills_ratio(w[pos]) + np.where(near[pos], -l3[pos] / 6.0, 1.0 / u[pos] - 1.0 / w[pos])
+            m = np.where(bad, np.where(m1 > 0.0, m1, _mills_ratio(w[pos])), m)
+        log_sf[pos] = log_phi[pos] + np.log(m)
+    neg = ~pos
+    if np.any(neg):
+        q = 0.5 * np.array([math.erfc(float(t) / math.sqrt(2.0)) for t in w[neg]])
+        sf = q + np.exp(log_phi[neg]) * corr[neg]
+        log_sf[neg] = np.log(np.clip(sf, _XMIN, 1.0))
+    return x, np.minimum(log_sf, 0.0)
+
+
+_EXACT_COMPONENTS = 64       # largest weights kept exactly ...
+_GROUPED_COMPONENTS = 192    # ... the rest merged into this many groups of neighbouring weights
+
+
+def _components(model: CellModel) -> tuple[np.ndarray, np.ndarray]:
+    """Weights sorted descending (negligible ones dropped) and the per-component shapes.
+
+    Beyond :data:`_EXACT_COMPONENTS` components, the smaller (sorted, hence neighbouring)
+    weights are merged in contiguous groups: weight = group mean, shape = shape x group size
+    (mean preserved; the tail is set by the largest weights, which stay exact)."""
+    a = np.sort(np.asarray(model.weights, dtype=np.float64))[::-1]
+    a = a[a > a[0] * 1e-12]
+    c = np.full(a.size, model.shape)
+    if a.size <= _EXACT_COMPONENTS + _GROUPED_COMPONENTS:
+        return a, c
+    rest = np.array_split(a[_EXACT_COMPONENTS:], _GROUPED_COMPONENTS)
+    a_g = np.array([float(np.mean(g)) for g in rest])
+    c_g = np.array([model.shape * g.size for g in rest], dtype=np.float64)
+    return np.concatenate((a[:_EXACT_COMPONENTS], a_g)), np.concatenate((c[:_EXACT_COMPONENTS], c_g))
+
+
+def weighted_gamma_sf(x, weights, shape: float):
+    """``P(X > x)`` for ``X = sum_i weights[i] * G_i``, ``G_i ~ Gamma(shape, 1)`` iid.
+
+    Second-order Lugannani-Rice saddlepoint approximation with the exact cumulant
+    generating function (the saddlepoint is solved per ``x``); relative error in the upper
+    tail against the exact gamma: 0.7 % for ``shape = 1``, < 0.15 % for ``shape >= 2``
+    (~3 % for ``shape = 0.5``). Scalar in -> ``float``; array in -> ``float64`` array.
+    """
+    a, c = _components(CellModel(tuple(np.ravel(np.asarray(weights, dtype=np.float64)).tolist()), shape))
+    xs = np.atleast_1d(np.asarray(x, dtype=np.float64))
+    if np.any(np.isnan(xs)):
+        raise ConfigError("weighted_gamma_sf: x NaN olamaz")
+    out = np.ones_like(xs)
+    act = xs > 0.0
+    fin = act & np.isfinite(xs)
+    out[act & ~np.isfinite(xs)] = 0.0
+    if np.any(fin):
+        xt = xs[fin]
+        # K'(s) is increasing in s: bisection on log v, v = 1 - a_max s in (1e-60, 1e60)
+        lo = np.full(xt.size, -138.0)
+        hi = np.full(xt.size, 138.0)
+        for _ in range(90):
+            mid = 0.5 * (lo + hi)
+            _, _, k1, _, _, _ = _cgf_parts(a, c, np.exp(mid))
+            big = k1 > xt                                   # v too small -> raise it
+            lo = np.where(big, mid, lo)
+            hi = np.where(big, hi, mid)
+        _, log_sf = _lr_log_sf(a, c, np.exp(0.5 * (lo + hi)))
+        out[fin] = np.exp(log_sf)
+    if np.ndim(x) == 0:
+        return float(out[0])
+    return out.reshape(np.shape(x))
+
+
+@lru_cache(maxsize=64)
+def _log_sf_table(model: CellModel) -> tuple[np.ndarray, np.ndarray]:
+    """Saddlepoint table ``(x, log P(X > x))`` (ascending ``x``) for fast interpolation."""
+    a, c = _components(model)
+    v = np.concatenate((np.logspace(_TABLE_BODY_DECADES, 0.0, _TABLE_POINTS // 3, endpoint=False),
+                        np.logspace(0.0, -_TABLE_TAIL_DECADES, _TABLE_POINTS - _TABLE_POINTS // 3)))
+    x, log_sf = _lr_log_sf(a, c, v)
+    order = np.argsort(x, kind="stable")
+    x, log_sf = x[order], log_sf[order]
+    log_sf = np.minimum.accumulate(log_sf)                   # survival is non-increasing
+    return x, log_sf
+
+
+def _cell_log_sf(model: CellModel, x: np.ndarray) -> np.ndarray:
+    """``log P(X > x)`` for the cell model by interpolation of its saddlepoint table."""
+    xt, lt = _log_sf_table(model)
+    out = np.interp(x, xt, lt)
+    hi = x > xt[-1]
+    if np.any(hi):                                           # beyond the table: asymptotic slope
+        slope = (lt[-1] - lt[-2]) / (xt[-1] - xt[-2])
+        out[hi] = lt[-1] + slope * (x[hi] - xt[-1])
+    out[x <= 0.0] = 0.0
+    return out
+
+
 # --------------------------------------------------------------------------- CFAR
 def cfar_alpha(pfa: float, n_avg: float) -> float:
     """Ideal threshold multiplier for averaged ``|X|^2`` noise with *known* mean.
@@ -339,12 +540,16 @@ def _os_estimate_grid(n: float, m: int, k: int, pfa: float) -> tuple[np.ndarray,
     return y, _normalize_weights(log_density, trap)
 
 
-def _solve_multiplier(pfa: float, n: float, y: np.ndarray, w: np.ndarray) -> float:
-    """Solve ``sum_j w_j Q(n, n beta y_j) = pfa`` for ``beta`` (bisection in log beta)."""
+def _solve_multiplier(pfa: float, n: float, y: np.ndarray, w: np.ndarray, cut: CellModel | None = None) -> float:
+    """Solve ``sum_j w_j S(beta y_j) = pfa`` for ``beta`` (bisection in log beta); ``S`` is the
+    CUT survival: ``Q(n, n x)`` (``Gamma(n, 1/n)``) or that of ``cut`` when given."""
     log_pfa = math.log(pfa)
 
     def log_pfa_of(beta: float) -> float:
-        _, log_q = _gamma_log_pq(n, n * beta * y)
+        if cut is None:
+            _, log_q = _gamma_log_pq(n, n * beta * y)
+        else:
+            log_q = _cell_log_sf(cut, beta * y)
         mx = float(np.max(log_q))
         return mx + math.log(float(np.sum(w * np.exp(log_q - mx))))
 
@@ -373,49 +578,61 @@ def _solve_multiplier(pfa: float, n: float, y: np.ndarray, w: np.ndarray) -> flo
     return math.exp(0.5 * (log_lo + log_hi))
 
 
+def _check_cut(cut: CellModel | None) -> CellModel | None:
+    if cut is None:
+        return None
+    if not isinstance(cut, CellModel):
+        raise ConfigError(f"cut bir CellModel olmalı, {type(cut).__name__} geldi")
+    if abs(cut.mean - 1.0) > 1e-6:
+        raise ConfigError(f"cut modelinin ortalaması 1 olmalı (gürültü ortalamasına normalize), {cut.mean!r} geldi")
+    return cut
+
+
 @lru_cache(maxsize=512)
-def _ca_cfar_alpha_cached(pfa: float, n: float, m_cells: float) -> float:
+def _ca_cfar_alpha_cached(pfa: float, n: float, m_cells: float, cut: CellModel | None = None) -> float:
     y, w = _ca_estimate_grid(n, m_cells, pfa)
-    return _solve_multiplier(pfa, n, y, w)
+    return _solve_multiplier(pfa, n, y, w, cut)
 
 
-def ca_cfar_alpha(pfa: float, n_avg: float, n_train: float) -> float:
+def ca_cfar_alpha(pfa: float, n_avg: float, n_train: float, *, cut: CellModel | None = None) -> float:
     """CA-CFAR multiplier on the *mean of the training cells* with the finite-M correction.
 
     ``P(X > alpha * mean_train) = pfa`` for ``X`` and the ``n_train`` training cells iid
     ``Gamma(n_avg, 1/n_avg) sigma^2``. ``n_train`` may be non-integer (effective number of
     independent cells when neighbouring bins are correlated): the mean estimate is then
     modelled as ``Gamma(n M, 1/(n M))`` (exact for integer M, moment-matched otherwise).
-    Tends to :func:`cfar_alpha` as ``n_train -> inf``.
+    Tends to :func:`cfar_alpha` as ``n_train -> inf``. ``cut`` (mean 1) replaces the
+    cell-under-test distribution (training cells keep the gamma model; module docstring).
     """
     pfa = _check_prob(pfa, "pfa")
     n = _check_shape(n_avg)
     m = float(n_train)
     if not (math.isfinite(m) and m > 0.0):
         raise ConfigError(f"Eğitim hücresi sayısı pozitif olmalı, {n_train!r} geldi")
-    return _ca_cfar_alpha_cached(pfa, n, m)
+    return _ca_cfar_alpha_cached(pfa, n, m, _check_cut(cut))
 
 
 @lru_cache(maxsize=512)
-def _os_cfar_beta_cached(pfa: float, n: float, m: int, k: int) -> float:
+def _os_cfar_beta_cached(pfa: float, n: float, m: int, k: int, cut: CellModel | None = None) -> float:
     y, w = _os_estimate_grid(n, m, k, pfa)
-    return _solve_multiplier(pfa, n, y, w)
+    return _solve_multiplier(pfa, n, y, w, cut)
 
 
-def os_cfar_alpha(pfa: float, n_avg: float, n_train: int, k: int) -> float:
+def os_cfar_alpha(pfa: float, n_avg: float, n_train: int, k: int, *, cut: CellModel | None = None) -> float:
     """OS-CFAR multiplier on the *noise-mean estimate* ``X_(k) / c_k`` (finite-M exact).
 
     ``X_(k)`` is the rank-``k`` (1-based) order statistic of ``n_train`` iid
     ``Gamma(n_avg, 1/n_avg) sigma^2`` training cells and ``c_k`` = :func:`os_cfar_scale`.
     The returned ``alpha`` satisfies ``P(X > alpha * X_(k) / c_k) = pfa``; i.e. the raw
-    multiplier on ``X_(k)`` is ``alpha / c_k``.
+    multiplier on ``X_(k)`` is ``alpha / c_k``. ``cut`` (mean 1) replaces the
+    cell-under-test distribution (training cells keep the gamma model; module docstring).
     """
     pfa = _check_prob(pfa, "pfa")
     n = _check_shape(n_avg)
     m = _check_cells(n_train)
     if not (1 <= int(k) <= m):
         raise ConfigError(f"OS-CFAR sırası 1..{m} aralığında olmalı, {k!r} geldi")
-    beta = _os_cfar_beta_cached(pfa, n, m, int(k))
+    beta = _os_cfar_beta_cached(pfa, n, m, int(k), _check_cut(cut))
     return beta * os_cfar_scale(n, m, int(k))
 
 

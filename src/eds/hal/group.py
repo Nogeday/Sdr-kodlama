@@ -11,7 +11,11 @@ done upstream, see ``eds.df.coherence``). Alignment between members is only *coa
 (host time); ``last_skew_ns`` is the spread of the members' first-sample host times for
 the last block. Any member overflow — or a failed/timeouted member read, after which the
 members are no longer read in lock-step — sets ``overflow`` on the group block: alignment
-is lost and DF must re-calibrate.
+is lost and DF must re-calibrate. On a Pluto the member overflow comes from the RX DMA
+status register (:mod:`eds.hal.soapy_backend`; SoapyPlutoSDR itself never reports one) and
+the uncertain span after it is flagged ``settling``, which the group block inherits.
+SoapyPlutoSDR allows only ONE Pluto per process, so 2× Pluto members are subprocess proxies
+(``[[device]] isolation``).
 
 USB load: the group profile scales the interface limits by the number of members (each
 device has its own USB link). If several Plutos share one USB 2.0 host controller the
@@ -221,8 +225,10 @@ class DeviceGroup(RxDevice):
         overflow = self._misaligned or any(b.overflow for b in blocks)
         self._misaligned = False
         if any(b.settling for b in blocks):
-            # union of member settling windows and the group's own window
-            self._settle_until = max(self._settle_until, self._index + int(samples.shape[1]))
+            # union of member settling windows and the group's own window (under the lock that
+            # serialises set_* / mark_settling and the block labelling in read())
+            with self._lock:
+                self._settle_until = max(self._settle_until, self._index + int(samples.shape[1]))
         t_ret = max(int(b.t_end_ns) for b in blocks)
         return RawRead(samples=samples, overflow_before=overflow, t_ns=t_ret)
 

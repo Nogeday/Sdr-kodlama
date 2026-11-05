@@ -186,3 +186,123 @@ def test_uncalibrated_or_wrong_unit_gets_no_verdict(tmp_path):
     assert dbfs.passed is None and "Birim" in dbfs.extra[VERDICT_NOTE_KEY]
     assert uncal.passed is None and "Kalibrasyonsuz" in uncal.extra[VERDICT_NOTE_KEY]
     assert ok.passed is True and VERDICT_NOTE_KEY not in ok.extra
+
+
+# ----------------------------------------------------------------------------- verdict blockers
+def test_results_flagged_not_comparable_get_no_verdict(tmp_path):
+    """MM-04: quick mode, non-real-time simulator, no coherence and the measurement's own
+    blockers keep the target but never give GEÇTİ/KALDI."""
+    from eds.measure.targets import REASON_NO_COHERENCE, REASON_NONREALTIME, REASON_QUICK, VERDICT_NOTE_KEY
+
+    t = {"max_rate": Target(4.0, ">="), "latency": Target(100.0, "<="), "df_rms": Target(5.0, "<=")}
+    quick = _res("max_rate", 6.0)
+    quick.conditions["quick"] = True
+    nonrt = _res("latency", 300.0)
+    nonrt.extra["realtime"] = False
+    incoherent = _res("df_rms", 1.0)
+    incoherent.extra["coherent"] = False
+    own = _res("df_rms", 1.0)
+    own.blockers = [REASON_NO_COHERENCE, "simülasyon: yalnız termal gürültü"]
+    own.extra["coherent"] = False                              # same reason: listed once
+    full = _res("max_rate", 6.0)
+    full.conditions.update(quick=False, simulated=True)
+    full.extra["realtime"] = True
+    apply_targets([quick, nonrt, incoherent, own, full], t)
+    for r, word in ((quick, REASON_QUICK), (nonrt, REASON_NONREALTIME), (incoherent, REASON_NO_COHERENCE)):
+        assert r.passed is None and r.target is not None and word in r.extra[VERDICT_NOTE_KEY]
+        assert r.extra[VERDICT_NOTE_KEY].endswith("hedefle karşılaştırılmadı")
+    assert own.passed is None and own.extra[VERDICT_NOTE_KEY].count(REASON_NO_COHERENCE) == 1
+    assert "termal" in own.extra[VERDICT_NOTE_KEY]
+    assert full.passed is True and VERDICT_NOTE_KEY not in full.extra
+    # a failed / skipped result gets no verdict note (nothing to compare)
+    failed = _res("latency", None, status="failed")
+    failed.conditions["quick"] = True
+    apply_targets([failed], t)
+    assert failed.passed is None and VERDICT_NOTE_KEY not in failed.extra
+    # re-evaluation with a fresh (comparable) result clears a stale note
+    quick.conditions["quick"] = False
+    apply_targets([quick], t)
+    assert quick.passed is True and VERDICT_NOTE_KEY not in quick.extra
+
+
+REQ = """
+[scan_speed]
+target = 5.0
+op = ">="
+note = "325 MHz–3.8 GHz"
+
+[scan_speed.require]
+span_hz_min = 3.475e9
+rbw_hz_max = 20e3
+fs_hz = 20e6
+
+[image_rejection]
+target = 40.0
+op = ">="
+
+[image_rejection.require]
+fcs_hz_count_min = 4
+tracking = true
+
+[max_rate]
+target = 4.0
+op = ">="
+
+[max_rate.require]
+headline_mode = "pipeline"
+duration_s_min = 60
+"""
+
+
+def test_target_conditions_are_parsed_and_checked(tmp_path):
+    from eds.measure.targets import TARGET_REQUIRE_KEY, VERDICT_NOTE_KEY
+
+    t = load_targets(_write(tmp_path, REQ))
+    assert dict(t["scan_speed"].require) == {"span_hz_min": 3.475e9, "rbw_hz_max": 20e3, "fs_hz": 20e6}
+    quick_scan = _res("scan_speed", 7.0)                       # 325–825 MHz, RBW 39 kHz
+    quick_scan.conditions.update(span_hz=500e6, rbw_hz=39.06e3, fs_hz=20e6)
+    full_scan = _res("scan_speed", 7.0)
+    full_scan.conditions.update(span_hz=3.475e9, rbw_hz=19.5e3, fs_hz=20e6)
+    one_fc = _res("image_rejection", 45.0)
+    one_fc.conditions.update(fcs_hz=[915e6], tracking=True)
+    four_fc = _res("image_rejection", 45.0)
+    four_fc.conditions.update(fcs_hz=[0.4e9, 1e9, 2e9, 3e9], tracking=True)
+    transport = _res("max_rate", 6.0)
+    transport.conditions.update(headline_mode="transport", duration_s=60.0)
+    no_record = _res("max_rate", 6.0)                          # conditions not recorded → cannot verify
+    apply_targets([quick_scan, full_scan, one_fc, four_fc, transport, no_record], t)
+    assert quick_scan.passed is None
+    note = quick_scan.extra[VERDICT_NOTE_KEY]
+    assert "span_hz = 5e+08 (gerekli ≥ 3.475e+09)" in note and "rbw_hz = 39060 (gerekli ≤ 20000)" in note
+    assert "fs_hz" not in note
+    assert full_scan.passed is True and full_scan.extra[TARGET_REQUIRE_KEY]["rbw_hz_max"] == 20e3
+    assert one_fc.passed is None and "fcs_hz sayısı 1 < 4" in one_fc.extra[VERDICT_NOTE_KEY]
+    assert four_fc.passed is True
+    assert transport.passed is None and "headline_mode = 'transport' (gerekli 'pipeline')" in \
+        transport.extra[VERDICT_NOTE_KEY]
+    assert no_record.passed is None and "kayıtlı değil" in no_record.extra[VERDICT_NOTE_KEY]
+
+
+def test_bad_target_conditions_are_rejected(tmp_path):
+    bad = """
+[scan_speed]
+target = 5.0
+op = ">="
+require = 3
+
+[max_rate]
+target = 4.0
+op = ">="
+[max_rate.require]
+duration_s_min = "uzun"
+mode = [1, 2]
+"""
+    with pytest.raises(ConfigError) as ei:
+        load_targets(_write(tmp_path, bad))
+    msg = str(ei.value)
+    assert "[scan_speed]: 'require' tablo olmalı" in msg
+    assert "duration_s_min = 'uzun': sonlu bir sayı olmalı" in msg
+    assert "mode = [1, 2]: metin, true/false ya da sonlu sayı olmalı" in msg
+    with pytest.raises(ConfigError, match="hedef koşulu"):
+        Target(1.0, "<=", require={"rbw_hz_max": "x"})
+    assert Target(1.0, "<=", require={"rbw_hz_max": 2e3}).require == (("rbw_hz_max", 2e3),)

@@ -53,14 +53,23 @@ signal). LTE (10 MHz) and Wi-Fi (20 MHz) are therefore searched on coarser spect
   ``train_bins`` count *coarse* bins. A pass is **skipped** when the coarse spectrum has
   fewer than ``4 (train_bins + guard_bins)`` bins.
 * **Effective averages scale with D**: noise-only native bins are ``Gamma(n_eff)`` and
-  their only mutual dependence is the window's leakage correlation ``rho`` (white noise
-  across the block). The block mean is then modelled (moment-matched) as
-  ``Gamma(n_eff * D_eff)`` with ``D_eff = D^2 / sum_{i,j<D} rho(|i - j|)``: ``D_eff = D`` for
-  independent bins (rectangular window), ``~ D / 2.76`` for Blackman-Harris (the cruder
-  ``D / ENBW_bins = D / 2.0`` would overstate the averaging and raise the false-alarm
-  rate). Overlapping Welch segments are treated as separable (``n_eff`` per bin times
+  their only mutual dependence is the window's leakage correlation (white noise across
+  the block). For the **training cells** (noise estimate) the block mean is modelled
+  (moment-matched) as ``Gamma(n_eff * D_eff)`` with ``D_eff = D^2 / sum_{i,j<D}
+  rho(|i - j|)``: ``D_eff = D`` for independent bins (rectangular window), ``~ D / 2.76``
+  for Blackman-Harris (the cruder ``D / ENBW_bins = D / 2.0`` would overstate the
+  averaging). Overlapping Welch segments are treated as separable (``n_eff`` per bin times
   ``D_eff``). The coarse training cells are nearly independent; their ``M_eff`` follows
   from the coarse-bin correlation induced by ``rho`` (same formula as above).
+* **Exact tail of the coarse cell under test**: the false-alarm rate is set by the far
+  tail of the block mean, which the moment-matched gamma underestimates (Blackman-Harris,
+  ``D = 16``: x2 at 1e-4, x5 at 1.7e-7). The block mean of one segment is the quadratic
+  form ``(1/D) X^H X`` of the ``D`` native bins ``X ~ CN(0, R)``, ``R[i, j] = r(i - j)``
+  with ``r`` = DFT of ``w^2`` / ``sum w^2`` (the bins' amplitude correlation; ``rho =
+  |r|^2``). With the eigenvalues ``lambda_i`` of ``R`` it is ``sum_i lambda_i / (n_eff D)
+  * Gamma(n_eff, 1)`` (:func:`coarse_cell_model`), whose survival the CFAR multiplier uses
+  (:class:`~eds.dsp.stats.CellModel`, saddlepoint; :mod:`eds.dsp.stats`). For a
+  rectangular window ``R = I`` and this is the exact ``Gamma(n_eff D)``.
 * **Bonferroni**: every pass that runs uses ``pfa / n_passes`` (``n_passes`` = native +
   coarse passes actually run), so the expected number of false-alarm bins of all passes
   together is ``<= pfa * n_native`` (coarse spectra have fewer bins). With a single
@@ -110,13 +119,14 @@ from ..core.units import db10, lin10
 from .peaks import interp_peak
 from .psd import DEFAULT_DC_NOTCH_BINS, Spectrum
 from .stats import (
+    CellModel,
     ca_cfar_alpha,
     effective_averages,
     os_cfar_alpha,
     os_cfar_scale,
     os_rank_index,
 )
-from .windows import bin_correlation, canonical_window_name
+from .windows import bin_correlation, canonical_window_name, get_window
 
 log = logging.getLogger(__name__)
 
@@ -137,6 +147,7 @@ EXTENSION_SIGMAS: float = 3.0
 #: Hysteresis: the extension threshold lies this many dB below ``min_snr_db``.
 EXTENSION_HYSTERESIS_DB: float = 3.0
 _RHO_MAX_LAG: int = 32          # native bin correlation beyond this lag is zero for all windows here
+_EIG_EXACT_MAX_D: int = 2048    # larger blocks: circulant (symbol) eigenvalues instead of eigvalsh
 
 
 @dataclass
@@ -228,6 +239,46 @@ def _coarse_stats_cached(window: str, nfft: int, d: int, t: int) -> tuple[float,
     offsets = np.arange(m)
     lag = np.abs(offsets[:, None] - offsets[None, :])
     return float(d_eff), float(m * m / np.sum(rho_c[lag]))
+
+
+@lru_cache(maxsize=256)
+def _block_eigenvalues(window: str, nfft: int, d: int) -> tuple[float, ...]:
+    """Eigenvalues (descending, sum normalised to 1) of the ``d x d`` amplitude-correlation
+    matrix ``R[i, j] = r(i - j)`` of adjacent native bins (see module docstring)."""
+    w = get_window(window, nfft)
+    w2 = w * w
+    r_all = np.fft.fft(w2) / float(np.sum(w2))
+    lag_max = min(_RHO_MAX_LAG, nfft // 2, d - 1)
+    r = r_all[:lag_max + 1]
+    if d <= _EIG_EXACT_MAX_D:
+        lags = np.arange(d)[:, None] - np.arange(d)[None, :]
+        rm = np.zeros((d, d), dtype=np.complex128)
+        inside = np.abs(lags) <= lag_max
+        lg = lags[inside]
+        rm[inside] = np.where(lg >= 0, r[np.abs(lg)], np.conj(r[np.abs(lg)]))
+        lam = np.linalg.eigvalsh(rm)
+    else:                                   # circulant approximation (edge effects ~ lag_max / d)
+        c = np.zeros(d, dtype=np.complex128)
+        c[:lag_max + 1] = r
+        c[d - lag_max:] = np.conj(r[1:][::-1])
+        lam = np.fft.fft(c).real
+    lam = np.clip(lam, 0.0, None)
+    lam = np.sort(lam)[::-1]
+    lam = lam[lam > lam[0] * 1e-12]
+    return tuple((lam / np.sum(lam)).tolist())
+
+
+def coarse_cell_model(window: str, nfft: int, d: int, n_eff: float) -> CellModel:
+    """Distribution (mean 1) of a ``d``-bin block mean of ``Gamma(n_eff)`` native noise bins
+    of ``window`` / ``nfft``: ``sum_i lambda_i / n_eff * Gamma(n_eff, 1)`` with the
+    normalised eigenvalues ``lambda_i`` of the bins' amplitude-correlation matrix."""
+    if isinstance(d, bool) or int(d) != d or int(d) < 1:
+        raise ConfigError(f"Çözünürlük çarpanı pozitif tamsayı olmalı, {d!r} geldi")
+    n = float(n_eff)
+    if not (math.isfinite(n) and n > 0.0):
+        raise ConfigError(f"n_eff pozitif olmalı, {n_eff!r} geldi")
+    lam = _block_eigenvalues(canonical_window_name(window), int(nfft), int(d))
+    return CellModel(tuple(v / n for v in lam), n)
 
 
 def coarse_statistics(window: str, nfft: int, d: int, train_bins: int) -> tuple[float, float]:
@@ -495,10 +546,11 @@ def _fill_invalid(p: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, np.ndar
     return out, ext
 
 
-def _one_sided(pc: np.ndarray, cfg: DetectConfig, n_c: float, m_eff: float, pfa: float
-               ) -> tuple[np.ndarray, np.ndarray, float]:
+def _one_sided(pc: np.ndarray, cfg: DetectConfig, n_c: float, m_eff: float, pfa: float,
+               cut: CellModel | None = None) -> tuple[np.ndarray, np.ndarray, float]:
     """One-sided noise-mean estimates (left / right windows of ``2 train`` coarse cells beyond
-    ``guard``) and the multiplier of each one-sided test at ``pfa`` (see module doc)."""
+    ``guard``) and the multiplier of each one-sided test at ``pfa`` (see module doc);
+    ``cut`` = exact cell-under-test distribution (``None``: ``Gamma(n_c)``)."""
     n = pc.size
     g, t = int(cfg.guard_bins), int(cfg.train_bins)
     m = 2 * t
@@ -507,14 +559,14 @@ def _one_sided(pc: np.ndarray, cfg: DetectConfig, n_c: float, m_eff: float, pfa:
     win = sliding_window_view((pc / scale).astype(np.float64), m)       # win[j] = pc[j:j+m]
     if cfg.method == "ca_cfar":
         est_w = np.mean(win, axis=1) * scale
-        alpha = ca_cfar_alpha(pfa, n_c, m_eff)
+        alpha = ca_cfar_alpha(pfa, n_c, m_eff, cut=cut)
     else:
         rank = os_rank_index(float(cfg.os_rank), m)
         est_w = np.partition(win, rank - 1, axis=1)[:, rank - 1] * scale / os_cfar_scale(n_c, m, rank)
         if cfg.method == "os_cfar":
             m_os = max(1, int(round(m_eff)))
             k_os = min(m_os, max(1, int(round(rank / m * m_os))))
-            alpha = os_cfar_alpha(pfa, n_c, m_os, k_os)
+            alpha = os_cfar_alpha(pfa, n_c, m_os, k_os, cut=cut)
         else:
             alpha = 1.0
     k = np.arange(n)
@@ -538,7 +590,10 @@ def _coarse_pass(p_work: np.ndarray, valid: np.ndarray, d: int, spec: Spectrum, 
     vc = np.count_nonzero(valid[off:off + nc * d].reshape(nc, d), axis=1) * 2 > d
     d_eff, m_eff = coarse_statistics(spec.window, spec.nfft, d, int(cfg.train_bins))
     n_c = n_eff * d_eff
-    left, right, alpha = _one_sided(pc, cfg, n_c, m_eff, 0.5 * pfa)
+    cut = coarse_cell_model(spec.window, spec.nfft, d, n_eff) if cfg.method != "fixed" else None
+    if cut is not None and cut.weights[-1] >= cut.weights[0] * (1.0 - 1e-9):
+        cut = None                          # independent bins (rect): Gamma(n_eff D) is exact
+    left, right, alpha = _one_sided(pc, cfg, n_c, m_eff, 0.5 * pfa, cut)
     so = np.minimum(left, right)
     if cfg.method == "fixed":
         thr = np.full(nc, float(lin10(float(cfg.fixed_threshold))))

@@ -49,6 +49,7 @@ from ...dsp.psd import Spectrum
 from ...rx.sweep import Sweeper, SweepResult
 from ..base import FigureSpec, Measurement, MeasurementResult, Series, register
 from ..common import base_conditions, spectrum_screenshot
+from ..targets import REASON_NONREALTIME
 
 log = logging.getLogger(__name__)
 
@@ -85,8 +86,13 @@ class ScanConfig:
 
     @property
     def label(self) -> str:
-        res = f"RBW {fmt_hz(self.rbw_hz, 4)}" if self.rbw_hz > 0 else f"N = {self.nfft}"
+        """Label with the REQUESTED resolution (before a sweeper exists, e.g. a skipped config)."""
+        res = f"istenen RBW {fmt_hz(self.rbw_hz, 4)}" if self.rbw_hz > 0 else f"N = {self.nfft}"
         return f"#{self.index + 1}: {self.fs / 1e6:g} MS/s, {res}, {self.averages} ort."
+
+    def label_actual(self, rbw_hz: float, nfft: int) -> str:
+        """Label with the resolution the sweeper actually uses (RBW = ENBW·fs/nfft)."""
+        return f"#{self.index + 1}: {self.fs / 1e6:g} MS/s, RBW {fmt_hz(rbw_hz, 4)} (N = {nfft}), {self.averages} ort."
 
 
 @dataclass
@@ -96,6 +102,10 @@ class ConfigRun:
     cfg: ScanConfig
     sweeper: Sweeper
     sweeps: list[SweepResult]
+
+    @property
+    def label(self) -> str:
+        return self.cfg.label_actual(self.sweeper.rbw_hz, self.sweeper.nfft)
 
     @property
     def rates_ghz(self) -> list[float]:
@@ -254,7 +264,8 @@ class ScanSpeedMeasurement(Measurement):
                 sweeps = []
                 for k in range(repeats):
                     res = sweeper.run()
-                    log.info("scan_speed %s tekrar %d/%d: %d adım, %.3f s, %.3f GHz/s", sc.label, k + 1, repeats,
+                    log.info("scan_speed %s tekrar %d/%d: %d adım, %.3f s, %.3f GHz/s",
+                             sc.label_actual(sweeper.rbw_hz, sweeper.nfft), k + 1, repeats,
                              res.n_steps, res.duration_s, res.rate_hz_per_s / 1e9)
                     sweeps.append(res)
             except ProfileViolation as e:
@@ -296,7 +307,7 @@ class ScanSpeedMeasurement(Measurement):
             g = r.gaps_s()
             gap_cfg = float(np.median(g)) if g else gap_s
             per_config.append({
-                "config": r.cfg.label, "fs_hz": r.cfg.fs, "bw_hz": r.cfg.bw, "rbw_hz": r.sweeper.rbw_hz,
+                "config": r.label, "fs_hz": r.cfg.fs, "bw_hz": r.cfg.bw, "rbw_hz": r.sweeper.rbw_hz,
                 "rbw_requested_hz": r.cfg.rbw_hz, "nfft": r.sweeper.nfft, "averages": r.cfg.averages,
                 "rate_ghz_per_s": r.rate_ghz, "rate_min_ghz_per_s": min(r.rates_ghz),
                 "rate_max_ghz_per_s": max(r.rates_ghz), "duration_s": r.duration_s, "n_steps": r.n_steps,
@@ -347,7 +358,7 @@ class ScanSpeedMeasurement(Measurement):
         }
         if not ref_is_first:
             extra["reference_note"] = (f"Referans konfigürasyon {configs[0].label} profil sınırı nedeniyle atlandı; "
-                                       f"değer {ref.cfg.label} için verildi")
+                                       f"değer {ref.label} için verildi")
         if nonrt:
             extra["warning"] = NONREALTIME_WARNING
 
@@ -355,7 +366,7 @@ class ScanSpeedMeasurement(Measurement):
         conditions.pop("fc_hz", None)                 # a sweep has no single centre frequency
         conditions.update({
             "start_hz": start, "stop_hz": stop, "span_hz": span, "fs_hz": ref.cfg.fs, "bw_hz": ref.cfg.bw,
-            "rbw_hz": sw.rbw_hz, "nfft": sw.nfft, "averages": ref.cfg.averages, "window": last.window,
+            "rbw_hz": sw.rbw_hz, "rbw_requested_hz": ref.cfg.rbw_hz, "nfft": sw.nfft, "averages": ref.cfg.averages, "window": last.window,
             "overlap": float(app.dsp.overlap), "gain_db": float(app.sweep.gain_db),
             "sweep_gain_mode": app.sweep.gain_mode, "usable_fraction": float(app.sweep.usable_fraction),
             "dc_avoid": bool(app.sweep.dc_avoid), "settle_buffers": int(dev.settle_buffers),
@@ -387,6 +398,8 @@ class ScanSpeedMeasurement(Measurement):
         )
         res = self.new_result(value, summary=summary, method=method, conditions=conditions, extra=extra,
                               uncertainty=unc)
+        if nonrt:
+            res.blockers.append(REASON_NONREALTIME)
         res.table = self._table(runs)
         res.figures = [self._breakdown_figure(runs, start, stop), self._screenshot(last, start, stop, value)]
         return res
@@ -399,7 +412,7 @@ class ScanSpeedMeasurement(Measurement):
                 n = max(s.n_steps, 1)
                 gap = (r.sweeps[k + 1].t_start_ns - s.t_end_ns) * 1e-9 if k + 1 < len(r.sweeps) else None
                 rows.append({
-                    "config": r.cfg.label, "repeat": k + 1, "fs_hz": r.cfg.fs, "rbw_hz": s.rbw_hz, "nfft": s.nfft,
+                    "config": r.label, "repeat": k + 1, "fs_hz": r.cfg.fs, "rbw_hz": s.rbw_hz, "nfft": s.nfft,
                     "averages": s.averages, "n_steps": s.n_steps, "step_hz": s.step_hz, "duration_s": s.duration_s,
                     "rate_ghz_per_s": s.rate_hz_per_s / 1e9,
                     **{f"{key}_ms": 1e3 * s.timing[f"{key}_s"] / n for key in TIMING_KEYS},
@@ -418,7 +431,7 @@ class ScanSpeedMeasurement(Measurement):
         cum = np.cumsum([[m[k] for k in TIMING_KEYS] for m in per], axis=1)      # (n_cfg, 4)
         series = [Series(x=x, y=cum[:, i].tolist(), label=TIMING_LABELS[k], style="bar")
                   for i, k in reversed(list(enumerate(TIMING_KEYS)))]
-        markers = [(xi, float(c[-1]), f"{r.cfg.label} — {c[-1]:.2f} ms/adım, {r.rate_ghz:.3f} GHz/s")
+        markers = [(xi, float(c[-1]), f"{r.label} — {c[-1]:.2f} ms/adım, {r.rate_ghz:.3f} GHz/s")
                    for xi, c, r in zip(x, cum, runs)]
         top = float(np.max(cum[:, -1])) if cum.size else 1.0
         return FigureSpec(

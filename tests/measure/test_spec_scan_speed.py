@@ -15,8 +15,10 @@ import time
 import pytest
 
 from eds.core.config import DeviceConfig, RxConfig
+from eds.core.units import fmt_hz
 from eds.hal import open_device
 from eds.measure.specs.scan_speed import NONREALTIME_WARNING, TIMING_KEYS
+from eds.measure.targets import REASON_NONREALTIME
 from eds.rx.sweep import Sweeper
 
 from .spec_fixtures_b import assert_result_contract, run_spec, single_sim_app
@@ -99,7 +101,17 @@ def test_scan_speed_configs_repeats_and_profile_skip(tmp_path):
     assert_result_contract(res, tmp_path)
     ex = res.extra
     assert res.summary.startswith(NONREALTIME_WARNING) and ex["warning"] == NONREALTIME_WARNING
+    assert REASON_NONREALTIME in res.blockers
     assert [c["fs_hz"] for c in ex["configs"]] == [20e6, 20e6, 10e6]
+    # JURY-10: every label states the RBW actually used (ENBW·fs/nfft), never the requested one
+    for c in ex["configs"]:
+        assert f"RBW {fmt_hz(c['rbw_hz'], 4)}" in c["config"] and f"N = {c['nfft']}" in c["config"]
+        assert c["rbw_hz"] < c["rbw_requested_hz"] and fmt_hz(c["rbw_requested_hz"], 4) not in c["config"]
+    assert {r["config"] for r in res.table} == {c["config"] for c in ex["configs"]}
+    assert "istenen RBW" in ex["skipped_configs"][0]["config"]
+    bars = next(f for f in res.figures if f.name == "scan_speed_step_breakdown")
+    assert [m[2].split(" — ")[0] for m in bars.markers] == [c["config"] for c in ex["configs"]]
+    assert res.conditions["rbw_hz"] == ex["rbw_hz"] and res.conditions["rbw_requested_hz"] == 50e3
     assert len(ex["skipped_configs"]) == 1 and ex["skipped_configs"][0]["fs_hz"] == 80e6
     assert "MS/s" in ex["skipped_configs"][0]["reason"]
     assert len(res.table) == 3 * 2

@@ -5,31 +5,44 @@
         DR_inst = P_max [dBFS] − N_RBW [dBFS]          (same gain, same RBW)
 
     ``N_RBW`` = noise power in one RBW with the input terminated (Gamma-median-corrected
-    median of the flat central band). ``P_max`` = the strongest *non-clipping* CW tone: the
-    tone is raised in ``lin_step_db`` steps until the capture clips (``clip_fraction > 0``) or
-    its per-rail peak reaches ``clip_peak_dbfs`` (:func:`eds.dsp.levels.iq_levels`), then the
-    last-good / first-clipping bracket is bisected down to ``bisect_db``. The stepped points
-    form the input→output linearity curve. Without a source ``DR_inst = 0 dBFS − N_RBW``
-    (full-scale CW assumed, stated in the method).
+    median of the flat central band). ``P_max`` = the strongest CW tone that neither clips
+    nor compresses: ``P_max = min(ADC clipping, input 1 dB compression)``. The tone is raised
+    in ``lin_step_db`` steps from ``max(lin_start_dbfs, N_RBW + 15 dB)`` until the capture
+    clips (``clip_fraction > 0``) or its per-rail peak reaches ``clip_peak_dbfs``
+    (:func:`eds.dsp.levels.iq_levels`), or its gain (``tone_dbfs − setting``) has dropped
+    ``compression_db`` (1 dB) below the small-signal gain of the lowest points (≥ 20 dB SNR,
+    within 10 dB of the first one); the last-good / first-limited bracket is then bisected down
+    to ``bisect_db``. The source never drives the RX port above the profile's
+    ``rx_max_input_dbm`` (absolute sources: setting cap; relative sources: cap extrapolated
+    from the linear probe reading): a search stopped by that ceiling — or by the source's
+    maximum — gives ``P_max`` as a lower bound (``≥``). The stepped points form the
+    input→output linearity curve. Without a source ``DR_inst = 0 dBFS − N_RBW`` (full-scale CW
+    assumed, stated in the method).
 
 (b) SFDR: a CW tone at ``fc + (tone_offset_frac + tone_detune_frac)·fs`` (fs/8 plus a small
     detuning so harmonics/images do not coincide) at ``sfdr_level_dbfs``; the strongest
-    component in the usable band outside the carrier main lobe (``±main_lobe_bins``) and the
-    DC notch — the IQ image and digital spurs INCLUDED — is the dominant spur::
+    *discrete line* (≥ ``spur_contrast_db`` above the median of its neighbourhood) in the usable
+    band outside the carrier's close-in region (``±max(main_lobe_bins, close_in_hz)``: LO /
+    reference phase-noise skirt, reported separately) and the DC notch — the IQ image and
+    digital spurs INCLUDED — is the dominant spur::
 
         SFDR [dBc]  = P_carrier − P_spur,      SFDR [dBFS] = 0 dBFS − P_spur
 
     The value excluding the IQ image is reported separately. Spur power = noise-corrected
-    band power (``±5`` bins); a spur less than 10 dB above the noise makes SFDR a lower bound.
+    band power (``±5`` bins); a spur less than 10 dB above the noise, or a strongest component
+    that is not a discrete line, makes SFDR a lower bound. A stimulus with its own LO (Pluto
+    TX) gets its LO placed beyond the tone (away from ``fc``) and its LO leakage / TX IQ image
+    are masked from the search and reported as source artifacts ("kaynak kaynaklı").
 
 (c) Total (gain-managed) DR::
 
         DR_total = P_in,max(G_min) [dBm] − MDS_RBW(G_max) [dBm]
 
-    ``P_in,max(G_min)`` from the same clip search at the minimum gain (in-situ / table level
-    reference), ``MDS = N_RBW(G_max) + SNR_min`` with ``SNR_min`` from the detector model
-    (:func:`eds.measure.specs.sensitivity.required_snr_db`, Pd = ``pd_target``). Without an
-    absolute reference: level-model estimate (``dBFS ≈ dBm + G − 5``), flagged in the result.
+    ``P_in,max(G_min)`` from the same search (clipping / compression / RX input ceiling) at
+    the minimum gain (in-situ / table level reference), ``MDS = N_RBW(G_max) + SNR_min`` with
+    ``SNR_min`` from the detector model (:func:`eds.measure.specs.sensitivity.required_snr_db`,
+    Pd = ``pd_target``). Without an absolute reference: level-model estimate (``dBFS ≈ dBm +
+    G − 5``, ``P_in,max`` capped at ``rx_max_input_dbm``), flagged in the result.
 
 A noise-floor-vs-gain sweep gives ``DR_inst(G) = P_max − N_RBW(G)`` over the gain range.
 """
@@ -49,7 +62,15 @@ from ...dsp.detect import usable_mask
 from ...dsp.levels import iq_levels
 from ...dsp.psd import Spectrum, spectrum_from_block
 from ..base import FigureSpec, Measurement, MeasurementResult, Series, register
-from ..common import LevelRef, base_conditions, setup_rx, spectrum_screenshot, tone, welch_len
+from ..common import (
+    LevelRef,
+    base_conditions,
+    setup_rx,
+    source_conditions,
+    spectrum_screenshot,
+    tone,
+    welch_len,
+)
 from ..stimulus import (
     LEVEL_MODEL_OFFSET_DB,
     TONE_HALFWIDTH_BINS,
@@ -67,9 +88,14 @@ from ..stimulus import (
     opt_float,
     qparam,
     reference_level,
+    relative_setting_cap,
+    rx_max_input_dbm,
     settled_capture,
+    source_artifacts,
+    source_lo_offset_hz,
     source_power_range,
     tone_band_db,
+    try_lo_offset,
     valid_bins,
 )
 from .sensitivity import (
@@ -80,26 +106,56 @@ from .sensitivity import (
 log = logging.getLogger(__name__)
 
 
+#: Linearity points at least this far above N_RBW define / are tested against the small-signal gain.
+_LIN_SNR_DB: float = 20.0
+#: Points within this range above the lowest such point form the small-signal reference.
+_LIN_REF_SPAN_DB: float = 10.0
+#: Discrete-line test of an SFDR candidate: neighbourhood ``k ± [inner, outer]`` bins.
+_LINE_CTX_BINS: tuple[int, int] = (8, 40)
+
+#: P_max criteria (TR, jury-facing).
+CLIP = "kırpma"
+COMPRESSION = "1 dB sıkışma"
+RX_CEILING = "RX giriş sınırı"
+SOURCE_MAX = "kaynak üst sınırı"
+
+
 @dataclass
 class _LinPoint:
     setting: float
-    p_in: float               # input power (result unit: dBm or dBFS-equivalent)
+    p_in: float               # input power (result unit: dBm or dBFS-equivalent; linear map of the setting)
     tone_dbfs: float          # measured tone power at the ADC (noise corrected)
     peak_dbfs: float          # per-rail time-domain peak
     clip_fraction: float
     phase: str                # "adım" | "ikiye bölme"
+    noise_dbfs: float = -math.inf   # noise per RBW of the capture
+    compression_db: float = math.nan  # small-signal gain − this point's gain (dB, > 0 = compressed)
+    limit: str = ""           # criterion this point violates: CLIP | COMPRESSION | ""
 
     @property
     def clipped(self) -> bool:
         return self.clip_fraction > 0.0
 
+    @property
+    def gain_db(self) -> float:
+        """Tone level per setting (dBFS − setting): constant in the linear regime."""
+        return self.tone_dbfs - self.setting
+
+    @property
+    def snr_db(self) -> float:
+        return self.tone_dbfs - self.noise_dbfs
+
 
 @dataclass
 class _ClipSearch:
     points: list[_LinPoint]
-    ok: _LinPoint | None      # strongest non-clipping point
-    clip: _LinPoint | None    # weakest clipping point (None: source limit reached)
-    limited: bool             # True: source maximum reached before clipping (P_max is a lower bound)
+    ok: _LinPoint | None      # strongest point without clipping / compression
+    clip: _LinPoint | None    # weakest limited point (None: ceiling / source maximum reached)
+    limited: bool             # True: stopped by the RX input ceiling / source maximum (P_max is a lower bound)
+    criterion: str = ""       # what set P_max: CLIP | COMPRESSION | RX_CEILING | SOURCE_MAX
+    small_signal_gain_db: float | None = None   # dBFS per setting of the linear regime
+    p1db_input: float | None = None             # interpolated input 1 dB compression point (result unit)
+    setting_max: float = math.inf               # highest setting the search was allowed to apply
 
 
 @register
@@ -130,6 +186,10 @@ class DynamicRangeMeasurement(Measurement):
         "quick_lin_step_db": 10.0,
         "gain_curve_step_db": 10.0,
         "quick_gain_curve_step_db": 20.0,
+        "compression_db": 1.0,         # gain drop that ends the linear range (1 dB compression)
+        "close_in_hz": 25e3,           # SFDR: carrier close-in region excluded (phase-noise skirt)
+        "spur_contrast_db": 6.0,       # SFDR: a spur must stand this far above its neighbourhood median
+        "source_lo_offset_hz": None,   # LO offset magnitude of a source with its own LO (None: the source's)
         "total": True,                 # measure the gain-managed total DR
         "pd_target": 0.9,              # Pd of the MDS used in DR_total
         "level_uncertainty_db": None,
@@ -161,6 +221,10 @@ class DynamicRangeMeasurement(Measurement):
             "lin_step_db": as_float(qparam(self, "lin_step_db"), "dynamic_range.lin_step_db", 0.5, 30.0),
             "gain_curve_step_db": as_float(qparam(self, "gain_curve_step_db"), "dynamic_range.gain_curve_step_db",
                                            1.0, 100.0),
+            "compression_db": as_float(p["compression_db"], "dynamic_range.compression_db", 0.1, 6.0),
+            "close_in_hz": as_float(p["close_in_hz"], "dynamic_range.close_in_hz", 0.0),
+            "spur_contrast_db": as_float(p["spur_contrast_db"], "dynamic_range.spur_contrast_db", 0.0, 40.0),
+            "source_lo_offset_hz": opt_float(p["source_lo_offset_hz"], "dynamic_range.source_lo_offset_hz", 1.0),
             "total": bool(p["total"]),
             "pd_target": as_float(p["pd_target"], "dynamic_range.pd_target", 0.05, 0.995),
             "level_uncertainty_db": opt_float(p["level_uncertainty_db"], "dynamic_range.level_uncertainty_db", 0.0),
@@ -222,13 +286,17 @@ class DynamicRangeMeasurement(Measurement):
         return {"per_gain": per_gain, "spec": spec_fix, "n_rbw_dbfs": per_gain[g_fix], "model": model}
 
     # ------------------------------------------------------------------ source part
-    def _input_power(self, setting: float, dbfs: float, ref: LevelRef) -> float:
+    def _input_power(self, setting: float, probe: ToneProbe, ref: LevelRef) -> float:
+        """Input power of a source setting in the result unit: the setting itself (absolute
+        source), else its *linear* image through the probe (``setting + probe.offset_db``, dBFS)
+        and the level reference — a compressed reading never understates the drive level."""
         if getattr(self.ctx.source, "absolute_power", False):
             return float(setting)
+        dbfs = float(setting) + probe.offset_db
         return dbfs + ref.offset_db if ref.calibrated else dbfs
 
     def _measure(self, dev: Any, prm: dict[str, Any], f_src: float, f_app: float, setting: float, ref: LevelRef,
-                 phase: str) -> _LinPoint:
+                 probe: ToneProbe, phase: str) -> _LinPoint:
         nfft, avg, win, ov = prm["nfft"], prm["averages"], prm["window"], prm["overlap"]
         with tone(self.ctx, f_src, setting):
             blk = settled_capture(dev, welch_len(nfft, avg, ov))
@@ -237,64 +305,126 @@ class DynamicRangeMeasurement(Measurement):
         nz = noise_mean_lin(spec, valid_bins(self.ctx.app, nfft))
         k = locate_peak(spec, f_app, known_search_hz(spec.df_hz))
         t_db = tone_band_db(spec, k, TONE_HALFWIDTH_BINS, nz)
-        return _LinPoint(setting=float(setting), p_in=self._input_power(setting, t_db, ref), tone_dbfs=t_db,
-                         peak_dbfs=lv.peak_dbfs, clip_fraction=lv.clip_fraction, phase=phase)
+        return _LinPoint(setting=float(setting), p_in=self._input_power(setting, probe, ref), tone_dbfs=t_db,
+                         peak_dbfs=lv.peak_dbfs, clip_fraction=lv.clip_fraction, phase=phase,
+                         noise_dbfs=float(db10(nz)))
 
     def _is_clip(self, pt: _LinPoint, prm: dict[str, Any]) -> bool:
         return pt.clipped or pt.peak_dbfs >= prm["clip_peak_dbfs"]
 
+    @staticmethod
+    def _small_signal_gain(pts: list[_LinPoint]) -> float | None:
+        """Median gain of the lowest stepped points (≥ 20 dB SNR, within 10 dB of the lowest)."""
+        good = [q for q in pts if q.phase == "adım" and not q.limit and q.snr_db >= _LIN_SNR_DB]
+        if not good:
+            return None
+        s0 = min(q.setting for q in good)
+        return float(np.median([q.gain_db for q in good if q.setting <= s0 + _LIN_REF_SPAN_DB]))
+
+    def _limit(self, pt: _LinPoint, prm: dict[str, Any], g_ss: float | None) -> str:
+        """Criterion ``pt`` violates (CLIP / COMPRESSION) or ''; fills ``pt.compression_db``."""
+        if g_ss is not None and pt.snr_db >= _LIN_SNR_DB:
+            pt.compression_db = g_ss - pt.gain_db
+        if self._is_clip(pt, prm):
+            return CLIP
+        if math.isfinite(pt.compression_db) and pt.compression_db >= prm["compression_db"]:
+            return COMPRESSION
+        return ""
+
     def _clip_search(self, dev: Any, prm: dict[str, Any], probe: ToneProbe, f_src: float, ref: LevelRef,
                      start_dbfs: float, step: float) -> _ClipSearch:
-        """Raise the tone from ``start_dbfs`` in ``step`` dB until it clips, then bisect."""
-        lo_src, hi_src = source_power_range(self.ctx.source)
+        """Raise the tone from ``start_dbfs`` in ``step`` dB until it clips or compresses by
+        ``compression_db`` (never above the RX input ceiling), then bisect the bracket."""
+        ctx = self.ctx
+        lo_src, hi_raw = source_power_range(ctx.source)
+        hi_src = source_power_range(ctx.source, dev)[1]
+        hi = min(hi_src, relative_setting_cap(ctx, dev, probe.setting, probe.level_dbfs, ref))
+        hi = max(hi, lo_src)
+        ceiling = hi < hi_raw - 1e-9
         f_app = probe.f_app_hz
-        s = float(np.clip(probe.setting + (start_dbfs - probe.level_dbfs), lo_src, hi_src))
+        s = float(np.clip(probe.setting + (start_dbfs - probe.level_dbfs), lo_src, hi))
         pts: list[_LinPoint] = []
         ok: _LinPoint | None = None
-        clip: _LinPoint | None = None
+        lim: _LinPoint | None = None
         while True:
-            pt = self._measure(dev, prm, f_src, f_app, s, ref, "adım")
+            pt = self._measure(dev, prm, f_src, f_app, s, ref, probe, "adım")
+            pt.limit = self._limit(pt, prm, self._small_signal_gain(pts))
             pts.append(pt)
-            if self._is_clip(pt, prm):
-                clip = pt
+            if pt.limit:
+                lim = pt
                 break
             ok = pt
-            if s >= hi_src:
+            if s >= hi:
                 break
-            s = min(hi_src, s + step)
-        if clip is not None and ok is None:
-            raise MeasurementError(f"Ton başlangıç seviyesinde ({start_dbfs:.0f} dBFS hedef) bile kırpıyor")
-        while clip is not None and ok is not None and clip.setting - ok.setting > prm["bisect_db"]:
-            mid = 0.5 * (ok.setting + clip.setting)
-            pt = self._measure(dev, prm, f_src, f_app, mid, ref, "ikiye bölme")
+            s = min(hi, s + step)
+        if lim is not None and ok is None:
+            raise MeasurementError(f"Ton başlangıç seviyesinde ({start_dbfs:.0f} dBFS hedef) bile kırpıyor/sıkışıyor")
+        g_ss = self._small_signal_gain(pts)
+        while lim is not None and ok is not None and lim.setting - ok.setting > prm["bisect_db"]:
+            mid = 0.5 * (ok.setting + lim.setting)
+            pt = self._measure(dev, prm, f_src, f_app, mid, ref, probe, "ikiye bölme")
+            pt.limit = self._limit(pt, prm, g_ss)
             pts.append(pt)
-            if self._is_clip(pt, prm):
-                clip = pt
+            if pt.limit:
+                lim = pt
             else:
                 ok = pt
+        for q in pts:                     # compression of every point against the final reference
+            if g_ss is not None and q.snr_db >= _LIN_SNR_DB:
+                q.compression_db = g_ss - q.gain_db
         pts.sort(key=lambda q: q.setting)
-        return _ClipSearch(points=pts, ok=ok, clip=clip, limited=clip is None)
+        if lim is not None:
+            criterion = lim.limit
+        else:
+            criterion = RX_CEILING if ceiling else SOURCE_MAX
+        p1db = None
+        if lim is not None and ok is not None and lim.limit == COMPRESSION and math.isfinite(ok.compression_db):
+            c0, c1 = ok.compression_db, lim.compression_db
+            frac = (prm["compression_db"] - c0) / (c1 - c0) if c1 > c0 else 0.0
+            s1 = ok.setting + float(np.clip(frac, 0.0, 1.0)) * (lim.setting - ok.setting)
+            p1db = self._input_power(s1, probe, ref)
+        return _ClipSearch(points=pts, ok=ok, clip=lim, limited=lim is None, criterion=criterion,
+                           small_signal_gain_db=g_ss, p1db_input=p1db, setting_max=hi)
 
     def _with_source(self, dev: Any, prm: dict[str, Any], out: dict[str, Any]) -> None:
         ctx = self.ctx
+        src = ctx.source
         nfft, avg, win, ov = prm["nfft"], prm["averages"], prm["window"], prm["overlap"]
         fs, fc = float(dev.fs), float(dev.fc)
         ref: LevelRef = out["ref"]
         n_rbw = out["noise"]["n_rbw_dbfs"]
         f_src = fc + prm["tone_frac"] * fs
-        probe = adjust_tone(ctx, dev, f_src, -30.0, nfft=nfft, averages=avg, window=win, overlap=ov, ref=ref,
-                            tol_db=2.0)
-        start = max(prm["lin_start_dbfs"], n_rbw + 15.0)
-        cs = self._clip_search(dev, prm, probe, f_src, ref, start, prm["lin_step_db"])
-        out["probe"], out["clip_search"] = probe, cs
-        # SFDR at sfdr_level_dbfs (re-uses the probe spectrum of the adjusted tone)
-        sp = adjust_tone(ctx, dev, f_src, prm["sfdr_level_dbfs"], nfft=nfft, averages=avg, window=win, overlap=ov,
-                         setting=probe.setting + (prm["sfdr_level_dbfs"] - probe.level_dbfs), tol_db=0.5,
-                         search_hz=known_search_hz(fs / nfft), f_expected=probe.f_app_hz)
-        out["sfdr"] = self._sfdr(sp, prm)
-        out["sfdr_probe"] = sp
+        # a source with its own LO (Pluto TX): LO beyond the tone, away from fc, so the LO
+        # leakage and the TX IQ image sit on the far side of the carrier (masked in the SFDR)
+        lo0 = source_lo_offset_hz(src)
+        if lo0 is not None:
+            mag = abs(prm["source_lo_offset_hz"] if prm["source_lo_offset_hz"] is not None else lo0)
+            try:
+                out["source_lo_offset_hz"] = try_lo_offset(src, -math.copysign(mag, prm["tone_frac"]))
+            except ConfigError as e:
+                log.warning("Kaynak LO ofseti ayarlanamadı (%s); kaynak artefaktları yalnızca maskelenecek", e)
+        try:
+            probe = adjust_tone(ctx, dev, f_src, -30.0, nfft=nfft, averages=avg, window=win, overlap=ov, ref=ref,
+                                tol_db=2.0)
+            start = max(prm["lin_start_dbfs"], n_rbw + 15.0)
+            cs = self._clip_search(dev, prm, probe, f_src, ref, start, prm["lin_step_db"])
+            out["probe"], out["clip_search"] = probe, cs
+            # SFDR at sfdr_level_dbfs (re-uses the probe spectrum of the adjusted tone)
+            sp = adjust_tone(ctx, dev, f_src, prm["sfdr_level_dbfs"], nfft=nfft, averages=avg, window=win,
+                             overlap=ov, setting=probe.setting + (prm["sfdr_level_dbfs"] - probe.level_dbfs),
+                             tol_db=0.5, search_hz=known_search_hz(fs / nfft), f_expected=probe.f_app_hz)
+            arts = source_artifacts(src, probe.e)
+            out["sfdr"] = self._sfdr(sp, prm, arts)
+            out["sfdr_probe"] = sp
+        finally:
+            if lo0 is not None and "source_lo_offset_hz" in out:
+                try:
+                    try_lo_offset(src, lo0)          # leave the source as it was configured
+                except Exception as e:  # noqa: BLE001 - restoring is best effort
+                    log.warning("Kaynak LO ofseti geri yüklenemedi: %s", e)
 
-    def _sfdr(self, pr: ToneProbe, prm: dict[str, Any]) -> dict[str, Any]:
+    def _sfdr(self, pr: ToneProbe, prm: dict[str, Any], artifacts: list[tuple[float, str]] | None = None
+              ) -> dict[str, Any]:
         spec = pr.spec
         app = self.ctx.app
         n = spec.n_bins
@@ -307,26 +437,64 @@ class DynamicRangeMeasurement(Measurement):
         f_img = 2.0 * spec.fc - float(spec.f_hz[kc])
         k_img = nearest_bin(spec, f_img)
         ml = prm["main_lobe_bins"]
+        close = max(ml, int(math.ceil(prm["close_in_hz"] / spec.df_hz)))
+        guard = TONE_HALFWIDTH_BINS + 2
+        # stimulus artifacts (LO leakage / TX image of a Pluto TX): masked, reported separately
+        art_rows: list[dict[str, Any]] = []
+        art_mask = np.zeros(n, dtype=bool)
+        f_lo, f_hi = float(spec.f_hz[0]), float(spec.f_hz[-1])
+        for f_a, label in artifacts or []:
+            if not f_lo <= f_a <= f_hi:
+                continue
+            ka = nearest_bin(spec, f_a)
+            art_mask |= np.abs(k - ka) <= guard
+            lvl = tone_band_db(spec, ka, TONE_HALFWIDTH_BINS, nz)
+            art_rows.append({"f_hz": float(f_a), "label": label, "level_dbfs": lvl, "dbc": lvl - carrier,
+                             "overlaps_image": bool(abs(ka - k_img) <= guard)})
+        lo_ctx, hi_ctx = _LINE_CTX_BINS
+        contrast = float(10.0 ** (prm["spur_contrast_db"] / 10.0))
+        clean = valid & ~art_mask & (np.abs(k - kc) > close)
+
+        def is_line(ks: int) -> bool:
+            """Discrete line: ≥ spur_contrast_db above the median of its clean neighbourhood."""
+            idx = np.r_[max(0, ks - hi_ctx):max(0, ks - lo_ctx + 1), min(n, ks + lo_ctx):min(n, ks + hi_ctx + 1)]
+            idx = idx[clean[idx]]
+            if idx.size < 8:
+                return True                       # no clean neighbourhood: cannot tell, accept
+            return bool(spec.p_lin[ks] >= contrast * float(np.median(spec.p_lin[idx])))
 
         def strongest(mask: np.ndarray) -> dict[str, Any]:
             idx = np.flatnonzero(mask)
             if idx.size == 0:
                 raise MeasurementError("SFDR arama bölgesi boş (bant/ana lob ayarlarını kontrol edin)")
-            ks = int(idx[np.argmax(spec.p_lin[idx])])
+            p = spec.p_lin
+            inner = idx[(idx > 0) & (idx < n - 1)]
+            peaks = inner[(p[inner] >= p[inner - 1]) & (p[inner] >= p[inner + 1])]
+            ks, discrete = int(idx[np.argmax(p[idx])]), False
+            for kk in peaks[np.argsort(p[peaks])[::-1]][:256]:
+                if is_line(int(kk)):
+                    ks, discrete = int(kk), True
+                    break
             peak_db = float(spec.p_db[ks])
-            limited = peak_db - nz_db < VISIBLE_SNR_DB
-            level = peak_db if limited else tone_band_db(spec, ks, TONE_HALFWIDTH_BINS, nz)
-            return {"k": ks, "f_hz": float(spec.f_hz[ks]), "level_dbfs": level, "noise_limited": bool(limited),
+            weak = peak_db - nz_db < VISIBLE_SNR_DB
+            level = peak_db if (weak or not discrete) else tone_band_db(spec, ks, TONE_HALFWIDTH_BINS, nz)
+            return {"k": ks, "f_hz": float(spec.f_hz[ks]), "level_dbfs": level,
+                    "noise_limited": bool(weak or not discrete), "discrete": bool(discrete),
                     "is_image": abs(ks - k_img) <= 2}
 
-        search = valid & (np.abs(k - kc) > ml)
+        search = valid & (np.abs(k - kc) > close) & ~art_mask
         s_all = strongest(search)
         s_ex = strongest(search & (np.abs(k - k_img) > ml))
         img_level = tone_band_db(spec, k_img, TONE_HALFWIDTH_BINS, nz)
+        ring = valid & (np.abs(k - kc) > ml) & (np.abs(k - kc) <= close)
+        close_in = float(np.max(spec.p_db[ring])) if np.any(ring) else math.nan
         return {"carrier_dbfs": carrier, "f_carrier_hz": float(spec.f_hz[kc]), "f_image_hz": f_img,
                 "image_dbfs": img_level, "spur": s_all, "spur_ex_image": s_ex, "noise_bin_dbfs": nz_db,
                 "sfdr_dbc": carrier - s_all["level_dbfs"], "sfdr_dbfs": -s_all["level_dbfs"],
-                "sfdr_ex_image_dbc": carrier - s_ex["level_dbfs"], "spec": spec}
+                "sfdr_ex_image_dbc": carrier - s_ex["level_dbfs"], "spec": spec,
+                "close_in_bins": close, "close_in_hz": close * spec.df_hz,
+                "close_in_max_dbc": close_in - carrier if math.isfinite(close_in) else math.nan,
+                "source_artifacts": art_rows}
 
     # ------------------------------------------------------------------ total DR
     def _total(self, dev: Any, prm: dict[str, Any], out: dict[str, Any]) -> None:
@@ -337,7 +505,9 @@ class DynamicRangeMeasurement(Measurement):
         model = noise["model"]
         snr_req = required_snr_db(prm["pd_target"], model.alpha, model.n_eff)
         n_max = noise["per_gain"][g_max]
-        tot: dict[str, Any] = {"snr_req_db": snr_req, "g_min": g_min, "g_max": g_max, "n_rbw_gmax_dbfs": n_max}
+        cap = rx_max_input_dbm(dev)
+        tot: dict[str, Any] = {"snr_req_db": snr_req, "g_min": g_min, "g_max": g_max, "n_rbw_gmax_dbfs": n_max,
+                               "rx_max_input_dbm": cap}
         table = getattr(ctx.cal, "power", None) if ctx.cal is not None else None
         absolute = ctx.source is not None and getattr(ctx.source, "absolute_power", False)
         if ctx.source is not None and (absolute or table is not None):
@@ -346,11 +516,14 @@ class DynamicRangeMeasurement(Measurement):
                     dev.set_gain(g_max)
                     ref_max = reference_level(ctx, dev, prm["fc"], nfft=nfft, averages=avg, window=win, overlap=ov)
                     dev.set_gain(g_min)
-                    ref_min = reference_level(ctx, dev, prm["fc"], nfft=nfft, averages=avg, window=win, overlap=ov)
+                    # probe well inside the linear range: the front end compresses first at minimum gain
+                    ref_min = reference_level(ctx, dev, prm["fc"], nfft=nfft, averages=avg, window=win, overlap=ov,
+                                              probe_dbfs=-40.0)
                     f_src = float(dev.fc) + prm["tone_frac"] * float(dev.fs)
-                    probe = adjust_tone(ctx, dev, f_src, -20.0, nfft=nfft, averages=avg, window=win, overlap=ov,
+                    probe = adjust_tone(ctx, dev, f_src, -40.0, nfft=nfft, averages=avg, window=win, overlap=ov,
                                         ref=ref_min, tol_db=2.0)
-                    cs = self._clip_search(dev, prm, probe, f_src, ref_min, -20.0, prm["lin_step_db"])
+                    start = max(prm["lin_start_dbfs"], noise["per_gain"].get(g_min, -200.0) + 15.0)
+                    cs = self._clip_search(dev, prm, probe, f_src, ref_min, start, prm["lin_step_db"])
             finally:
                 ctx.source.set_enabled(False)
             if cs.ok is None:
@@ -358,23 +531,26 @@ class DynamicRangeMeasurement(Measurement):
             p_max_in = cs.ok.p_in
             mds = n_max + ref_max.offset_db + snr_req
             tot.update({"method": "ölçüm", "p_max_in_gmin_dbm": p_max_in, "mds_gmax_dbm": mds,
-                        "dr_total_db": p_max_in - mds, "lower_bound": cs.limited,
-                        "ref_gmin": ref_min.method, "ref_gmax": ref_max.method})
-        elif table is not None:
-            off_min = float(table.offset_db(prm["fc"], g_min))
-            off_max = float(table.offset_db(prm["fc"], g_max))
-            p_max_in = 0.0 + off_min
-            mds = n_max + off_max + snr_req
-            tot.update({"method": "kalibrasyon tablosu (P_max = 0 dBFS varsayımı)", "p_max_in_gmin_dbm": p_max_in,
-                        "mds_gmax_dbm": mds, "dr_total_db": p_max_in - mds, "lower_bound": False})
+                        "dr_total_db": p_max_in - mds, "lower_bound": cs.limited, "criterion": cs.criterion,
+                        "p1db_input_gmin_dbm": cs.p1db_input, "ref_gmin": ref_min.method, "ref_gmax": ref_max.method,
+                        "points_gmin": [{"p_in": q.p_in, "tone_dbfs": q.tone_dbfs, "compression_db": q.compression_db,
+                                         "limit": q.limit, "phase": q.phase} for q in cs.points]})
         else:
-            off_min = -(g_min + LEVEL_MODEL_OFFSET_DB)
-            off_max = -(g_max + LEVEL_MODEL_OFFSET_DB)
-            p_max_in = 0.0 + off_min
+            if table is not None:
+                off_min = float(table.offset_db(prm["fc"], g_min))
+                off_max = float(table.offset_db(prm["fc"], g_max))
+                method = "kalibrasyon tablosu (P_max = 0 dBFS varsayımı)"
+            else:
+                off_min = -(g_min + LEVEL_MODEL_OFFSET_DB)
+                off_max = -(g_max + LEVEL_MODEL_OFFSET_DB)
+                method = "seviye modeli tahmini (dBFS ≈ dBm + G − 5; mutlak referans yok)"
+            p_full = 0.0 + off_min
+            p_max_in = min(p_full, cap)        # no RF compression model: never beyond the rated input
             mds = n_max + off_max + snr_req
-            tot.update({"method": "seviye modeli tahmini (dBFS ≈ dBm + G − 5; mutlak referans yok)",
-                        "p_max_in_gmin_dbm": p_max_in, "mds_gmax_dbm": mds, "dr_total_db": p_max_in - mds,
-                        "lower_bound": False, "estimate": True})
+            tot.update({"method": method, "p_max_in_gmin_dbm": p_max_in, "mds_gmax_dbm": mds,
+                        "dr_total_db": p_max_in - mds, "lower_bound": False, "estimate": table is None,
+                        "criterion": RX_CEILING if p_full > cap else "0 dBFS varsayımı",
+                        "p_full_scale_gmin_dbm": p_full})
         out["total"] = tot
 
     # ------------------------------------------------------------------ result
@@ -393,9 +569,11 @@ class DynamicRangeMeasurement(Measurement):
         if cs is not None and cs.ok is not None:
             p_max = cs.ok.tone_dbfs
             dr_inst = p_max - n_rbw
-            pmax_src = "ölçüldü"
+            pmax_src = f"ölçüldü ({cs.criterion})"
             if cs.limited:
-                notes.append("kaynak en yüksek gücünde kırpma görülmedi — DR_anlık alt sınırdır (≥)")
+                why = (f"RX giriş sınırına ({rx_max_input_dbm(dev):g} dBm)" if cs.criterion == RX_CEILING
+                       else "kaynağın en yüksek gücüne")
+                notes.append(f"{why} kadar kırpma/sıkışma görülmedi — DR_anlık alt sınırdır (≥)")
             uncertainty = prm["bisect_db"]
         else:
             p_max = 0.0
@@ -412,9 +590,14 @@ class DynamicRangeMeasurement(Measurement):
             extra["noise_rbw_dbm"] = n_rbw + ref.offset_db
         if cs is not None and cs.ok is not None:
             extra.update({"clip_input": cs.ok.p_in, "clip_input_unit": unit_in, "clip_peak_dbfs": cs.ok.peak_dbfs,
-                          "p_max_lower_bound": cs.limited})
+                          "p_max_lower_bound": cs.limited, "p_max_criterion": cs.criterion,
+                          "value_bound": "lower" if cs.limited else "",
+                          "p_max_input": cs.ok.p_in, "compression_at_p_max_db": cs.ok.compression_db,
+                          "small_signal_gain_db": cs.small_signal_gain_db})
             if cs.clip is not None:
                 extra["first_clip_input"] = cs.clip.p_in
+            if cs.p1db_input is not None:
+                extra["p1db_input"] = cs.p1db_input
         if sf is not None:
             spur, spur_ex = sf["spur"], sf["spur_ex_image"]
             extra.update({
@@ -424,47 +607,77 @@ class DynamicRangeMeasurement(Measurement):
                 "dominant_spur_is_image": spur["is_image"], "sfdr_noise_limited": spur["noise_limited"],
                 "image_dbfs": sf["image_dbfs"], "f_image_hz": sf["f_image_hz"],
                 "spur_ex_image_hz": spur_ex["f_hz"], "spur_ex_image_dbfs": spur_ex["level_dbfs"],
+                "dominant_spur_discrete": spur["discrete"], "close_in_excluded_hz": sf["close_in_hz"],
+                "close_in_max_dbc": sf["close_in_max_dbc"], "source_artifacts": sf["source_artifacts"],
             })
+            if out.get("source_lo_offset_hz") is not None:
+                extra["source_lo_offset_hz"] = out["source_lo_offset_hz"]
+            if any(a["overlaps_image"] for a in sf["source_artifacts"]):
+                notes.append("kaynak artefaktı IQ imajıyla çakışıyor — imaj seviyesi kaynak kaynaklı olabilir")
         else:
             notes.append("kaynak yok — SFDR ölçülemedi")
         if tot is not None:
             extra.update({"dr_total_db": tot["dr_total_db"], "dr_total_method": tot["method"],
                           "dr_total_lower_bound": tot["lower_bound"], "p_max_in_gmin_dbm": tot["p_max_in_gmin_dbm"],
                           "mds_gmax_dbm": tot["mds_gmax_dbm"], "snr_req_db": tot["snr_req_db"],
-                          "gain_min_db": tot["g_min"], "gain_max_db": tot["g_max"]})
+                          "gain_min_db": tot["g_min"], "gain_max_db": tot["g_max"],
+                          "p_max_gmin_criterion": tot["criterion"], "rx_max_input_dbm": tot["rx_max_input_dbm"]})
+            if tot.get("p1db_input_gmin_dbm") is not None:
+                extra["p1db_input_gmin_dbm"] = tot["p1db_input_gmin_dbm"]
             if tot.get("estimate"):
                 notes.append("DR_toplam seviye modeli tahminidir (mutlak referans yok)")
+            if tot["criterion"] == RX_CEILING:
+                notes.append(f"en düşük kazançta P_max RX giriş sınırıyla ({tot['rx_max_input_dbm']:g} dBm) "
+                             "sınırlandı" + (" — DR_toplam alt sınırdır (≥)" if tot["lower_bound"] else ""))
         if u_ref is not None:
             extra["level_uncertainty_db"] = u_ref
-        src = ctx.source
         conditions = base_conditions(
             dev, spec_n, averages=prm["averages"], noise_averages=prm["noise_averages"], gain_fixed_db=out["g_fix"],
-            source=getattr(src, "name", "yok") if src is not None else "yok", level_ref=ref.method,
-            calibrated=ref.calibrated, clip_criterion=f"clip_fraction > 0 veya tepe ≥ {prm['clip_peak_dbfs']:g} dBFS",
+            level_ref=ref.method, calibrated=ref.calibrated,
+            clip_criterion=f"clip_fraction > 0 veya tepe ≥ {prm['clip_peak_dbfs']:g} dBFS",
+            compression_criterion=f"küçük sinyal kazancından ≥ {prm['compression_db']:g} dB düşüş",
+            rx_max_input_dbm=rx_max_input_dbm(dev),
             sfdr_level_dbfs=prm["sfdr_level_dbfs"], main_lobe_bins=prm["main_lobe_bins"],
+            close_in_hz=prm["close_in_hz"], spur_contrast_db=prm["spur_contrast_db"], **source_conditions(ctx),
         )
         conditions["averages"] = prm["averages"]
         rbw = spec_n.rbw_hz
-        parts = [f"DR_anlık {dr_inst:.1f} dB (G = {out['g_fix']:g} dB, RBW {fmt_hz(rbw, 4)}, {fmt_hz(prm['fc'])}, "
-                 f"fs {fmt_hz(prm['fs'])}; P_max {p_max:.1f} dBFS, N_RBW {n_rbw:.1f} dBFS)"]
+        crit = f"; {cs.criterion}" if cs is not None and cs.ok is not None else ""
+        lb_inst = "≥ " if cs is not None and cs.ok is not None and cs.limited else ""
+        parts = [f"DR_anlık {lb_inst}{dr_inst:.1f} dB (G = {out['g_fix']:g} dB, RBW {fmt_hz(rbw, 4)}, "
+                 f"{fmt_hz(prm['fc'])}, fs {fmt_hz(prm['fs'])}; P_max {p_max:.1f} dBFS{crit}, N_RBW {n_rbw:.1f} dBFS)"]
         if sf is not None:
             what = "imaj" if sf["spur"]["is_image"] else "spur"
             bound = "≥ " if sf["spur"]["noise_limited"] else ""
+            bound_ex = "≥ " if sf["spur_ex_image"]["noise_limited"] else ""
             parts.append(f"SFDR {bound}{sf['sfdr_dbc']:.1f} dBc / {bound}{sf['sfdr_dbfs']:.1f} dBFS "
                          f"(baskın {what} {fmt_hz(sf['spur']['f_hz'] - prm['fc'])} ofsette; imaj hariç "
-                         f"{sf['sfdr_ex_image_dbc']:.1f} dBc)")
+                         f"{bound_ex}{sf['sfdr_ex_image_dbc']:.1f} dBc; taşıyıcının ±{fmt_hz(sf['close_in_hz'], 3)} "
+                         "yakını hariç)")
+            if sf["source_artifacts"]:
+                worst = max(sf["source_artifacts"], key=lambda a: a["dbc"])
+                parts.append(f"kaynak kaynaklı artefaktlar SFDR dışı (en güçlü: {worst['label']} {worst['dbc']:.1f} dBc)")
         if tot is not None:
             lb = "≥ " if tot["lower_bound"] else ""
             parts.append(f"DR_toplam {lb}{tot['dr_total_db']:.1f} dB (G {tot['g_min']:g}…{tot['g_max']:g} dB)")
         summary = "; ".join(parts + notes)
+        cap = rx_max_input_dbm(dev)
+        cap_txt = f"{cap:g} dBm" if math.isfinite(cap) else "profilde tanımsız"
         method = (
             "Sabit kazançta giriş sonlandırılarak RBW'deki gürültü N_RBW (merkez bant, Gamma-medyan düzeltmeli) "
             "ölçülür; ton adım adım yükseltilip IQ örneklerinde kırpma (clip_fraction > 0) ya da tepe ≥ "
-            f"{prm['clip_peak_dbfs']:g} dBFS görülene kadar artırılır, son kırpmasız/ilk kırpan aralığı "
-            f"{prm['bisect_db']:g} dB'ye ikiye bölünür: DR_anlık = P_max − N_RBW. SFDR, fs/8 + küçük ofsetteki "
-            f"{prm['sfdr_level_dbfs']:g} dBFS tonla kullanılabilir bantta ana lob (±{prm['main_lobe_bins']} bin) ve "
-            "DC çentiği dışındaki en güçlü bileşene (IQ imajı ve spur'lar dahil) göre verilir. DR_toplam = en düşük "
-            "kazançta kırpmasız giriş (dBm) − en yüksek kazançta MDS(RBW) (CFAR modelinden SNR_min).")
+            f"{prm['clip_peak_dbfs']:g} dBFS ya da kazancın en düşük noktalardaki küçük sinyal kazancından "
+            f"{prm['compression_db']:g} dB düşmesi (1 dB sıkışma) görülene kadar artırılır, son sağlam/ilk sınırlı "
+            f"aralık {prm['bisect_db']:g} dB'ye ikiye bölünür: P_max = min(kırpma, P1dB), DR_anlık = P_max − N_RBW. "
+            f"Kaynak RX girişini hiçbir zaman profilin rx_max_input_dbm sınırının ({cap_txt}) üstüne sürmez; arama bu "
+            "sınırda ya da kaynağın en yüksek gücünde durursa P_max alt sınırdır (≥). SFDR, fs/8 + küçük ofsetteki "
+            f"{prm['sfdr_level_dbfs']:g} dBFS tonla kullanılabilir bantta taşıyıcının yakın bölgesi (±max("
+            f"{prm['main_lobe_bins']} bin, {fmt_hz(prm['close_in_hz'], 3)}): LO/referans faz gürültüsü eteği, ayrıca "
+            "raporlanır) ve DC çentiği dışındaki en güçlü ayrık çizgiye (komşu bin medyanının ≥ "
+            f"{prm['spur_contrast_db']:g} dB üstü; IQ imajı ve spur'lar dahil) göre verilir; kendi LO'su olan kaynağın "
+            "(Pluto TX) LO kaçağı ve TX imajı aramadan çıkarılıp 'kaynak kaynaklı' olarak ayrıca verilir. "
+            "DR_toplam = en düşük kazançta aynı aramayla bulunan P_max girişi (dBm) − en yüksek kazançta MDS(RBW) "
+            "(CFAR modelinden SNR_min).")
         if cs is None:
             method += " Kaynak yok: DR_anlık = 0 dBFS (tam ölçekli CW varsayımı) − N_RBW."
         res = self.new_result(float(dr_inst), summary=summary, method=method, conditions=conditions, extra=extra,
@@ -480,7 +693,14 @@ class DynamicRangeMeasurement(Measurement):
             for pt in cs.points:
                 rows.append({"bölüm": "doğrusallık", "p_in": pt.p_in, "unit": unit_in, "setting": pt.setting,
                              "tone_dbfs": pt.tone_dbfs, "peak_dbfs": pt.peak_dbfs, "clip_fraction": pt.clip_fraction,
-                             "clipped": self._is_clip(pt, prm), "phase": pt.phase})
+                             "clipped": self._is_clip(pt, prm), "compression_db": pt.compression_db,
+                             "limit": pt.limit, "phase": pt.phase})
+        tot = out.get("total")
+        if tot is not None:
+            for q in tot.get("points_gmin", []):
+                rows.append({"bölüm": "doğrusallık (G_min)", "p_in": q["p_in"], "unit": "dBm", "tone_dbfs": q["tone_dbfs"],
+                             "compression_db": q["compression_db"], "limit": q["limit"], "phase": q["phase"],
+                             "gain_db": tot["g_min"]})
         p_max = cs.ok.tone_dbfs if cs is not None and cs.ok is not None else 0.0
         for g, nv in sorted(out["noise"]["per_gain"].items()):
             rows.append({"bölüm": "gürültü-kazanç", "gain_db": g, "noise_rbw_dbfs": nv, "dr_inst_db": p_max - nv})
@@ -505,9 +725,13 @@ class DynamicRangeMeasurement(Measurement):
             if clipped:
                 series.append(Series(x=[p.p_in for p in clipped], y=[p.tone_dbfs for p in clipped],
                                      label="Kırpma", style="marker"))
+            compressed = [p for p in pts if p.limit == COMPRESSION]
+            if compressed:
+                series.append(Series(x=[p.p_in for p in compressed], y=[p.tone_dbfs for p in compressed],
+                                     label=f"≥ {prm['compression_db']:g} dB sıkışma", style="marker"))
             markers = []
             if cs.ok is not None:
-                markers.append((cs.ok.p_in, cs.ok.tone_dbfs, f"P_max {cs.ok.tone_dbfs:.1f} dBFS"))
+                markers.append((cs.ok.p_in, cs.ok.tone_dbfs, f"P_max {cs.ok.tone_dbfs:.1f} dBFS ({cs.criterion})"))
             figs.append(FigureSpec(
                 name="dynamic_range_linearity", title=f"Giriş–çıkış doğrusallığı (G = {out['g_fix']:g} dB)", kind="xy",
                 series=series, xlabel=f"Giriş gücü [{unit_in}]", ylabel="Çıkış (ton gücü) [dBFS]",

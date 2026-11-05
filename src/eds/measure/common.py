@@ -7,10 +7,19 @@ Level referencing order (:func:`level_reference`):
 2. Absolute stimulus available (sim source, SCPI generator, anchored Pluto TX) →
    *in-situ* reference: inject a tone of known power, ``offset = P_in − P_meas(dBFS)``.
 3. Neither → offset 0, results stay in dBFS and are flagged ``calibrated = False``.
+
+Stimulus timing (:func:`stimulus_changed`): a source call returns before the new RF output
+reaches the DUT (Pluto TX: the samples already queued in the libiio TX buffers still play,
+``≈ 5 × buffer_len / fs``; a lab generator: synthesizer / level settling). Every stimulus
+change therefore waits :func:`source_settle_s` of wall-clock time and only then flags the
+RX's stale buffers as settling: the discarded ``settle_samples`` cover the whole RX
+FIFO, so every later sample was taken after the wait.
 """
 
 from __future__ import annotations
 
+import math
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -61,18 +70,80 @@ def tone_power_db(spec, f_hz: float, halfwidth_hz: float | None = None) -> float
     return float(spec.band_power_db(f_hz - hw, f_hz + hw))
 
 
+#: Added to a source's own queue-latency estimate (USB transfer / host scheduling jitter), s.
+SOURCE_SETTLE_MARGIN_S: float = 0.005
+#: Settling of a networked lab generator without its own estimate (``*OPC?`` returns when the
+#: command is processed; synthesizer / ALC settling after that is typically a few ms), s.
+SCPI_SETTLE_S: float = 0.010
+#: The Pluto TX estimate (``estimated_queue_latency_s``) counts the 4 libiio kernel buffers;
+#: SoapyPlutoSDR's own staging buffer comes on top: (4 + 1) / 4.
+QUEUE_LATENCY_FACTOR: float = 1.25
+
+
+def _num_attr(obj: Any, name: str) -> float | None:
+    """Finite, non-negative numeric attribute (``None`` if absent / not a number / unreadable)."""
+    try:
+        v = getattr(obj, name, None)
+    except Exception:  # noqa: BLE001 - remote proxies may fail on attribute access
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float, np.integer, np.floating)):
+        return None
+    v = float(v)
+    return v if math.isfinite(v) and v >= 0.0 else None
+
+
+def source_settle_s(src: Any) -> float:
+    """Wall-clock time from the return of a stimulus call (on/off, frequency, level) until
+    the new RF output is at the DUT.
+
+    * ``src.settle_s`` when the source states it (preferred),
+    * else ``src.estimated_queue_latency_s`` (Pluto TX: libiio TX queue) ×
+      :data:`QUEUE_LATENCY_FACTOR` + :data:`SOURCE_SETTLE_MARGIN_S`,
+    * else :data:`SCPI_SETTLE_S` for an SCPI generator, 0 otherwise (simulator: immediate;
+      manual source: the operator confirms every step).
+    """
+    if src is None:
+        return 0.0
+    v = _num_attr(src, "settle_s")
+    if v is not None:
+        return v
+    q = _num_attr(src, "estimated_queue_latency_s")
+    if q is not None:
+        return QUEUE_LATENCY_FACTOR * q + SOURCE_SETTLE_MARGIN_S
+    if str(getattr(src, "name", "")) == "scpi":
+        return SCPI_SETTLE_S
+    return 0.0
+
+
+def stimulus_changed(ctx: MeasurementContext, settle_s: float | None = None) -> float:
+    """Call after every stimulus change (on/off, frequency, level, tones): wait until the new
+    RF output has reached the DUT (``settle_s``, default :func:`source_settle_s`), then flag
+    the RX's stale buffers as settling. The ``settle_samples`` discarded by the next capture
+    cover the whole RX FIFO, so every captured sample was taken after the wait (hardware
+    and the real-time simulator alike). Returns the wait in seconds."""
+    s = source_settle_s(ctx.source) if settle_s is None else max(0.0, float(settle_s))
+    if s > 0.0:
+        time.sleep(s)
+    for d in ctx.devices:
+        d.mark_settling()
+    return s
+
+
 @contextmanager
 def tone(ctx: MeasurementContext, f_hz: float, power: float) -> Iterator[Any]:
-    """Enable the stimulus at ``f_hz``/``power`` for the duration of the block."""
+    """Enable the stimulus at ``f_hz``/``power`` for the duration of the block.
+
+    On entry the RF output has settled (:func:`stimulus_changed`), so a capture inside the
+    block holds only samples of the new stimulus. On exit the source is switched off; a
+    capture that needs the source *off* (not merely disconnected) calls
+    :func:`stimulus_changed` itself."""
     src = ctx.source
     if src is None:
         raise MeasurementError("Bu adım sinyal kaynağı gerektiriyor")
     src.set_frequency(f_hz)
     src.set_power(power)
     src.set_enabled(True)
-    # samples already queued in the driver/kernel buffers predate the switch
-    for d in ctx.devices:
-        d.mark_settling()
+    stimulus_changed(ctx)
     try:
         yield src
     finally:
@@ -87,6 +158,7 @@ class LevelRef:
     method: str               # human readable (TR)
     calibrated: bool
     unit: str                 # "dBm" | "dBFS"
+    setting: float | None = None   # in-situ: source setting of the probe tone (level-uncertainty budget)
 
 
 def level_reference(ctx: MeasurementContext, dev, f_hz: float, gain_db: float, *,
@@ -130,6 +202,16 @@ def base_conditions(dev, spec=None, **extra: Any) -> dict[str, Any]:
                   "window": spec.window})
     d.update(extra)
     return d
+
+
+def source_conditions(ctx: MeasurementContext) -> dict[str, Any]:
+    """Stimulus block of the conditions: source name, absolute/relative level and the settle
+    time waited after every stimulus change (:func:`source_settle_s`)."""
+    src = ctx.source
+    if src is None:
+        return {"source": "yok"}
+    return {"source": str(getattr(src, "name", "?")), "absolute_source": bool(getattr(src, "absolute_power", False)),
+            "source_settle_s": source_settle_s(src)}
 
 
 def spectrum_screenshot(spec, name: str, title: str, *, offset_db: float = 0.0, unit: str | None = None,

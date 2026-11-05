@@ -12,10 +12,18 @@ every backend:
 * gain clamping to the band-dependent gain range,
 * **settling bookkeeping** — after a retune / gain change the next
   ``settle_buffers × buffer_size`` samples are flagged ``settling`` (stale libiio kernel
-  buffers + PLL lock), and :meth:`capture` / :meth:`flush` discard them,
-* **overflow handling** — :meth:`read` never returns a block with an internal gap: if the
-  driver reports an overflow mid-block, the partial data is discarded and the block is
-  restarted with ``overflow=True`` (gap *before* the block),
+  buffers + PLL lock), and :meth:`capture` / :meth:`flush` discard them. Every ``set_*``
+  marks the window *before* touching the hardware (and again after), and :meth:`read`
+  snapshots index / settling / labels (fc, gain, ...) under the same lock, so a block read
+  concurrently with a settings change is either entirely from before the change or flagged
+  ``settling`` — never new-setting samples under the old label,
+* **overflow handling** — :meth:`read` never returns a block with an internal *reported*
+  gap: if the driver reports an overflow mid-block, the partial data is discarded and the
+  block is restarted with ``overflow=True`` (gap *before* the block). When the backend only
+  knows that the gap lies somewhere in the next ``RawRead.uncertain_samples`` samples (Pluto
+  DMA status register), those samples are additionally flagged ``settling``. A
+  :class:`StreamTimeout` is a gap too: the partial block is discarded and the next block
+  carries ``overflow=True``,
 * stream statistics (:class:`~eds.core.types.StreamStats`).
 """
 
@@ -49,6 +57,9 @@ class RawRead:
     timeout        True if nothing arrived within the timeout (k must be 0)
     t_ns           host wall-clock time (time.time_ns) when the read returned
     hw_time_ns     device timestamp of samples[:, 0] if the driver provides one, else None
+    uncertain_samples  with ``overflow_before``: the gap is only known to lie within the
+                   next ``uncertain_samples`` samples from ``samples[:, 0]`` on (they are
+                   flagged ``settling``); 0 = exactly before ``samples[:, 0]``
     """
 
     samples: np.ndarray
@@ -56,6 +67,7 @@ class RawRead:
     timeout: bool = False
     t_ns: int = 0
     hw_time_ns: int | None = None
+    uncertain_samples: int = 0
 
 
 class RxDevice(ABC):
@@ -81,6 +93,7 @@ class RxDevice(ABC):
         self._seq = 0
         self._index = 0                       # host-side index of next sample to be read
         self._settle_until = 0
+        self._gap_pending = False             # a read timed out: the next block follows a gap
         self._streaming = False
         self._lock = threading.RLock()
 
@@ -205,6 +218,7 @@ class RxDevice(ABC):
             from ..core.errors import ProfileViolation
             raise ProfileViolation(err)
         with self._lock:
+            self.mark_settling()                  # before the hardware change (see module doc)
             self.fc = float(self._apply_center_freq(float(hz)))
             self.mark_settling()
             # band-dependent gain range: re-clamp current gain at the new frequency
@@ -221,6 +235,7 @@ class RxDevice(ABC):
             from ..core.errors import ProfileViolation
             raise ProfileViolation(errs)
         with self._lock:
+            self.mark_settling()
             self.fs = float(self._apply_sample_rate(float(hz)))
             self.mark_settling()
         return self.fs
@@ -231,6 +246,7 @@ class RxDevice(ABC):
             from ..core.errors import ProfileViolation
             raise ProfileViolation(errs)
         with self._lock:
+            self.mark_settling()
             self.bw = float(self._apply_bandwidth(float(hz)))
             self.mark_settling()
         return self.bw
@@ -241,6 +257,7 @@ class RxDevice(ABC):
         g = gr.clamp(db)
         chans = range(self.num_channels) if channel is None else [channel]
         with self._lock:
+            self.mark_settling()
             for ch in chans:
                 self.gains[ch] = float(self._apply_gain(g, ch))
             self.mark_settling()
@@ -250,13 +267,15 @@ class RxDevice(ABC):
         if mode not in GAIN_MODES:
             raise ValueError(f"gain mode {mode!r} not in {GAIN_MODES}")
         with self._lock:
+            self.mark_settling()
             self._apply_gain_mode(mode)
             self.gain_mode = mode
             self.mark_settling()
 
     def mark_settling(self, n_samples: int | None = None) -> None:
         """Flag the next ``n_samples`` (default ``settle_samples``) as settling."""
-        self._settle_until = self._index + int(self.settle_samples if n_samples is None else n_samples)
+        with self._lock:
+            self._settle_until = self._index + int(self.settle_samples if n_samples is None else n_samples)
 
     # ------------------------------------------------------------------ streaming
     def start_stream(self, buffer_size: int | None = None) -> None:
@@ -267,6 +286,7 @@ class RxDevice(ABC):
                 self.buffer_size = int(buffer_size)
             self._start(self.buffer_size)
             self._streaming = True
+            self._gap_pending = False
             self.stats = StreamStats(start_mono=mono(), last_mono=mono())
             self.mark_settling()
 
@@ -282,11 +302,14 @@ class RxDevice(ABC):
     def read(self, n: int | None = None, timeout_s: float = 2.0) -> IQBlock:
         """Read exactly ``n`` contiguous samples per channel (default ``buffer_size``).
 
-        Raises :class:`StreamTimeout` if the driver delivers nothing for ``timeout_s``.
+        Raises :class:`StreamTimeout` if the driver delivers nothing for ``timeout_s``; the
+        partial block is then discarded and the next block carries ``overflow=True`` (samples
+        produced meanwhile are lost on a streaming radio).
         """
         if not self._streaming:
             raise StreamError(f"{self.name}: stream not started")
         n = int(n or self.buffer_size)
+        nch = self.num_channels
         parts: list[np.ndarray] = []
         got = 0
         overflow = False
@@ -294,16 +317,27 @@ class RxDevice(ABC):
         t_last = 0
         while got < n:
             r = self._read_raw(n - got, timeout_s)
+            if r.samples.ndim != 2 or r.samples.shape[0] != nch:
+                raise StreamError(f"{self.name}: arka uç {nch} kanal yerine {tuple(r.samples.shape)} biçiminde "
+                                  "örnek döndürdü (akış okuma sırasında durdurulmuş olabilir)")
             if r.timeout:
                 self.stats.timeouts += 1
+                with self._lock:
+                    if got:
+                        self.stats.discarded_samples += got
+                        self._index += got
+                    self._gap_pending = True
                 raise StreamTimeout(f"{self.name}: {timeout_s:.2f} s içinde örnek gelmedi")
             if r.overflow_before:
                 self.stats.overflows += 1
                 overflow = True
-                if got:
-                    self.stats.discarded_samples += got
-                    self._index += got
-                    parts, got, hw_first = [], 0, None
+                with self._lock:
+                    if got:
+                        self.stats.discarded_samples += got
+                        self._index += got
+                        parts, got, hw_first = [], 0, None
+                    if r.uncertain_samples > 0:
+                        self._settle_until = max(self._settle_until, self._index + int(r.uncertain_samples))
             k = r.samples.shape[1]
             if k:
                 if not parts:
@@ -313,22 +347,28 @@ class RxDevice(ABC):
                 t_last = r.t_ns
         samples = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=1)
         samples = np.ascontiguousarray(samples, dtype=np.complex64)
-        index = self._index
-        self._index += n
-        settling = index < self._settle_until
+        with self._lock:   # consistent snapshot against concurrent set_* (see module doc)
+            index = self._index
+            self._index += n
+            settling = index < self._settle_until
+            overflow = overflow or self._gap_pending
+            self._gap_pending = False
+            fs, fc, gains, gain_mode, bw = self.fs, self.fc, tuple(self.gains), self.gain_mode, self.bw
+            ppm_hw, ppm_hw_via = self.ppm_hw, self.ppm_hw_via
+            members = getattr(self, "ppm_hw_members", None)
+            seq = self._seq
+            self._seq += 1
         block = IQBlock(
-            samples=samples, fs=self.fs, fc=self.fc,
-            t_ns=int(t_last - round(n / self.fs * 1e9)) if self.fs else t_last or now_ns(),
-            index=index, seq=self._seq, gain_db=tuple(self.gains), overflow=overflow,
-            settling=settling, meta={"ppm_hw": self.ppm_hw, "ppm_hw_via": self.ppm_hw_via,
-                                     "gain_mode": self.gain_mode, "bw": self.bw},
+            samples=samples, fs=fs, fc=fc,
+            t_ns=int(t_last - round(n / fs * 1e9)) if fs else t_last or now_ns(),
+            index=index, seq=seq, gain_db=gains, overflow=overflow,
+            settling=settling, meta={"ppm_hw": ppm_hw, "ppm_hw_via": ppm_hw_via,
+                                     "gain_mode": gain_mode, "bw": bw},
         )
         if hw_first is not None:
             block.meta["hw_time_ns"] = hw_first
-        members = getattr(self, "ppm_hw_members", None)
         if members is not None:
             block.meta["ppm_hw_members"] = list(members)
-        self._seq += 1
         st = self.stats
         st.blocks += 1
         st.samples += n

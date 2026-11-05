@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import html
 import json
 import logging
 import re
@@ -19,19 +20,27 @@ from eds.measure import report as report_mod
 from eds.measure.base import FigureSpec, MeasurementResult, Series
 from eds.measure.report import (
     EXT_BANNER,
+    NOT_COMPARED,
+    QUICK_BANNER,
+    QUICK_TAG,
     SIM_BANNER,
+    SIM_TAG,
     SUMMARY_CSV_COLUMNS,
+    _raw_col_width,
+    _raw_layout,
     console_table,
+    figure_flags,
     format_condition,
     format_number,
     format_uncertainty,
     format_value,
     git_revision,
+    no_verdict_reason,
     short_conditions,
     verdict,
     write_report,
 )
-from eds.measure.targets import TARGET_NOTE_KEY, Target, apply_targets
+from eds.measure.targets import REASON_QUICK, TARGET_NOTE_KEY, Target, apply_targets
 
 T0_NS = 1_762_340_000_000_000_000          # 2025-11-05T10:53:20Z
 FIXED_META = {"git_commit": "abc1234", "git_dirty": True, "operatör": "Ayşe Yılmaz"}
@@ -180,7 +189,7 @@ def test_markdown_main_table_values_units_status(full_report):
     assert "| # | Parametre | Ölçülen | Birim | Hedef | Durum | Koşullar (kısa) |" in md
     rows = {m.group(1): m.group(0) for m in re.finditer(r"^\| \d \| ([^|]+) \|.*$", md, re.M)}
     assert rows["Duyarlılık (MDS)"].startswith(
-        "| 1 | Duyarlılık (MDS) | -101.3 ± 0.3 | dBm | ≤ -100.0 | GEÇTİ | fc 915 MHz; fs 4 MHz; RBW 1.46484 kHz; G 40.0 dB |")
+        "| 1 | Duyarlılık (MDS) | -101.3 ± 0.3 | dBm | ≤ -100.0 | GEÇTİ | fc 915 MHz; RBW 1.465 kHz; Pfa 1.00e-06; G 40.0 dB |")
     assert rows["Dinamik alan"].startswith("| 2 | Dinamik alan | 55.0 | dB | ≥ 60.0 | KALDI |")
     assert rows["Anlık bant genişliği"].startswith("| 3 | Anlık bant genişliği | 18.2 | MHz | — | HEDEF YOK |")
     assert rows["DF RMS hatası"].startswith("| 4 | DF RMS hatası | — | ° | ≤ 5.00 | ATLANDI |")
@@ -260,7 +269,9 @@ def test_results_json(full_report):
     assert meta["eds_version"] == eds.__version__ and meta["git_commit"] == "abc1234" and meta["git_dirty"] is True
     assert meta["config_path"] == "/etc/eds/rx_sim.toml"
     assert meta["devices"][0]["serial"] == "SIM-rx0"
-    assert meta["verdicts"] == {"GEÇTİ": 2, "KALDI": 1, "HEDEF YOK": 1, "ATLANDI": 1, "HATA": 2}
+    assert meta["verdicts"] == {"GEÇTİ": 2, "KALDI": 1, "KARŞILAŞTIRILMADI": 0, "HEDEF YOK": 1, "ATLANDI": 1,
+                                "HATA": 2}
+    assert meta["quick"] is False and meta["quick_specs"] == []
     assert meta["figures_rendered"] == 4 and meta["figures_failed"] == 1
     assert meta["measured_from_utc"] == "2025-11-05T10:53:20Z"
     assert meta["user_meta"]["operatör"] == "Ayşe Yılmaz"
@@ -434,14 +445,14 @@ def test_format_helpers():
     assert format_condition("x", None) == "—"
     assert format_condition("ppm", 12.34567) == "12.3 ppm"
     assert format_condition("noise_dbfs_hz", -150.04) == "-150.0 dBFS/Hz"
-    assert format_condition("cal", {"a": float("nan")}) == '{"a": null}'
+    assert format_condition("cal", {"a": float("nan")}) == "a: —"
     assert format_condition("tracking", np.bool_(False)) == "hayır"
     assert format_condition("gain_db", np.array([40.0, 38.0])) == "40.0 dB, 38.0 dB"
     assert format_condition("fc_hz", np.float32(915e6)) == "915 MHz"
 
 
 def test_verdict_and_short_conditions():
-    ok = MeasurementResult(spec_id="sensitivity", title="t", value=1.0, unit="dB")
+    ok = MeasurementResult(spec_id="sensitivity", title="t", value=1.0, unit="dBm")
     assert verdict(ok) == "HEDEF YOK"
     ok.evaluate_target(0.0, ">=")
     assert verdict(ok) == "GEÇTİ"
@@ -466,5 +477,240 @@ def test_console_table():
     assert lines[5].endswith("ATLANDI") and lines[6].endswith("HATA")
     col = lines[0].index("Durum")
     assert all(ln[col:].split()[0] in {"GEÇTİ", "KALDI", "HEDEF", "ATLANDI", "HATA"} for ln in lines[2:9])
-    assert lines[-1] == "Toplam: 7  |  GEÇTİ: 2  KALDI: 1  HEDEF YOK: 1  ATLANDI: 1  HATA: 2"
+    assert lines[-1] == "Toplam: 7  |  GEÇTİ: 2  KALDI: 1  KARŞILAŞTIRILMADI: 0  HEDEF YOK: 1  ATLANDI: 1  HATA: 2"
     assert "\x1b[" not in text
+
+
+# ------------------------------------------------------------------------- quick / simulation / no verdict
+def _png_text(path: Path) -> dict[str, str]:
+    import struct
+
+    data, pos, out = path.read_bytes(), 8, {}
+    while pos < len(data):
+        (n,) = struct.unpack(">I", data[pos:pos + 4])
+        kind, body = data[pos + 4:pos + 8], data[pos + 8:pos + 8 + n]
+        if kind == b"tEXt":
+            k, _, v = body.partition(b"\x00")
+            out[k.decode("latin-1")] = v.decode("latin-1")
+        elif kind == b"iTXt":
+            k, _, rest = body.partition(b"\x00")
+            out[k.decode("latin-1")] = rest[2:].split(b"\x00", 2)[-1].decode("utf-8")
+        pos += 12 + n
+    return out
+
+
+def _quick_results(simulated: bool = True) -> list[MeasurementResult]:
+    """Results as run_measurement produces them in ``--quick`` mode (conditions quick/simulated)."""
+    results = make_results(backend="sim" if simulated else "soapy")
+    for r in results:
+        r.conditions["quick"] = True
+        r.conditions["simulated"] = simulated
+    apply_targets(results, {"sensitivity": Target(-100.0, "<="), "dynamic_range": Target(60.0, ">="),
+                            "image_rejection": Target(40.0, ">=")})
+    return results
+
+
+@pytest.fixture(scope="module")
+def quick_report(tmp_path_factory):
+    pytest.importorskip("matplotlib")
+    results = _quick_results()
+    for r in results[1:]:
+        r.figures = []
+    rdir = write_report(results, tmp_path_factory.mktemp("quick"), meta={"git_commit": "abc1234"})
+    return rdir, results
+
+
+def test_quick_mode_banner_header_csv_json(quick_report):
+    """JURY-01 / MM-03: a --quick report says so everywhere the jury or a later reader looks."""
+    rdir, results = quick_report
+    md = (rdir / "summary.md").read_text(encoding="utf-8")
+    page = (rdir / "report.html").read_text(encoding="utf-8")
+    assert QUICK_BANNER.startswith("HIZLI MOD - KTR'de kullanılmaz")
+    assert f"> **UYARI: {QUICK_BANNER}**" in md and f"> **UYARI: {SIM_BANNER}**" in md
+    assert '<div class="banner quick">UYARI: ' + html.escape(QUICK_BANNER) + "</div>" in page
+    assert re.search(r"\| Ölçüm modu \| HIZLI \(--quick\)", md)
+    assert "| Veri kaynağı | SİMÜLASYON (donanım ölçümü değil) |" in md
+    rows = _read_csv(rdir / "summary.csv")
+    assert {"quick", "simulated", "verdict_note"} <= set(rows[0])
+    assert all(r["quick"] == "true" and r["simulated"] == "true" for r in rows)
+    meta = json.loads((rdir / "results.json").read_text(encoding="utf-8"))["meta"]
+    assert meta["quick"] is True and meta["quick_specs"] == [r.spec_id for r in results]
+    assert QUICK_BANNER in meta["banners"]
+
+
+def test_quick_results_are_not_compared_and_show_the_reason(quick_report):
+    """MM-04 (report side): a blocked result is KARŞILAŞTIRILMADI + reason, never HEDEF YOK/GEÇTİ."""
+    rdir, results = quick_report
+    md = (rdir / "summary.md").read_text(encoding="utf-8")
+    page = (rdir / "report.html").read_text(encoding="utf-8")
+    assert verdict(results[0]) == NOT_COMPARED and results[0].passed is None
+    assert REASON_QUICK in no_verdict_reason(results[0])
+    row = next(ln for ln in md.splitlines() if ln.startswith("| 1 | Duyarlılık (MDS)"))
+    assert f"| {NOT_COMPARED} — {REASON_QUICK} |" in row
+    assert '<span class="badge b-nc">KARŞILAŞTIRILMADI</span><div class="why">' in page
+    sec = md.split("### 1. ")[1].split("### 2.")[0]
+    assert f"- **Sonuç:** -101.3 dBm ± 0.3 dB — {NOT_COMPARED} (hedef ≤ -100.0 dBm)" in sec
+    assert f"- **Karşılaştırılmama nedeni:** {REASON_QUICK}" in sec
+    assert "verdict_note" not in sec                                         # shown as a fact only
+    rows = _read_csv(rdir / "summary.csv")
+    assert rows[0]["verdict"] == NOT_COMPARED and rows[0]["passed"] == "" and REASON_QUICK in rows[0]["verdict_note"]
+    items = json.loads((rdir / "results.json").read_text(encoding="utf-8"))["results"]
+    assert items[0]["verdict"] == NOT_COMPARED and REASON_QUICK in items[0]["no_verdict_reason"]
+    assert rows[2]["verdict"] == "HEDEF YOK"            # quick but no target: nothing to compare
+    assert rows[3]["verdict"] == "ATLANDI" and rows[4]["verdict"] == "HATA"
+
+
+def test_quick_and_simulation_reach_the_figures(quick_report):
+    """JURY-15 / MM-03: every PNG of a simulated quick result carries both tags."""
+    rdir, results = quick_report
+    flags = _png_text(rdir / "figures" / "sensitivity_screenshot.png").get("Description", "")
+    assert SIM_TAG in flags and QUICK_TAG in flags
+    assert figure_flags(results[0]) == f"{SIM_TAG} · {QUICK_TAG}"
+
+
+def test_hardware_full_run_has_no_tags(tmp_path):
+    pytest.importorskip("matplotlib")
+    results = make_results(backend="soapy")
+    for r in results:
+        r.conditions["quick"] = False
+        r.conditions["simulated"] = False
+        r.figures = r.figures[:1]
+    rdir = write_report(results, tmp_path, meta={"git_commit": "x"})
+    assert "Description" not in _png_text(rdir / "figures" / "sensitivity_screenshot.png")
+    rows = _read_csv(rdir / "summary.csv")
+    assert rows[0]["quick"] == "false" and rows[0]["simulated"] == "false" and rows[0]["verdict"] == "GEÇTİ"
+    md = (rdir / "summary.md").read_text(encoding="utf-8")
+    assert "HIZLI MOD" not in md and "| Ölçüm modu | tam (--quick kullanılmadı) |" in md
+
+
+def test_partial_quick_banner_lists_specs(tmp_path):
+    results = _no_figures(make_results())
+    results[1].conditions["quick"] = True
+    rdir = write_report(results, tmp_path, meta={"git_commit": "x"})
+    md = (rdir / "summary.md").read_text(encoding="utf-8")
+    assert f"{QUICK_BANNER} — hızlı modda ölçülenler: dynamic_range" in md
+    assert "| Ölçüm modu | KARIŞIK — hızlı modda: dynamic_range" in md
+
+
+def test_blockers_without_target_and_without_apply_targets():
+    """``blockers`` alone, and the targets rules even if apply_targets was never run."""
+    r = MeasurementResult(spec_id="inst_bw", title="t", value=18.0, unit="MHz",
+                          blockers=["kanallar koherent değil (ortak referans yok)"])
+    assert verdict(r) == NOT_COMPARED and "koherent" in no_verdict_reason(r)
+    q = MeasurementResult(spec_id="dynamic_range", title="t", value=70.0, unit="dB", conditions={"quick": True})
+    q.evaluate_target(60.0, ">=")                       # passed=True, but quick → no verdict in the report
+    assert q.passed is True and verdict(q) == NOT_COMPARED and REASON_QUICK in no_verdict_reason(q)
+    u = MeasurementResult(spec_id="sensitivity", title="t", value=-40.0, unit="dBFS")
+    u.evaluate_target(-100.0, "<=")
+    assert verdict(u) == NOT_COMPARED and "Birim" in no_verdict_reason(u)
+    skipped = MeasurementResult(spec_id="x", title="t", value=None, unit="", status="skipped", blockers=["b"])
+    assert verdict(skipped) == "ATLANDI" and no_verdict_reason(skipped) == ""
+
+
+# ------------------------------------------------------------------------- conditions / units
+def test_short_conditions_are_spec_specific():
+    """JURY-04: the main table shows the conditions that define each number."""
+    scan = MeasurementResult(spec_id="scan_speed", title="t", value=0.5, unit="GHz/s", conditions={
+        "fs_hz": 20e6, "start_hz": 325e6, "stop_hz": 825e6, "rbw_hz": 39147.51832455171, "averages": 4,
+        "repeats": 1, "gain_db": 50.0})
+    assert short_conditions(scan) == "aralık 325 MHz – 825 MHz; fs 20 MS/s; RBW 39.15 kHz; ort. 4; tekrar 1"
+    rate = MeasurementResult(spec_id="max_rate", title="t", value=6.0, unit="MS/s", conditions={
+        "fc_hz": 935e6, "fs_hz": 6e6, "duration_s": 0.6, "buffer_size": 65536, "interface": "usb2",
+        "headline_mode": "pipeline"})
+    assert short_conditions(rate) == "süre/hız 600 ms; buffer 65536; arayüz usb2; mod pipeline"
+    lat = MeasurementResult(spec_id="latency", title="t", value=35.9, unit="ms", conditions={
+        "headline_mode": "B", "n_events": 6, "transport": "tcp", "fs_hz": 4e6})
+    assert short_conditions(lat) == "mod B; olay 6; taşıma tcp; fs 4 MS/s"
+    df = MeasurementResult(spec_id="df_rms", title="t", value=0.5, unit="°", conditions={
+        "fc_hz": 999.5e6, "f_target_hz": 999.9e6, "baseline_m": 0.15, "angles_deg": [-60, -40, -20, 0, 20, 40, 60],
+        "repeats": 2, "coherent": True})
+    assert short_conditions(df) == "f 999.9 MHz; d 0.150 m; θ -60.0 ° … 60.0 ° (7); tekrar 2; koherent evet"
+    ibw = MeasurementResult(spec_id="inst_bw", title="t", value=16.9, unit="MHz", conditions={
+        "fc_hz": 935e6, "configs": [[20e6, 20e6]], "rbw_hz": 9786.88, "gain_db": [40.0]})
+    assert short_conditions(ibw) == "fc 935 MHz; fs / BW 20 MS/s / 20 MHz; RBW 9.787 kHz; G 40.0 dB"
+    img = MeasurementResult(spec_id="image_rejection", title="t", value=55.0, unit="dB", conditions={
+        "fcs_hz": [935e6], "fs_hz": 4e6, "offsets_frac": [0.05, 0.1, 0.2, 0.3, 0.4], "gain_db": [30.0]})
+    assert short_conditions(img) == "fc 935 MHz; fs 4 MS/s; δ/fs 0.0500 … 0.400 (5); G 30.0 dB"
+
+
+def test_unit_formatting_rules():
+    """JURY-11: degrees keep significant digits, per-unit keys, qualifiers, nested dicts."""
+    assert format_condition("rms_deg", 0.0028) == "0.0028 °"
+    assert format_condition("max_abs_deg", 0.0123) == "0.012 °"
+    assert format_condition("pd_slope_per_db", 0.6) == "0.600 /dB"
+    assert format_condition("phase_drift_deg_per_s", -0.00978) == "-0.0098 °/s"
+    assert format_condition("mb_per_s_at_max", 24.0) == "24.0 MB/s"
+    assert format_condition("snr_db_mean", 86.6) == "86.6 dB"
+    assert format_condition("ppm_estimate", 11.7) == "11.7 ppm"
+    assert format_condition("fs_hz", 4e6) == "4 MS/s"
+    assert format_condition("rates_hz", [1e6, 2.4e6]) == "1 MS/s, 2.4 MS/s"
+    assert format_condition("spectrum_rate_hz", 10.0) == "10 Hz"                 # a frame rate, not fs
+    assert format_condition("halfwidth_bins", 5) == "5 bin"
+    assert format_condition("timing_share_pct", {"tune": 0.4182692535174094, "settle": 74.27}) == \
+        "tune: 0.418 %; settle: 74.27 %"
+    assert format_condition("mode_a_breakdown_mean_ms", {"processing_ms": 14.066, "publish_ms": 0.0842}) == \
+        "processing_ms: 14.1 ms; publish_ms: 0.0842 ms"
+    assert format_condition("best_config", {"fs_hz": 2e7, "bw_hz": 2e7}) == "fs_hz: 20 MS/s; bw_hz: 20 MHz"
+    assert format_condition("modes", ["transport", "pipeline"]) == "transport, pipeline"
+    assert format_condition("configs", [{"x": 0.123456789}]) == '[{"x": 0.123457}]'
+    assert format_condition("clip_input", -35.57, unit="dBm") == "-35.6 dBm"
+    assert format_value(44.467, "ms") == "44.5 ms"               # no spurious 5th digit (latency p95)
+    assert format_value(0.0028, "°", 0.0005) == "0.0028 ° ± 0.0005 °"
+
+
+def test_unit_hints_in_report_tables(tmp_path):
+    r = MeasurementResult(spec_id="sensitivity", title="Duyarlılık", value=-131.8, unit="dBm",
+                          extra={"sensitivity": -131.785, "clip_input": -35.576, "clip_input_unit": "dBm",
+                                 "rms_deg": 0.0028})
+    md = (write_report([r], tmp_path, meta={"git_commit": "x"}) / "summary.md").read_text(encoding="utf-8")
+    assert "| `sensitivity` | -131.8 dBm |" in md and "| `clip_input` | -35.6 dBm |" in md
+    assert "| `rms_deg` | 0.0028 ° |" in md
+
+
+# ------------------------------------------------------------------------- raw tables
+def test_raw_frequency_cells_keep_their_digits(tmp_path):
+    """JURY-12: two tones 1.3 kHz apart at 935 MHz must not print as the same number."""
+    r = MeasurementResult(spec_id="freq_resolution", title="t", value=1315.0, unit="Hz",
+                          table=[{"df_hz": 1300.0, "f_a_hz": 935399350.0, "f_b_hz": 935400650.0,
+                                  "noise_dbm_hz": -150.25}])
+    md = (write_report([r], tmp_path, meta={"git_commit": "x"}) / "summary.md").read_text(encoding="utf-8")
+    assert "| 1.3 kHz | 935.39935 MHz | 935.40065 MHz | -150.25 |" in md
+
+
+def _wide_result(n_cols: int = 28, n_rows: int = 12) -> MeasurementResult:
+    rows = []
+    for i in range(n_rows):
+        row = {"mode": "pipeline", "rate_msps": 1.0 + i, "fs_hz": (1.0 + i) * 1e6, "buffer_size": 65536}
+        row.update({f"discarded_samples_{k}": 1_000_000 + 37 * i * k for k in range(n_cols - 5)})
+        row["note"] = "kayıpsız; overflow yok; zaman aşımı yok" if i % 2 else ""
+        rows.append(row)
+    return MeasurementResult(spec_id="max_rate", title="t", value=6.0, unit="MS/s", table=rows)
+
+
+def test_wide_raw_tables_are_split_to_fit_a4():
+    """JURY-03: no raw table wider than the A4 text column; constants listed once; the first
+    column repeated in every group."""
+    r = _wide_result()
+    lay = _raw_layout(r)
+    assert len(lay.groups) > 1
+    assert ("buffer_size", "65536") in lay.constant
+    assert all(g[0] == lay.groups[0][0] for g in lay.groups)
+    for g in lay.groups:
+        width = sum(_raw_col_width(lay.cols[j], (row[j] for row in lay.shown)) for j in g)
+        assert width <= report_mod._RAW_BUDGET_MM
+    shown_cols = {lay.cols[j] for g in lay.groups for j in g} | {c for c, _ in lay.constant}
+    assert shown_cols == set(lay.cols)                           # nothing silently lost
+
+
+def test_wide_raw_table_html(tmp_path):
+    rdir = write_report([_wide_result()], tmp_path, meta={"git_commit": "x"})
+    page = (rdir / "report.html").read_text(encoding="utf-8")
+    assert page.count('<table class="raw">') == len(_raw_layout(_wide_result()).groups)
+    assert '<div class="rawwrap">' in page and "Tüm satırlarda aynı:" in page and "Sütun grubu 2/" in page
+    assert "discarded_<wbr>samples_<wbr>1" in page
+    assert '<td class="raw long">kayıpsız; overflow yok; zaman aşımı yok</td>' in page
+
+
+def test_narrow_raw_table_is_not_split():
+    lay = _raw_layout(make_results()[0])
+    assert lay.groups == [list(range(len(lay.cols)))] and lay.constant == []

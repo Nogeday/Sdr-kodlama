@@ -206,7 +206,9 @@ def test_gain_never_exceeds_the_band_range_at_2_4_ghz():
 
 
 def test_settle_reports_too_strong_input_at_minimum_gain():
-    dev = sim_device([strong(+10.0)], gain=40.0)          # +10 dBm: clips even at -1 dB gain
+    # +10 dBm: clips even at -1 dB gain (ADC-clip path: the simulator's front-end compression
+    # is off here; with it the AD936x model saturates below full scale at minimum gain)
+    dev = sim_device([strong(+10.0)], gain=40.0, rf_compression=False)
     agc = GainController(dev, AgcConfig())
     g = agc.settle(max_iter=8)
     assert g == dev.gain_range().min_db == -1.0

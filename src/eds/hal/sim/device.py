@@ -12,7 +12,10 @@ Signal chain per sample (in this order)
 2. **Thermal noise.** Density ``kT + NF`` = ``-173.975 + noise_figure_db`` dBm/Hz referred
    to the input, scaled by the same level equation (per-sample variance = density·fs).
    Generated in the frequency domain in frames of :data:`~eds.hal.sim.signals.FRAME`
-   samples aligned to absolute sample indices (independent of read sizes).
+   samples aligned to absolute sample indices (independent of read sizes); consecutive
+   frames overlap by :data:`~eds.hal.sim.signals.FRAME_XFADE` samples and are crossfaded
+   with power-complementary tapers, so the process is continuous across frame boundaries
+   (no splice leakage outside the shaped band; the same holds for noise-like emitters).
 3. **RX filters (analog LPF x digital decimation chain).** Both are applied to every
    emitter contribution at its *pre-alias* baseband offset ``f = f_RF - f_LO`` (per
    frequency bin for noise-like emitters, per Jacobi-Anger sideband for FM), i.e. BEFORE
@@ -20,7 +23,10 @@ Signal chain per sample (in this order)
    noise within ``±fs/2`` (per-frame frequency-domain shaping, which gives the band-edge
    roll-off of real Pluto spectra):
 
-   * analog: 3rd-order Butterworth magnitude, -3 dB corner at ``bw/2``;
+   * analog: 3rd-order Butterworth magnitude with its -3 dB corner at
+     ``analog_corner_factor · bw/2`` (1.4: the AD936x driver calibrates the RX BB LPF to
+     1.4 × BBBW, BBBW = ``bw/2``) times the TIA single pole at ``tia_pole_factor · bw/2``
+     (2.5; 0 = none). At ``f = bw/2`` the analog chain is ≈ -1.2 dB, not -3 dB;
    * digital (``digital_filter`` = true): the AD9363 half-band decimators + programmable
      FIR, flat to ``±dig_pass_frac·fs`` (0.40) and ``dig_stop_db`` (-80 dB) beyond
      ``±dig_stop_frac·fs`` (0.60) with a cosine taper in dB in between
@@ -36,7 +42,10 @@ Signal chain per sample (in this order)
    :attr:`skip_level_dbfs`) are not synthesized at all — emitters GHz away from the LO cost
    nothing, which keeps a full-band sweep fast.
 4. **TCXO.** ``e = ppm·1e-6``; with hardware correction ``e_hw`` (``set_ppm_correction``,
-   Pluto ``xo_correction``) the residual is ``e_res = (1+e)/(1+e_hw) - 1``. Actual LO =
+   Pluto ``xo_correction``) the residual is ``e_res = (1+e)/(1+e_hw) - 1``. ``xo_correction``
+   is written in ``xo_correction_step_hz`` steps (default 1 Hz of 40 MHz = 0.025 ppm, as on
+   the Pluto; 0 = continuous), so ``e_hw`` is the QUANTISED request and ``ppm_hw`` reports
+   it (the read-back, not the request; ``e_res`` keeps up to ±0.0125 ppm). Actual LO =
    ``fc·(1+e_res)``, actual sample clock = ``fs·(1+e_res)``; an emitter at ``f_true`` is
    seen at nominal-Hz baseband frequency ``(f_true - fc(1+e_res))/(1+e_res)``, i.e. apparent
    RF ``f_true/(1+e_res)`` (ARCHITECTURE ppm sign convention).
@@ -52,17 +61,31 @@ Signal chain per sample (in this order)
    advances at ``2π f (1/(1+e_a) − 1/(1+e_b)) ≈ 2π f (e_b − e_a)`` rad/s. Noise-like emitter
    envelopes are drawn on the world sample grid ``m = n + time_offset_samples`` so two
    devices see the same realization (cross-correlation peak at the offset difference).
-6. **IQ imbalance** on the composite analog signal: ``y = x + r·conj(x)`` with
+6. **RF front-end compression** (``rf_compression`` = true) of the composite signal
+   (emitters + thermal noise, after the filter models): Rapp AM-AM (no AM-PM)
+   ``y = x / (1 + (|x|/A_sat)^(2p))^(1/(2p))``, ``p`` = ``rapp_smoothness`` (2), with
+   ``A_sat`` set so that a CW tone at the input-referred 1 dB compression point
+   :meth:`SimRxDevice.input_p1db_dbm` is exactly 1 dB compressed. P1dB is linear in dB
+   over the band's gain table: ``p1db_min_gain_dbm`` (0 dBm) at the minimum gain to
+   ``p1db_max_gain_dbm`` (-20 dBm) at the maximum gain (the AD936x LNA/mixer compress
+   near 0 dBm at low gain; at high gain the following stages set it). Consequences: at
+   low gain (below ≈ 7 dB at 1 GHz) the front end compresses BEFORE the ADC clips — at
+   minimum gain the output saturates near -5 dBFS and never reaches full scale; at
+   moderate and high gain the ADC clips first. A tone reads ``level_dbfs(P) -
+   compression_db(P)``; two tones near P1dB produce intermodulation products. Limits:
+   out-of-band blockers do not compress the model (only the filtered composite is
+   compressed) and the products are not re-filtered by the decimation chain.
+7. **IQ imbalance** on the composite analog signal: ``y = x + r·conj(x)`` with
    ``r = K2/K1`` of the ``I' = I, Q' = g(Q cos φ − I sin φ)`` model ⇒ image rejection
    ``IRR = 10log10((1+2g cos φ+g²)/(1−2g cos φ+g²))``, ``g = 10^(ε/20)``. ``ε, φ`` =
    ``iq_gain_db, iq_phase_deg`` (0.4 dB, 2.5° ⇒ 30 dB) with quadrature tracking off, the
    residuals ``iq_residual_gain_db, iq_residual_phase_deg`` (0.02 dB, 0.15° ⇒ 55 dB) on.
-7. **DC offset**: complex constant (fixed random phase per device) at ``dc_offset_dbfs``
+8. **DC offset**: complex constant (fixed random phase per device) at ``dc_offset_dbfs``
    (-40) with BB DC tracking off, ``dc_residual_dbfs`` (-80) on. RF DC tracking is
    accepted/reported; its effect is folded into the BB DC model.
-8. **Spurs**: post-ADC digital tones at ``offset_hz`` / ``dbfs`` (gain independent, on the
+9. **Spurs**: post-ADC digital tones at ``offset_hz`` / ``dbfs`` (gain independent, on the
    digital clock, phase continuous); spurs outside ``±fs/2`` are dropped.
-9. **ADC**: white, gain-independent transition noise of ``adc_noise_lsb_rms`` (0.5 LSB rms
+10. **ADC**: white, gain-independent transition noise of ``adc_noise_lsb_rms`` (0.5 LSB rms
    per I/Q component ≈ -69.2 dBFS; it dithers the quantizer so sub-LSB DC/spurs survive
    and the output floor never collapses to exact zeros at low gain), then 12-bit
    quantization ``rint(x·2048)`` with HARD clipping of I and Q separately to
@@ -74,7 +97,8 @@ Emitter synthesis (see :mod:`eds.hal.sim.world` for the kinds): CW tones (and th
 Jacobi–Anger sideband series of sine FM, ``J_n(β)`` at ``f + n·f_mod``, each filtered by the
 LPF at its own frequency) are summed in one separable complex64 matrix product; pulse
 trains and FCCH bursts are gated analytically per period on the world-time axis (carrier
-phase continuous); noise-like envelopes are frequency-domain frames on the world grid.
+phase continuous); noise-like envelopes are crossfaded frequency-domain frames on the
+world grid.
 Phases are evaluated exactly (``fractions.Fraction``) at every piece start, so they do not
 drift with stream length. Reading the same index range in different chunk sizes yields the
 same waveform up to float32 rounding (rare ±1 LSB flips after quantization).
@@ -144,7 +168,7 @@ _time_ns = time.time_ns
 _TWO_PI = 2.0 * math.pi
 _SKIP_MARGIN_DB = 60.0             # emitter contributions this far below the ADC floor are skipped
 _SHAPE_FLOOR = 1e-7                # thermal-noise bins with |H| below this (-140 dB) are not drawn
-_FRAME_CACHE_SIZE = 24
+_FRAME_CACHE_SIZE = 48
 _AGC_TARGET_DBFS = -12.0
 _AGC_HYST_DB = 2.0
 _AGC_MAX_UP_DB = 3.0
@@ -177,19 +201,26 @@ SIM_PARAM_DEFAULTS: dict[str, Any] = {
     "lo_phase_random": True,
     "time_offset_samples": 0,
     "hw_xo_correction": True,
-    "xo_correction_step_hz": 0.0,   # 1.0 emulates Pluto's integer-Hz xo_correction
+    "xo_correction_step_hz": 1.0,   # Pluto's xo_correction is integer Hz (0 = continuous correction)
     "seed": None,                   # world seed + stable hash(name)
     "digital_filter": True,         # AD9363 RX digital decimation chain (half-bands + FIR)
     "dig_pass_frac": sg.DIG_PASS_FRAC,   # flat up to +-0.40 fs
     "dig_stop_frac": sg.DIG_STOP_FRAC,   # dig_stop_db from +-0.60 fs on
     "dig_stop_db": sg.DIG_STOP_DB,       # stop-band gain (dB)
+    "analog_corner_factor": sg.ANALOG_CORNER_FACTOR,   # BB LPF -3 dB corner = factor x bw/2
+    "tia_pole_factor": sg.TIA_POLE_FACTOR,             # TIA pole = factor x bw/2 (0 = none)
+    "rf_compression": True,         # RF front-end AM-AM compression (Rapp)
+    "p1db_min_gain_dbm": 0.0,       # input P1dB at the band's minimum gain ...
+    "p1db_max_gain_dbm": -20.0,     # ... and at its maximum gain (linear in dB in between)
+    "rapp_smoothness": 2.0,         # Rapp p
 }
 
 _FLOAT_KEYS = ("ppm", "noise_figure_db", "gain_offset_db", "dc_offset_dbfs", "dc_residual_dbfs",
                "iq_gain_db", "iq_phase_deg", "iq_residual_gain_db", "iq_residual_phase_deg",
                "usb_bytes_per_s", "xo_correction_step_hz", "adc_noise_lsb_rms", "dig_pass_frac",
-               "dig_stop_frac", "dig_stop_db")
-_BOOL_KEYS = ("realtime", "lo_phase_random", "hw_xo_correction", "digital_filter")
+               "dig_stop_frac", "dig_stop_db", "analog_corner_factor", "tia_pole_factor",
+               "p1db_min_gain_dbm", "p1db_max_gain_dbm", "rapp_smoothness")
+_BOOL_KEYS = ("realtime", "lo_phase_random", "hw_xo_correction", "digital_filter", "rf_compression")
 
 
 def _parse_sim_params(name: str, raw: dict[str, Any]) -> dict[str, Any]:
@@ -253,6 +284,12 @@ def _parse_sim_params(name: str, raw: dict[str, Any]) -> dict[str, Any]:
             f"(geldi: {p['dig_pass_frac']}, {p['dig_stop_frac']})")
     if p["dig_stop_db"] > 0.0:
         raise ConfigError(f"{where}.dig_stop_db pozitif olamaz (zayıflatma, dB ≤ 0)")
+    if p["analog_corner_factor"] <= 0.0:
+        raise ConfigError(f"{where}.analog_corner_factor pozitif olmalı (geldi: {p['analog_corner_factor']})")
+    if p["tia_pole_factor"] < 0.0:
+        raise ConfigError(f"{where}.tia_pole_factor negatif olamaz (0 = TIA kutbu yok)")
+    if p["rapp_smoothness"] <= 0.0:
+        raise ConfigError(f"{where}.rapp_smoothness pozitif olmalı (geldi: {p['rapp_smoothness']})")
     return p
 
 
@@ -393,9 +430,40 @@ class SimRxDevice(RxDevice):
         return self._n_next
 
     def level_dbfs(self, power_dbm: float, gain_db: float | None = None) -> float:
-        """Expected baseband level of an in-band input of ``power_dbm`` (level equation)."""
+        """Expected baseband level of an in-band input of ``power_dbm`` (small-signal level
+        equation; a strong input reads :meth:`compression_db` lower, before ADC clipping)."""
         g = self.gains[0] if gain_db is None else gain_db
         return float(power_dbm) + float(g) + self._p["gain_offset_db"]
+
+    def input_p1db_dbm(self, gain_db: float | None = None) -> float:
+        """Ground truth: input-referred 1 dB compression point (dBm) of the RF front end at
+        ``gain_db`` (default: current gain) for the commanded centre frequency; ``inf`` with
+        ``rf_compression = false``. Linear in dB between ``p1db_min_gain_dbm`` at the band's
+        minimum gain and ``p1db_max_gain_dbm`` at its maximum (clamped outside)."""
+        g = self.gains[0] if gain_db is None else gain_db
+        return self._p1db_dbm(float(g), self._segments[-1].state.fc)
+
+    def compression_db(self, power_dbm: float, gain_db: float | None = None) -> float:
+        """Ground truth: gain compression (dB, >= 0) of a CW tone of ``power_dbm`` at the RX
+        input (Rapp AM-AM of the front end, thermal noise neglected); the tone then reads
+        ``level_dbfs(P) - compression_db(P)`` (until the ADC clips)."""
+        p1 = self.input_p1db_dbm(gain_db)
+        if not math.isfinite(p1):
+            return 0.0
+        sm = self._p["rapp_smoothness"]
+        a_sat = sg.rapp_saturation(10.0 ** (p1 / 10.0), sm)
+        return -sg.rapp_gain_db(10.0 ** (float(power_dbm) / 10.0), a_sat, sm)
+
+    def _p1db_dbm(self, gain_db: float, fc: float) -> float:
+        p = self._p
+        if not p["rf_compression"]:
+            return math.inf
+        gr = self.profile.gain_range(fc)
+        lo, hi = p["p1db_min_gain_dbm"], p["p1db_max_gain_dbm"]
+        if gr.max_db <= gr.min_db:
+            return lo
+        x = min(max((gain_db - gr.min_db) / (gr.max_db - gr.min_db), 0.0), 1.0)
+        return lo + (hi - lo) * x
 
     def noise_density_dbfs_hz(self, gain_db: float | None = None) -> float:
         """Expected thermal noise density in dBFS/Hz (flat part of the passband)."""
@@ -416,10 +484,11 @@ class SimRxDevice(RxDevice):
         """Ground-truth RX amplitude response (dB) at PRE-ALIAS baseband offset ``f_bb_hz``.
 
         ``f_bb_hz = f_RF - f_LO`` (Hz) before folding into ``+-fs/2``; the result is
-        ``20 log10(|H_analog(f)| |H_digital(f)|)`` for the commanded ``fs`` / ``bw`` (analog
-        3rd-order Butterworth with corner ``bw/2`` times the digital decimation chain, see
-        the module docstring). A tone at ``f`` then reads ``level_dbfs(P) + response_db(f)``
-        at its aliased frequency. Scalar in -> ``float``; array in -> ``float64`` array.
+        ``20 log10(|H_analog(f)| |H_digital(f)|)`` for the commanded ``fs`` / ``bw`` (analog:
+        3rd-order Butterworth with corner ``analog_corner_factor * bw/2`` (1.4) times the TIA
+        pole at ``tia_pole_factor * bw/2`` (2.5); digital decimation chain; see the module
+        docstring). A tone at ``f`` then reads ``level_dbfs(P) + response_db(f)`` at its
+        aliased frequency. Scalar in -> ``float``; array in -> ``float64`` array.
         """
         h = self._hmag(f_bb_hz, self._segments[-1].state)
         if np.ndim(h) == 0:
@@ -427,9 +496,9 @@ class SimRxDevice(RxDevice):
         return 20.0 * np.log10(np.maximum(h, 1e-300))
 
     def _hmag(self, f: Any, st: _RxState) -> Any:
-        """Combined ``|H|`` (analog LPF x digital chain) at pre-alias baseband ``f`` (Hz)."""
-        h = sg.butterworth_mag(f, st.bw / 2.0)
+        """Combined ``|H|`` (analog LPF x TIA x digital chain) at pre-alias baseband ``f`` (Hz)."""
         p = self._p
+        h = sg.rx_analog_mag(f, st.bw, p["analog_corner_factor"], p["tia_pole_factor"])
         if not p["digital_filter"]:
             return h
         g_db = sg.digital_filter_db(f, st.fs, p["dig_pass_frac"], p["dig_stop_frac"], p["dig_stop_db"])
@@ -558,8 +627,11 @@ class SimRxDevice(RxDevice):
             if not self._p["hw_xo_correction"]:
                 self.ppm_hw, self.ppm_hw_via = 0.0, "none"
                 return "none"
-            self.ppm_hw, self.ppm_hw_via = ppm, "hardware"
-            self._push_state(e_res=self._e_res(ppm), lo_phase=self._new_lo_phase())
+            e_hw = self._xo_quantize(ppm * 1e-6)
+            # ppm_hw = what is IN EFFECT (integer-Hz xo_correction read-back), not the request
+            self.ppm_hw = ppm if e_hw == ppm * 1e-6 else e_hw * 1e6
+            self.ppm_hw_via = "hardware"
+            self._push_state(e_res=self._e_res(e_hw), lo_phase=self._new_lo_phase())
             self.mark_settling()
             return "hardware"
 
@@ -599,16 +671,22 @@ class SimRxDevice(RxDevice):
     def _new_lo_phase(self) -> float:
         return float(self._ctl_rng.uniform(0.0, _TWO_PI)) if self._p["lo_phase_random"] else 0.0
 
-    def _e_res(self, ppm_hw: float) -> float:
-        e = self._ppm * 1e-6
-        e_hw = ppm_hw * 1e-6
+    def _xo_quantize(self, e_hw: float) -> float:
+        """Requested reference correction -> the one the hardware applies: ``xo_correction``
+        is written in ``xo_correction_step_hz`` steps (Pluto: integer Hz of 40 MHz, i.e.
+        0.025 ppm); also sets :attr:`xo_correction_hz` (the read-back)."""
         step = self._p["xo_correction_step_hz"]
         ref = float(self.profile.ref_clock_hz)
-        if step > 0.0 and ppm_hw != 0.0:
+        if step > 0.0 and e_hw != 0.0:
             xo = round(ref * (1.0 + e_hw) / step) * step
-            e_hw = xo / ref - 1.0
+            self.xo_correction_hz = float(xo)
+            return xo / ref - 1.0
         self.xo_correction_hz = ref * (1.0 + e_hw)
-        return (1.0 + e) / (1.0 + e_hw) - 1.0
+        return e_hw
+
+    def _e_res(self, e_hw: float) -> float:
+        """Residual reference error ``(1 + e)/(1 + e_hw) - 1`` for the APPLIED correction ``e_hw``."""
+        return (1.0 + self._ppm * 1e-6) / (1.0 + e_hw) - 1.0
 
     def _stale_boundary(self) -> int:
         """First absolute index that a settings change made *now* can affect."""
@@ -799,6 +877,11 @@ class SimRxDevice(RxDevice):
         buf[:] = self._thermal(p_a, p_b, st, lvl)
         for q_a, q_b, scene in self._scene_pieces(p_a, p_b):
             self._add_emitters(buf[q_a - p_a:q_b - p_a], q_a, seg, lvl, scene)
+        # RF front-end compression (Rapp AM-AM) of the composite signal, input-referred P1dB
+        p1 = self._p1db_dbm(gain, st.fc)
+        if math.isfinite(p1):
+            sm = self._p["rapp_smoothness"]
+            sg.rapp_compress_inplace(buf, sg.rapp_saturation(10.0 ** ((p1 + lvl) / 10.0), sm), sm)
         # IQ imbalance on the composite analog signal
         eps, phi = self._iq_params(st)
         r = sg.iq_image_ratio(eps, phi)
@@ -854,31 +937,49 @@ class SimRxDevice(RxDevice):
 
     def _frames(self, key: tuple, i_a: int, i_b: int,
                 fill: Callable[[int, np.ndarray], None]) -> np.ndarray:
-        """Samples ``[i_a, i_b)`` of a frame-structured process (frames aligned to multiples
-        of FRAME). ``fill(frame_index, spectrum_row)`` writes one frame's spectrum; missing
-        frames are inverse-transformed in one batched FFT."""
-        fr_a, fr_b = i_a // sg.FRAME, (i_b - 1) // sg.FRAME
-        nf = fr_b - fr_a + 1
-        rows: list[np.ndarray | None] = [self._cache_get(key + (fr,)) for fr in range(fr_a, fr_b + 1)]
+        """Samples ``[i_a, i_b)`` of a frame-structured process. ``fill(j, spectrum_row)``
+        writes frame ``j``'s spectrum; missing frames are inverse-transformed in one batched
+        FFT. Frame ``j`` covers absolute samples ``[j H, j H + FRAME)`` (``H`` =
+        :data:`~eds.hal.sim.signals.FRAME_HOP`); in the ``FRAME_XFADE`` samples where frames
+        ``j - 1`` and ``j`` overlap they are crossfaded with power-complementary tapers
+        (``w_in^2 + w_out^2 = 1``: same variance, no splice discontinuity). The result is a
+        pure function of the absolute index (read slicing does not matter)."""
+        hop, xf, n_fr = sg.FRAME_HOP, sg.FRAME_XFADE, sg.FRAME
+        fr_a, fr_b = i_a // hop, (i_b - 1) // hop
+        o_a = i_a - fr_a * hop
+        first = fr_a - 1 if o_a < xf else fr_a          # frame fr_a - 1 only feeds the fade-in
+        idx = list(range(first, fr_b + 1))
+        rows: list[np.ndarray | None] = [self._cache_get(key + (fr,)) for fr in idx]
         missing = [j for j, r in enumerate(rows) if r is None]
         if missing:
-            spec = np.zeros((len(missing), sg.FRAME), dtype=np.complex64)
+            spec = np.zeros((len(missing), n_fr), dtype=np.complex64)
             for row, j in enumerate(missing):
-                fill(fr_a + j, spec[row])
+                fill(idx[j], spec[row])
             td = np.asarray(np.fft.ifft(spec, axis=1), dtype=np.complex64)
             for row, j in enumerate(missing):
                 rows[j] = td[row]
-            # Reads rarely end on a frame boundary: keep the (partially used) edge frames.
-            for j in sorted({0, nf - 1} & set(missing)):
-                self._cache_put(key + (fr_a + j,), np.array(rows[j]))
-            if len(missing) == nf:                # all generated in one batch: no concatenation
-                return td.reshape(-1)[i_a - fr_a * sg.FRAME:i_b - fr_a * sg.FRAME]
-        if nf == 1:
-            r0 = rows[0]
+            # Reads rarely end on a frame boundary: keep the first and the last two frames
+            # (the next read may start in the last one's fade-in).
+            keep = {0, len(idx) - 1, len(idx) - 2} & set(missing)
+            for j in sorted(keep):
+                self._cache_put(key + (idx[j],), np.array(rows[j]))
+        if fr_a == fr_b and o_a >= xf:                   # inside one frame, past its fade-in
+            r0 = rows[-1]
             assert r0 is not None
-            return r0[i_a - fr_a * sg.FRAME:i_b - fr_a * sg.FRAME]
-        flat = np.concatenate(rows)          # type: ignore[arg-type]
-        return flat[i_a - fr_a * sg.FRAME:i_b - fr_a * sg.FRAME]
+            return r0[o_a:o_a + (i_b - i_a)]
+        w_in, w_out = sg.crossfade_tapers(xf)
+        nf = fr_b - fr_a + 1
+        out = np.empty((nf, hop), dtype=np.complex64)
+        base = len(idx) - nf                             # 1 when frame fr_a - 1 was loaded
+        for j in range(nf):
+            cur = rows[base + j]
+            assert cur is not None
+            out[j] = cur[:hop]
+            prev = rows[base + j - 1] if base + j - 1 >= 0 else None
+            if prev is not None:
+                out[j, :xf] *= w_in
+                out[j, :xf] += prev[hop:] * w_out
+        return out.reshape(-1)[o_a:o_a + (i_b - i_a)]
 
     def _shape(self, key: tuple, make: Callable[[], tuple[list[tuple[int, int]], np.ndarray]]
                ) -> tuple[list[tuple[int, int]], np.ndarray]:

@@ -35,11 +35,13 @@ için kullanılır; yetkili kaynak profildir.
 | Örnekleme hızı (çip) | ≈65.1 kS/s – 61.44 MS/s | Sürdürülebilir sınır USB'dir | Profil aralığı + USB yük uyarıları (aşağıda). |
 | Kanal | Pluto kartı 1R1T | 1 cihaz = 1 RX | 2 RX kanalı = **2 Pluto** + `DeviceGroup` (`num_channels = 2`, `coherent = False`). Cihaz başına `channels = [0]`. |
 | ADC | 12-bit, tam ölçek ±2048 | Dinamik alan sınırlı | `I = counts/2048`, 0 dBFS tanımı, kırpma algılama (`clip_level = 2047/2048`), yazılım AGC (`eds.rx.agc`), ölçümlerde HW AGC kapalı. |
-| Kazanç | Banda bağlı: <1.3 GHz −1…73 dB, 1.3–4 GHz −3…71 dB | Retune sonrası aralık değişir | `gain_range(f)` banda göre; retune'da kazanç yeni aralığa **otomatik kırpılır**; adım 1 dB'ye kuantalanır. |
+| Kazanç | Banda bağlı: <1.3 GHz −1…73 dB, 1.3–4 GHz −3…71 dB | Retune sonrası aralık değişir | `gain_range(f)` banda göre (profil; SoapyPlutoSDR'nin sabit `0…73` aralığı banda duyarsız olduğundan yalnızca `gain_db_driver` olarak raporlanır, negatif minimum kesilmez); retune'da kazanç yeni aralığa **otomatik kırpılır**; adım 1 dB'ye kuantalanır. |
 | Saat | 40 MHz TCXO, ≈ ±25 ppm | 3.8 GHz'te ±95 kHz hata | PPM kalibrasyonu (`eds.calib.ppm`, GSM FCCH), donanım düzeltmesi `xo_correction`, yazılım yedeği, sıcaklık uyarısı. |
 | Arayüz | USB 2.0 (480 Mbit/s) | Akışın asıl darboğazı | Profil uyarıları (pratik 24 MB/s, teorik 53.2 MB/s); `eds measure max_rate` ile **ölçülen** sürdürülebilir hız; tarama burst ile. |
 | Mimari | Sıfır-IF (direct conversion) | DC çivisi + IQ imajı | AD936x DC/quadrature tracking açık; DC çevresi geçersiz bin (`dc_notch_bins`), taramada `dc_avoid`; imaj bastırma **ölçülür**. |
 | Retune | libiio 4 çekirdek tamponu | Retune sonrası **bayat örnek** | `settle_buffers = kernel_buffers + 1` tampon “settling” işaretlenir; `capture()`/`flush()` atar. |
+| RX giriş gücü | Mutlak maksimum ≈ +2.5 dBm (veri sayfası) | Fazlası LNA'ya zarar verir; düşük kazançta sıkışma | Profil `rx_max_input_dbm = -5` dBm: ölçüm prosedürleri uyaranı bu tavanın üstüne sürmez (§7.1, §8). |
+| SoapyPlutoSDR | Süreç başına **tek** libiio bağlamı | Aynı süreçteki 2. Pluto 1.'ye bağlanır | Süreçte ikinci Pluto reddedilir; her fazla Pluto kendi alt sürecinde (§1.8). |
 
 ### 1.1 Frekans ve BW → profil doğrulaması
 
@@ -62,7 +64,13 @@ için kullanılır; yetkili kaynak profildir.
   `(2, n)` blok döndürür.
 * Grup `coherent = False` bildirir: iki ayrı Pluto'nun LO'su ve örnekleme saati bağımsızdır
   (bkz. §5). Herhangi bir üyede overflow → grup bloğunda `overflow = True` (hizalama
-  kayboldu, DF yeniden kalibre etmeli).
+  kayboldu, DF yeniden kalibre etmeli). Pluto'da overflow ince katmandan DMA durum
+  yazmacıyla algılanır (§1.5) — DF için her iki cihazın `control_uri`'si çalışır olmalıdır.
+* **Süreç başına TEK Pluto.** SoapyPlutoSDR süreç başına tek bir libiio bağlamı tutar
+  (`static iio_context *ctx`): aynı süreçte açılan ikinci Pluto `uri`'sinden bağımsız olarak
+  ilkine bağlanır ve birini kapatmak diğerinin bağlamını yok eder. EDS aynı süreçte ikinci
+  bir SoapyPlutoSDR cihazını (RX ya da `pluto_tx`) **reddeder** (`DeviceError`); her Pluto
+  kendi alt sürecinde çalışır (`[[device]] isolation = "auto"`/`"subprocess"`; ayrıntı §1.8).
 * İki Pluto **aynı USB 2.0 host denetleyicisini** paylaşıyorsa toplam veri hızı önemlidir;
   `DeviceGroup.configure` bunun için uyarı üretir (2 × 4 MS/s = 32 MB/s).
 
@@ -74,11 +82,14 @@ için kullanılır; yetkili kaynak profildir.
 * **Kırpma:** `max(|I|,|Q|) ≥ clip_level ≈ 2047/2048`. Sert kırpma spektruma yayılan
   harmonikler/IMD üretir; bu yüzden:
   * `eds.dsp.levels.iq_levels` → `peak_dbfs, rms_dbfs, clip_fraction, dc_dbfs`,
-  * yazılım AGC (`gain_mode = "soft_agc"`, `[agc]`): hedef tepe **−10 dBFS**, üst eşik
-    −3 dBFS (hemen `attack_step_db = 10` dB düşür), alt eşik −35 dBFS (yavaşça
-    `decay_step_db = 3` dB artır, `hold_blocks` bekle), `max_clip_fraction = 1e-5`.
+  * yazılım AGC (`gain_mode = "soft_agc"`, `[agc]`): hedef tepe **−10 dBFS**; kırpma
+    (`clip_fraction > max_clip_fraction = 1e-5`) ya da tepe > −3 dBFS → hemen
+    `max(attack_step_db = 10, tepe − hedef)` dB düşür; tepe < −35 dBFS `hold_blocks` (4) blok
+    sürerse en fazla `decay_step_db = 3` dB artır.
     Kazanç değişimi sonrası bloklar “settling” işaretlenir ve AGC onları yok sayar.
-  * Ölçümler kırpılmış blokları kullanmaz; dinamik alan ölçümü kırpma eşiğini bu ölçütle bulur.
+  * Ölçümler kırpılmış blokları kullanmaz; dinamik alan ölçümü kırpma eşiğini `clip_fraction > 0`
+    ya da kanal başına tepe ≥ −0.5 dBFS ile, ön uç sıkışmasını küçük sinyal kazancından 1 dB
+    düşüşle bulur (`P_max = min(kırpma, P1dB)`; düşük kazançta AD936x ön ucu ADC'den önce sıkışır).
 * **Donanım AGC'si** (`hw_slow | hw_fast | hw_hybrid`) örnekle senkron kazanç bilgisi
   vermez → güç ölçümünde **kapalı** (`gain_mode = "manual"`). `hw_fast`/`hw_hybrid` ince
   libiio katmanı gerektirir; SoapySDR yalnızca `slow_attack` seçebilir.
@@ -116,7 +127,9 @@ Donanım düzeltmesi    xo_correction = ref_clock_hz · (1 + e)
 3. **Uygulama** (`[cal] ppm_mode = "auto"`): sırayla
    * `hardware` — ince libiio katmanı ile `ad9361-phy` `xo_correction` yazılır (LO **ve**
      örnekleme saati birlikte düzelir; komut satırı karşılığı:
-     `iio_attr -u ip:192.168.2.1 -d ad9361-phy xo_correction 40000468`),
+     `iio_attr -u ip:192.168.2.1 -d ad9361-phy xo_correction 40000468`). Değer tamsayı
+     Hz'dir (1 Hz = 0.025 ppm): `ppm_hw` istenen değerden değil **geri okunan** tamsayıdan
+     hesaplanır (`ppm_hw = (xo − 40e6)/40e6·1e6`), kalan ≤ ±0.0125 ppm yazılımda düzeltilir,
    * `soapy` — `setFrequencyCorrection` (sürücü destekliyorsa),
    * `software` — `apply_calibration` ile frekans ekseni `f_true = f_app·(1+e)`.
    `IQBlock.meta["ppm_hw"]` donanımın zaten düzeltip düzeltmediğini taşır (çift düzeltme yok).
@@ -131,9 +144,14 @@ Donanım düzeltmesi    xo_correction = ref_clock_hz · (1 + e)
    ```
 
    (Yeni firmware'lerde aynı alan yığın-bellek sürücüsündeki `config.txt` → `[SYSTEM]
-   xo_correction` ile de ayarlanabilir; kendi sürümünüzde doğrulayın.) Açılış değeri
-   nominal değilse ince katman bunu **uyarı** olarak raporlar ve ppm kestirimi yine nominale
-   göre yapılır.
+   xo_correction` ile de ayarlanabilir; kendi sürümünüzde doğrulayın.) `xo_correction`
+   Pluto yeniden başlayana kadar sürücüde **kalır**. Açılıştaki değer nominal değilse
+   (firmware ortamı ya da önceki bir çalıştırma) donanım bu düzeltmeyi **zaten uyguluyor**
+   demektir: EDS değeri ince katmandan okur ve `ppm_hw` olarak hesaba katar (uyarı ile);
+   kestirimler yine nominale göre **TOPLAM** ppm saklar, yani yeniden kalibrasyon kalıcı
+   düzeltmeyi silmez. EDS `xo_correction`'ı değiştirdiyse kapanışta açılış değerini geri
+   yükler. İnce katman yoksa firmware ortamındaki değer (bağlam özniteliği
+   `ad9361-phy,xo_correction`) doğrulanamayan tahmin olarak kullanılır.
 5. **Sıcaklık:** TCXO frekansı ısındıkça kayar. Ölçümden önce **10–15 dk ısınma**; AD9361
    sıcaklık sensörü (`read_sensors()["temperature_c"]`) her sonuca yazılır;
    kalibrasyon sıcaklığından `temp_warn_delta_c` (5 °C) fazla sapma uyarı üretir.
@@ -151,23 +169,49 @@ USB 2.0 High-Speed: 480 Mbit/s ham; bulk teorik üst sınır **53.248 MB/s**
 * Profil (`interface_practical_bytes_per_s = 24e6`) üstünde **“overflow beklenir”**, teorik
   sınır üstünde **“overflow kesin”** uyarısı verilir (`eds measure max_rate` önerisiyle).
 * Gerçek sınır makineye, USB denetleyicisine, hub'a, kabloya, libiio tampon boyuna bağlıdır
-  → **ölçülür**: `eds measure max_rate` (sıfır overflow + sıfır örnek kaybı, T saniye; yalnızca
-  taşıma ve DSP hattı açık iki mod). Varsayılan sürekli akış **4 MS/s** (16 MB/s, pay bırakır).
+  → **ölçülür**: `eds measure max_rate` (sıfır overflow + sıfır örnek kaybı, T saniye; başlık
+  değeri DSP hattı açık — gerçek `RxNode` — modudur, yalnız taşıma ayrıca verilir). Varsayılan sürekli akış **4 MS/s** (16 MB/s, pay bırakır).
 * **Tarama** 20 MS/s **burst** kullanır: her adımda retune → settle tamponları atılır → kısa
   bitişik yakalama. Adımlar arası overflow sonucu etkilemez (her adım kendi içinde bitişik).
   Bu yüzden `[sweep] sample_rate_hz = 20e6` için çıkan “teorik sınır” uyarısı beklenen
   davranıştır.
 * İpuçları: her Pluto'yu **ayrı kök porta** (farklı host denetleyicisi) takın; pasif hub
   kullanmayın; zayıf portlarda Pluto'nun ikinci (PWR) micro-USB girişinden ek besleme verin;
-  dizüstünde CPU frekans ölçeklemeyi `performance` yapın. SoapyPlutoSDR `usb_direct=1`
-  (libusb doğrudan akış) ve daha büyük `bufflen` (`"stream:bufflen" = "131072"`) ile
-  denenebilir — her değişikliği `max_rate` ile ölçün.
+  dizüstünde CPU frekans ölçeklemeyi `performance` yapın. Daha büyük akış tamponu
+  (`[rx] buffer_size = 131072`; `"stream:bufflen"` da kabul edilir, settle penceresi gerçek
+  tampona göre hesaplanır) denenebilir — her değişikliği `max_rate` ile ölçün. SoapyPlutoSDR
+  `usb_direct`, `timestamp_every`, `loopback`, `timeout` gibi argümanları **tanımaz**
+  (yalnızca `uri`, `hostname`, `label` ve akış argümanı `bufflen`); EDS bunlar için uyarı
+  verir ve bunlar ölçüm koşulu değildir.
+
+**Overflow (örnek kaybı) algılama.** SoapyPlutoSDR `readStream`'den **hiçbir zaman**
+`SOAPY_SDR_OVERFLOW` döndürmez (yalnızca örnek sayısı ya da `TIMEOUT`) ve donanım zaman
+damgası vermez. EDS bu yüzden ince katman üzerinden AXI ADC **DMA durum yazmacını** okur:
+`cf-ad9361-lpc`, adres `0x80000088`, bit 2 (`0x4`) = RX overflow, 1 yazarak temizlenir
+(libiio `examples/iio_adi_xflow_check.c` ile aynı erişim; komut satırı:
+`iio_reg -u ip:192.168.2.1 cf-ad9361-lpc 0x80000088`). Yazmaç okumalardan sonra en fazla
+`overflow_poll_s` (vars. 20 ms) aralıkla yoklanır; bit set ise **sonraki blok**
+`overflow = True` olur ve kayıp, olduğu anda kuyrukta bekleyen tamponların arkasında
+olduğundan, sonraki `settle_samples` örnek `settling` işaretlenir (pencere birleştirme, DF
+hizalaması ve `capture()` bu aralığı kullanmaz). İnce katman yoksa overflow **algılanamaz**
+(`overflow_source = "none"`, akış başlarken uyarı; `rx.status` `stream.overflow_source = "none"`
+taşır ve `eds rx` overflow sayacını “bilinmiyor (sürücü raporlamaz)” gösterir — 0 değil).
+Alt süreçteki Pluto'larda ve `DeviceGroup`'ta (2× Pluto) `overflow_source` ve üyelerin akış
+başlangıcı uyarıları ana süreçteki `rx.status`'a yansıtılmaz: orada bu durum yalnızca alt
+sürecin günlük uyarısı olarak (terminal/stderr) görünür — DF tezgahında her iki cihazın
+`control_uri`'sini (`iio_info -u ip:…`, yukarıdaki `iio_reg` komutu) ayrıca doğrulayın.
+Bir okuma zaman aşımı (`StreamTimeout`) da boşluk sayılır: sonraki blok `overflow = True`.
+Akışı durdurmak, takılmış bir `iio_buffer_refill`'i ancak libiio bağlam zaman aşımıyla
+(vars. 5 s; SoapyPlutoSDR'de ayarlanamaz) bitirir.
 
 ### 1.6 Sıfır-IF: DC ve IQ dengesizliği
 
 * AD936x **BB DC**, **RF DC** ve **quadrature** tracking varsayılan açık (`[rx]
-  dc_tracking / rf_dc_tracking / quad_tracking`). SoapySDR `setDCOffsetMode` /
-  `setIQBalanceMode` ile, RF-DC tracking ince katmanla uygulanır.
+  dc_tracking / rf_dc_tracking / quad_tracking`). `set_tracking` önce SoapySDR
+  `setDCOffsetMode` / `setIQBalanceMode`'u dener (sürücü destekliyorsa, yol `"soapy"`);
+  SoapyPlutoSDR'de bu API'ler olmadığından Pluto'da üçü de ince katmanla (`"iio"`) ayarlanır.
+  İnce katman yoksa yol `"unsupported"` olur (uyarı): tracking ayarlanamaz — `image_rejection`
+  bu durumda tracking-kapalı noktalarını atlar.
 * DC çevresindeki `dc_notch_bins` bin tespitte geçersizdir; tarama adımları örtüşür ve DC
   hiçbir zaman birleştirilmiş sonuca girmez (`dc_avoid = true`). Ölçüm tonları DC'den uzak
   ofsetlere konur.
@@ -178,9 +222,53 @@ USB 2.0 High-Speed: 480 Mbit/s ham; bulk teorik üst sınır **53.248 MB/s**
 
 libiio, `kernel_buffers` (vars. 4) tamponu kuyrukta tutar: retune / hız / kazanç değişiminden
 sonraki `4 × bufflen` örnek **eski ayarlarla** alınmıştır. HAL bunun +1 tampon fazlasını
-(`settle_buffers = 5`) “settling” olarak işaretler; `capture()` ve `flush()` bu örnekleri
-atar. 4 MS/s ve 65536'lık tamponda bu ≈ 82 ms'dir — tarama hızını doğrudan belirler
+(`settle_buffers = 5`, gerçek sürücü tamponu `max(buffer_size, MTU)` ile) “settling” olarak
+işaretler; `capture()` ve `flush()` bu örnekleri atar. Ayar değişikliği donanıma gitmeden
+**önce** de işaretlenir ve bloklar aynı kilit altında etiketlenir: başka bir thread'den
+gelen retune sırasında okunan blok ya tamamen eski ayarlıdır ya da `settling`'dir. 4 MS/s ve
+65536'lık tamponda bu 5 × 65536 / 4e6 ≈ 82 ms'dir — tarama hızını doğrudan belirler
 (`eds measure scan_speed` adım dökümünde “settle” kalemi).
+
+### 1.8 Süreç başına tek Pluto → süreç yalıtımı
+
+SoapyPlutoSDR (`PlutoSDR_Settings.cpp`) **süreç başına tek** libiio bağlamı tutar
+(`static iio_context *ctx`): kurucu, bağlam boşsa onu açar, doluysa **yeni cihazın `uri`'sini
+yok sayarak** eskisini kullanır; yıkıcı `iio_context_destroy(ctx); ctx = nullptr;` yapar. Aynı
+süreçte ikinci bir Pluto açmak sessizce birinciyi sürer (ortak saat zinciri, ikinci RX
+tamponunda EBUSY, TX yanlış radyodan) ve birini kapatmak diğerinin bağlamını yok eder.
+
+EDS bunu iki katmanda çözer (ayrıntı: ARCHITECTURE §5):
+
+* **Koruma:** `soapy_backend.claim_pluto` — `SoapyRxDevice` ve `SoapyTxSource`
+  `SoapySDR.Device()`'tan önce sürecin tek Pluto yuvasını alır; ikinci istek Türkçe
+  `DeviceError` (“bu süreçte zaten açık bir ADALM-Pluto var … isolation = "subprocess"”).
+  `driver = plutosdr` yazılmadan açılıp sonradan Pluto olduğu anlaşılan cihaz yuva doluysa
+  karantinaya alınır (serbest bırakmak paylaşılan bağlamı yok ederdi).
+* **Yerleşim** (`[[device]] isolation = "auto"`, varsayılan; `eds info` planı yazdırır):
+
+| Birlikte açılanlar | Yerleşim | Örnek konfigürasyon |
+|---|---|---|
+| 2 Pluto `[[device]]` (DF grubu) | iki cihaz da kendi alt sürecinde | `dual_pluto.toml` → `rx0=subprocess, rx1=subprocess` |
+| 1 Pluto DUT + `measure.source = "pluto_tx"` | DUT süreç içinde, TX Pluto alt süreçte | `rx_pluto.toml` → `rx0=inproc; pluto_tx kaynağı ayrı süreçte` |
+| 1 Pluto DUT + `pluto_tx`, `source_args.isolate = false` | DUT alt süreçte, kaynak süreç içinde | – |
+| tek Pluto / simülatör / Pluto olmayan Soapy cihazı | süreç içinde | `rx_sim.toml` |
+
+  `isolation = "inproc"` / `"subprocess"` yerleşimi zorlar (zorla `inproc` bir süreçte birden
+  çok Pluto bırakırsa günlükte uyarı). `source_args.isolate` `true/false`, `1/0`,
+  `evet/hayır` kabul eder.
+
+**Alt süreçte ne olur:** cihaz `multiprocessing` *spawn* süreci içinde aynı
+`SoapyRxDevice` olarak açılır (seri çözümleme, ince katman, xo_correction, DMA overflow
+yoklaması orada çalışır); profil doğrulaması, kazanç kırpma, settling ve boşluksuz okuma ana
+süreçte kalır. Örnekler pickle edilmeden boru üzerinden kopyalanır (ölçülen ~250–320 MS/s
+complex64, USB 2.0'ın çok üstünde); açılış ~0.15–1 s sürer. Alt süreçteki hata aynı Türkçe
+mesajla ana süreçte yeniden fırlatılır; alt süreç ölürse sonraki çağrılar `DeviceError`
+(okumada `StreamError`) verir. Ana süreç kapanır/öldürülürse alt süreç cihazını kapatır
+(`pluto_tx` önce RF'yi kapatır). Ctrl-C yalnız ana sürece gider; ana süreç cihazları sırayla
+kapatır. Kendi Python betiğinizde yalıtılmış cihaz açıyorsanız üst düzeyi
+`if __name__ == "__main__":` arkasına alın (spawn kuralı; `eds` CLI ve pytest zaten uyar).
+Arka uca özgü değerler (ince katman, `overflow_source`, `xo_correction_boot_hz` …) alt
+süreçteki cihazda yalnızca `describe()` çıktısında görünür.
 
 ---
 
@@ -189,14 +277,20 @@ atar. 4 MS/s ve 65536'lık tamponda bu ≈ 82 ms'dir — tarama hızını doğru
 ```text
 eds (Python) ── eds.hal.soapy_backend ── SoapySDR ── SoapyPlutoSDR ── libiio (USB) ── Pluto
              └─ eds.hal.pluto_iio (ince) ──────────────────────────── libiio (ip:)  ── Pluto iiod
-                xo_correction, RF-DC tracking, hızlı AGC, sıcaklık, fw_version, hw_serial
+                xo_correction, BB/RF-DC + quadrature tracking, hızlı AGC, sıcaklık,
+                fw_version, hw_serial, RX DMA overflow yazmacı (cf-ad9361-lpc 0x80000088)
 ```
 
 * Akış ve cihaz soyutlaması **SoapySDR** üzerindendir; pyadi-iio birincil arayüz değildir.
 * İnce katman, SoapyPlutoSDR USB üzerinden akış yaparken ikinci bir libiio **USB** bağlamı
   genellikle açamadığı için Pluto'nun USB-Ethernet arayüzüne (`control_uri = "ip:..."`,
   iiod birden çok istemciye hizmet verir) bağlanır. Açılamazsa **uyarı + Soapy yoluna
-  düşüş**; çökme yok.
+  düşüş**; çökme yok. İnce katmanın `hw_serial`'i akış cihazınınkiyle (Soapy
+  `getHardwareInfo`) karşılaştırılır; farklıysa (ör. `control_uri` diğer Pluto'yu
+  gösteriyor) ince katman **kullanılmaz** — xo_correction / tracking / AGC yanlış radyoya
+  yazılmaz.
+* SoapyPlutoSDR'de DC-offset ve IQ-balance API'si yoktur: BB-DC, RF-DC ve quadrature
+  tracking yalnızca ince katmanla ayarlanır.
 
 Kurulum: `scripts/install_ubuntu.sh` (Ubuntu 22.04/24.04; idempotent). Doğrulama:
 
@@ -208,7 +302,10 @@ iio_info -s                                       # libiio bağlamları: [usb:B.
 iio_info -u ip:192.168.2.1 | head                 # ağ üzerinden erişim
 iio_attr -u ip:192.168.2.1 -C fw_version          # firmware sürümü
 iio_attr -u ip:192.168.2.1 -d ad9361-phy xo_correction
+iio_reg -u ip:192.168.2.1 cf-ad9361-lpc 0x80000088  # RX DMA durum yazmacı (bit 2 = overflow); okuma temizlemez
 python -c "import SoapySDR, iio; print('ok')"     # .venv içinde (system-site-packages)
+eds devices --backend soapy --probe               # EDS ile aç: describe (ince katman, thin_serial_verified, xo_correction_boot_hz ...)
+eds info -c config/dual_pluto.toml                # profil doğrulaması + süreç yalıtım planı (rx0/rx1 = subprocess)
 ```
 
 ---
@@ -244,14 +341,21 @@ Available contexts:
 ```
 
 * `uri = "usb:"` libiio'da “tek USB cihazı otomatik seç” demektir; **iki Pluto USB'deyken
-  reddedilir** (EMLINK / “Too many links”). İki cihazlı konfigürasyonlarda tam URI yazılır.
+  reddedilir** (`ENXIO`, “No such device or address”). Uyaran Pluto'su (`pluto_tx`, IP ile
+  seçilse bile USB-Ethernet üzerinden) de USB'dedir. İki cihazlı tezgahta tam URI ya da seri
+  numarası yazılır.
 * USB adresi (`usb:BUS.DEV.IF`) port değişince / yeniden takınca değişebilir; **seri
   numarası sabittir**. Seri numarasını kasaya etiketleyin (A/B), her oturumda
   `iio_info -s` ile URI ↔ seri eşlemesini doğrulayın. EDS açılışta okuduğu seriyi
   `DeviceInfo.serial` olarak rapora yazar ve kalibrasyonu `cal/<seri>.json`'dan yükler —
   yanlış eşleme raporda görünür.
-* SoapyPlutoSDR `serial` anahtarına göre **filtrelemez**: args'a yalnızca `serial = "..."`
-  yazmak yanlış cihazı sessizce açabilir. Seçim URI ile yapılır.
+* SoapyPlutoSDR taraması seri numarası **içermez** (`SoapySDRUtil --find` →
+  `uri`, `label = "PlutoSDR #i <uri>"`) ve `serial` anahtarına göre **filtrelemez** (bulduğu
+  ilk bağlamı açar). EDS bu yüzden `args = { driver = "plutosdr", serial = "104473dc5993" }`
+  (tam seri ya da tekil önek; `uri`/`hostname` yokken) verildiğinde seriyi **libiio
+  taramasıyla** (`iio.scan_contexts()`, `iio_info -s` ile aynı; python3-libiio gerekir)
+  URI'ye çevirir ve cihazı o URI ile açar; eşleşme yoksa / önek belirsizse adayları
+  listeleyerek hata verir. Aynı çözümleme `pluto_tx` uyaranı için de geçerlidir.
 
 ---
 
@@ -299,9 +403,10 @@ EDS'te ilgili modüller: `eds.hal.group.DeviceGroup`, `eds.df.coherence`
    kestirimi için belirsizdir; gecikme tonlar arasında frekansa bağlı faz eğimi üretir
    (`Δφ = 2π·Δf_bb·Δn/fs`). **Herhangi bir overflow'da hizalama kaybolur** (grup bloğu
    `overflow = True`) → gecikme + faz yeniden kalibre edilir.
-5. **Koherens kontrolü.** `check_coherence` faz kaymasını (°/s) ve koherensi (0…1) ölçer;
-   `coherent = False` iken DF sonucu yayımlanmaz ve `df_rms` ölçümü bu raporu sonuçla birlikte
-   yazar.
+5. **Koherens kontrolü.** `check_coherence` faz kaymasını (°/s; eşik 1 °/s), koherensi (0…1;
+   eşik 0.9) ve blok faz kararlılığını (≤ 5°) ölçer (`eds cal coherence` ile de). `coherent =
+   False` iken DF sonucu kullanılmamalıdır: `df_rms` ölçümü devam eder ama özet “KOHERENS YOK -
+   ortak 40 MHz referans gerekli” taşır ve hedef kararı verilmez (KARŞILAŞTIRILMADI).
 6. **Geometri.** İki eleman arası `d = λ/2` belirsizliksiz ±90° verir; 0.15 m ⇒ 1 GHz'e kadar
    belirsizliksiz (`f ≤ c/(2d)`). Azimut konvansiyonu: dizi eksenine dik (broadside) = 0°,
    dizi ekseni boyunca 2. elemana (rx1) doğru pozitif. `sin θ` doğrusal olmadığından hata
@@ -362,9 +467,19 @@ tek Pluto'da koherent iki kanal verir — DF için çok değerlidir, ancak:
         Kontrol: TX kablosunu 50 Ω ile sonlandırın → ton spektrumdan KAYBOLMALI.
 ```
 
-`config/rx_pluto.toml` bu tezgahı tanımlar (`measure.source = "pluto_tx"`). Mutlak güç için
-`anchor_dbm` (bağıl 0 dB'de DUT girişinde, kalibre güç ölçerle ölçülen güç) girilir.
-Laboratuvar üreteci varsa `source = "scpi"` (daha doğru seviye, düşük faz gürültüsü).
+`config/rx_pluto.toml` bu tezgahı tanımlar (`measure.source = "pluto_tx"`; TX Pluto kendi alt
+sürecinde, §1.8). Mutlak güç için `anchor_dbm` (bağıl 0 dB'de DUT girişinde, kalibre güç
+ölçerle ölçülen güç) girilir; o zaman `P_dut = anchor_dbm − path_loss_db + P_bağıl` ve seviye
+belirsizliği `±1 dB ⊕ 0.02 dB/dB × |P_bağıl|` olarak raporlanır (MEASUREMENTS §0.3).
+Laboratuvar üreteci varsa `source = "scpi"` (daha doğru seviye, düşük faz gürültüsü; IRR/SFDR
+için önerilir).
+
+**Uyaran tavanı.** Profil `rx_max_input_dbm = -5` dBm: ölçüm prosedürleri uyaranı RX girişinde
+bu değerin üstüne çıkarmaz (mutlak kaynakta ayar tavanı, bağıl kaynakta doğrusal okumadan
+ekstrapole edilen tavan; tavanda duran arama sonucu “≥” sınır olarak raporlanır). Bu yazılım
+sınırı sabit zayıflatıcının **yerine geçmez**: `latency` ölçümünün uyarlamalı tonu ve operatör
+hataları (yanlış kablo, sıfıra alınmış kademeli zayıflatıcı) için ≥ 30 dB sabit zayıflatıcı
+hatta kalır (+7 dBm − 30 dB = −23 dBm < −5 dBm).
 
 ### 7.2 DF faz/gecikme kalibrasyonu
 
@@ -399,6 +514,33 @@ tekrar) ve kalibrasyondan çıkarın.
 Anahtar her retune sonrası “kalibrasyon” konumuna alınır, `φ_cal` ölçülür, sonra “anten”
 konumunda DF yapılır. Çok yollu yayılım (yansıma) DF RMS'i bozar: açık alan / emici malzeme.
 
+### 7.4 Pluto TX uyaranının kendi artefaktları ve LO ofseti
+
+`SoapyTxSource` tonu sayısal olarak, bir LO etrafında üretir (tampon tamsayı periyotlu, faz
+sürekli döngü):
+
+* **Tek ton:** LO = `f − tone_offset_hz` (vars. 200 kHz) → **LO sızıntısı** `LO`'da, **TX IQ
+  imajı** `2·LO − f = f − 2·tone_offset_hz`'de. **İki ton:** LO orta noktada (tek dereceli IMD
+  ürünü LO'ya düşmez).
+* `set_lo_offset(hz)`: LO'yu `f − hz`'e taşır, RF tonu, seviyeyi ve aç/kapa durumunu korur;
+  `hz` tampon döngüsüne kuantalanır, `0 < |hz| ≤ 0.4·fs`; LO aralık dışına düşerse önceki durum
+  geri yüklenir; iki ton modunda bir sonraki tek tona uygulanır. Etkin ofset
+  `describe()["lo_offset_hz"]`'dedir. Alt süreçteki kaynakta da aynen çalışır
+  (`ProcessSignalSource` iletir).
+* Ölçümler bunu kullanır: `image_rejection` ve `dynamic_range` (SFDR) her noktada LO'yu tonun
+  **ötesine** (fc'den uzağa) koyar, böylece RX bandına katlanan LO sızıntısı ve TX imajı tona da
+  RX imajına (`2·fc − f`) da `halfwidth + 2` binden yakın düşmez; seçilen ofset ve “temiz mi”
+  bilgisi noktaya yazılır, SFDR aramasında bu iki çizgi maskelenip “kaynak kaynaklı” olarak
+  ayrıca raporlanır. Yerleştirme olmadan (ör. fs = 4 MS/s, δ = 0.05·fs = 200 kHz) TX imajı RX
+  imajının ~100 Hz yanına düşer ve ölçülen IRR TX'in imaj bastırmasıyla sınırlanır.
+* **Gecikme:** `set_enabled` / `set_frequency` / `set_power` yeni tamponu verip döner; RF çıkışı
+  libiio TX kuyruğu boşalınca değişir (`estimated_queue_latency_s = 4 × buffer_len / fs`;
+  `rx_pluto.toml`'da 8192 / 1 MS/s = 32.8 ms). Ölçümler her uyaran değişikliğinden sonra
+  `1.25 × kuyruk + 5 ms` bekler ve RX'in bayat tamponlarını atar; `latency` RF-açık anını
+  `dönüş + kuyruk ± kuyruk/4` olarak düzeltir.
+* Pluto TX'in TCXO'su da ±25 ppm'dir: **frekans referansı değildir** (`freq_resolution`
+  `reference_locked = false` kabul eder ve mutlak doğruluk iddia etmez).
+
 ---
 
 ## 8. RF güvenliği
@@ -410,6 +552,11 @@ konumunda DF yapılır. Çok yollu yayılım (yansıma) DF RMS'i bozar: açık a
 * TX→RX yolunda **her zaman ≥ 30 dB sabit zayıflatıcı** bulunur (kademeli zayıflatıcı sıfıra
   alınsa bile). +7 dBm − 30 dB = −23 dBm: güvenli; yüksek kazançta kırpar (zararsız; EDS
   kırpmayı algılar ve raporlar).
+* Yazılım tavanı: profil `rx_max_input_dbm = -5` dBm (+2.5 dBm mutlak maksimumun altında pay;
+  düşük kazançta ön uç ≈ 0 dBm'de sıkışır). Ölçüm prosedürleri uyaranı bunun üstüne sürmez
+  (§7.1) — yine de sabit zayıflatıcı **zorunludur** (yazılım tavanı yanlış kablolamayı ve
+  `latency`'nin uyarlamalı ton seviyesini kapsamaz). Başka bir RX için profil değerini veri
+  sayfasından girin (`rx_max_input_dbm`; tanımsızsa `inf` = tavan yok).
 * Kablo takıp çıkarmadan önce TX'i kapatın (`set_enabled(False)`); konnektörleri statik
   boşalmaya karşı koruyun (ESD bilekliği, önce gövdeye dokunun). SMA'ları tork anahtarıyla
   sıkın; gevşek konnektör seviye hatası ve faz kayması üretir.
@@ -444,11 +591,15 @@ Profil `status = "planned"` olan cihazlar çalıştırılabilir konfigürasyonla
 | Belirti | Olası neden | Çözüm |
 |---|---|---|
 | `SoapySDR cihazı açılamadı ... Bulunan cihazlar: yok` | Modül yok / udev izni / kablo | `SoapySDRUtil --info \| grep plutosdr`; `ls -l /dev/bus/usb/*/*`; `groups` içinde `plugdev`; veri taşıyan kablo. |
-| `usb:` ile açılmıyor, “Too many links” | İki Pluto USB'de | Tam URI (`iio_info -s`). |
+| `usb:` ile açılmıyor, “No such device or address” (ENXIO) | İki Pluto USB'de (uyaran Pluto'su dahil) | Tam URI (`iio_info -s`) ya da `args.serial`. |
+| “bu süreçte zaten açık bir ADALM-Pluto var” | Aynı süreçte ikinci Pluto (SoapyPlutoSDR tek bağlam) | `[[device]] isolation = "auto"`/`"subprocess"`; `pluto_tx` için `source_args.isolate = true` (varsayılan). |
+| “cihaz alt süreci açılışta sonlandı” / “… s içinde açılmadı” | Alt süreç cihazı açamadan çıktı/takıldı (ör. kendi betiğinizde spawn koruması yok, içe aktarma hatası). Normal açılış hataları (cihaz bulunamadı, profil ihlali) kendi mesajlarıyla gelir. | `-v` ile alt süreç izine bakın; kendi betiğinizde üst düzeyi `if __name__ == "__main__":` arkasına alın (§1.8). |
+| “İnce katman BAŞKA bir Pluto'ya bağlı” | `control_uri` diğer Pluto'nun IP'si (USB adresleri yer değiştirmiş) | `control_uri`'yi bu cihazın IP'sine düzeltin; `args.serial` ile seçin. |
 | `Permission denied` (libusb) | udev kuralı / grup | `scripts/install_ubuntu.sh`; oturumu kapat-aç; Pluto'yu yeniden tak. |
 | İnce katman açılamadı uyarısı | `control_uri` yanlış / ağ arayüzü yok | `ping 192.168.2.1`; `ip addr` (USB ağ arayüzü DHCP almış mı); iki Pluto için farklı IP (§3). |
-| Sürekli overflow | USB/host darboğazı | `eds measure max_rate`; ayrı kök port; hız düşür; `bufflen` büyüt; CPU `performance`. |
-| Açılışta “xo_correction nominal değil” uyarısı | Firmware ortamında kalıcı düzeltme var | Bilinçli ise sorun yok (EDS nominale göre kestirir); değilse `fw_setenv xo_correction` kaldırın. |
+| Sürekli overflow | USB/host darboğazı | `eds measure max_rate`; ayrı kök port; hız düşür; `buffer_size` büyüt; CPU `performance`. |
+| “SoapyPlutoSDR örnek kaybını (overflow) RAPORLAMAZ” uyarısı | İnce katman yok / DMA durum yazmacı okunamıyor | `control_uri` (ağ arayüzü) çalışır hale getirin; aksi halde overflow sayısı bilinmez. |
+| Açılışta “xo_correction … nominal değil” uyarısı | Firmware ortamında kalıcı düzeltme ya da önceki çalıştırmadan kalan değer | Sorun değil: EDS bunu `ppm_hw` olarak hesaba katar ve kalibrasyon toplam ppm saklar; istenmiyorsa `fw_setenv xo_correction` kaldırın / Pluto'yu yeniden başlatın. |
 | Frekanslar ~kHz kaymış | PPM kalibrasyonu yok/eski | GSM FCCH veya referans CW ile kalibre et; ısınma; `cal.ppm_mode`. |
 | Spektrumun ortasında çivi | Sıfır-IF DC | DC tracking açık mı; `dc_notch_bins`; sinyali DC'den uzağa ayarla. |
 | Retune sonrası ilk spektrum yanlış frekansta | Bayat çekirdek tamponları | Ham `read()` yerine `capture()` kullanın; `settle_buffers` ≥ `kernel_buffers + 1`. |

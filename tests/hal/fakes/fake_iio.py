@@ -6,13 +6,22 @@ API mirrored (as used by :mod:`eds.hal.pluto_iio`):
 * ``ctx.attrs`` — ``dict`` name → ``str`` (optionally objects with ``.value`` to exercise
   tolerant callers), ``ctx.devices``, ``ctx.find_device(name_or_id_or_label)`` → ``Device | None``.
 * ``Device``: ``id``, ``name``, ``attrs`` (dict name → ``DeviceAttr``), ``debug_attrs``,
-  ``channels``, ``find_channel(name_or_id, is_output=False)`` → ``Channel | None``.
+  ``channels``, ``find_channel(name_or_id, is_output=False)`` → ``Channel | None``,
+  ``reg_read(addr) -> int`` / ``reg_write(addr, value)`` (``iio_device_reg_read/_write`` via
+  the ``direct_reg_access`` debug attribute; ``OSError(ENOENT)`` on a device without it).
+* ``iio.scan_contexts()`` → ``{uri: description}`` like ``iio_info -s`` (USB:
+  ``"0456:b673 (Analog Devices Inc. PlutoSDR (ADALM-PLUTO)), serial=..."``).
 * ``Channel``: ``id``, ``name``, ``output``, ``attrs`` (dict name → ``ChannelAttr``).
 * ``Attr.value`` — property, get → ``str``; set requires ``str`` (pylibiio calls
   ``value.encode("ascii")`` → ``AttributeError`` for an int), errors → ``OSError``.
 
 :func:`make_pluto_board` builds an ``ad9361-phy`` with the attributes of a Pluto (AD9363,
 firmware v0.3x) and records every attribute write in ``board.writes`` as ``(path, value)``.
+Its ``cf-ad9361-lpc`` models the AXI ADC **DMA status register** ``0x80000088``: bit 2
+(``0x4``) = RX overflow, write-1-to-clear (libiio ``examples/iio_adi_xflow_check.c``).
+``board.dma_overflow()`` sets the bit, i.e. "the hardware dropped samples"; hook it into the
+SoapySDR fake (``fake_soapy.install(..., overflow_hook=board.dma_overflow)``) to model the real
+SoapyPlutoSDR, whose ``readStream`` never reports the overflow while the register does.
 """
 
 from __future__ import annotations
@@ -99,12 +108,44 @@ class Channel:
         return self._attrs
 
 
+DMA_STATUS_REG = 0x80000088
+DMA_STATUS_OVERFLOW = 0x4
+_W1C_REGS = frozenset({DMA_STATUS_REG})
+
+
 class Device:
-    def __init__(self, did: str, name: str, label: str | None = None):
+    def __init__(self, did: str, name: str, label: str | None = None, board: FakeBoard | None = None,
+                 regs: dict[int, int] | None = None):
         self._id, self._name, self._label = did, name, label
         self._attrs: dict[str, DeviceAttr] = {}
         self._debug_attrs: dict[str, DeviceAttr] = {}
         self._channels: list[Channel] = []
+        self._board = board
+        self._regs = regs                       # None: no direct_reg_access debug attribute
+
+    def reg_read(self, reg: int) -> int:
+        if self._regs is None:
+            raise OSError(errno.ENOENT, "No such file or directory")
+        b = self._board
+        if b is not None:
+            if b.reg_error is not None:
+                raise OSError(*b.reg_error)
+            b.reg_log.append(("r", self._name, int(reg), None))
+        return int(self._regs.get(int(reg), 0)) & 0xFFFFFFFF
+
+    def reg_write(self, reg: int, value: int) -> None:
+        if self._regs is None:
+            raise OSError(errno.ENOENT, "No such file or directory")
+        b = self._board
+        if b is not None:
+            if b.reg_error is not None:
+                raise OSError(*b.reg_error)
+            b.reg_log.append(("w", self._name, int(reg), int(value)))
+        reg, value = int(reg), int(value) & 0xFFFFFFFF
+        if reg in _W1C_REGS:
+            self._regs[reg] = self._regs.get(reg, 0) & ~value
+        else:
+            self._regs[reg] = value
 
     @property
     def id(self) -> str:
@@ -147,9 +188,33 @@ class FakeBoard:
     open_error: tuple[int, str] | None = None
     ctx_attr_objects: bool = False
     opened: int = 0
+    rx_regs: dict[int, int] = field(default_factory=dict)        # cf-ad9361-lpc core registers
+    reg_log: list[tuple[str, str, int, int | None]] = field(default_factory=list)
+    reg_error: tuple[int, str] | None = None                     # every reg_read/reg_write fails
+    dma_overflows: int = 0
 
     def device(self, name: str) -> Device:
         return next(d for d in self.devices if d.name == name)
+
+    def dma_overflow(self) -> None:
+        """The RX DMA dropped samples: set the sticky overflow bit (as the AXI ADC core does)."""
+        self.dma_overflows += 1
+        self.rx_regs[DMA_STATUS_REG] = self.rx_regs.get(DMA_STATUS_REG, 0) | DMA_STATUS_OVERFLOW
+
+    @property
+    def rx_overflow_bit(self) -> bool:
+        return bool(self.rx_regs.get(DMA_STATUS_REG, 0) & DMA_STATUS_OVERFLOW)
+
+    def serial(self) -> str:
+        return self.ctx_attrs.get("hw_serial") or self.ctx_attrs.get("usb,serial", "")
+
+    def scan_description(self) -> str:
+        """Context description as ``iio_info -s`` / ``iio.scan_contexts()`` show it."""
+        ser = self.serial()
+        if self.uri.startswith("usb:"):
+            return f"0456:b673 (Analog Devices Inc. PlutoSDR (ADALM-PLUTO)), serial={ser}"
+        host = self.uri.split(":", 1)[-1]
+        return f"{host} ({self.ctx_attrs.get('hw_model', 'PlutoSDR')}), serial={ser}"
 
     def attr(self, path: str) -> _Attr:
         """``"ad9361-phy/xo_correction"`` or ``"ad9361-phy/in/voltage0/rssi"``."""
@@ -190,8 +255,10 @@ def make_pluto_board(uri: str = "ip:192.168.2.1", *, xo_correction: int = 40_000
                      temp_mode: str = "input", temp_milli: float = 36250.0, rssi: str = "105.25 dB",
                      gain_modes: str = "manual fast_attack slow_attack hybrid",
                      hardwaregain_available: str = "[-3 1 71]", ctx_attr_objects: bool = False,
-                     open_error: tuple[int, str] | None = None, include_serial: bool = True) -> FakeBoard:
-    """A Pluto (AD9363) as libiio exposes it. ``temp_mode``: "input" | "raw" | "none"."""
+                     open_error: tuple[int, str] | None = None, include_serial: bool = True,
+                     dma_regs: bool = True) -> FakeBoard:
+    """A Pluto (AD9363) as libiio exposes it. ``temp_mode``: "input" | "raw" | "none".
+    ``dma_regs=False``: ``cf-ad9361-lpc`` without ``direct_reg_access`` (no overflow register)."""
     b = FakeBoard(uri=uri, open_error=open_error, ctx_attr_objects=ctx_attr_objects)
     b.ctx_attrs = {
         "hw_model": "Analog Devices PlutoSDR Rev.B (Z7010-AD9363A)", "hw_model_variant": "0",
@@ -245,18 +312,34 @@ def make_pluto_board(uri: str = "ip:192.168.2.1", *, xo_correction: int = 40_000
             temp._attrs["offset"] = ChannelAttr(b, f"{tb}/offset", "offset", "250", writable=False)
             temp._attrs["scale"] = ChannelAttr(b, f"{tb}/scale", "scale", f"{temp_milli / 1250.0:.6f}", writable=False)
         phy._channels.append(temp)
-    rxdev = Device("iio:device3", "cf-ad9361-lpc")
+    rxdev = Device("iio:device3", "cf-ad9361-lpc", board=b, regs=b.rx_regs if dma_regs else None)
     rxdev._channels = [Channel("voltage0", False), Channel("voltage1", False)]
+    if dma_regs:
+        rxdev._debug_attrs["direct_reg_access"] = DeviceAttr(b, "cf-ad9361-lpc/direct_reg_access",
+                                                              "direct_reg_access", "0x0")
     txdev = Device("iio:device2", "cf-ad9361-dds-core-lpc")
     xadc = Device("iio:device1", "xadc")
     b.devices = [phy, xadc, txdev, rxdev]
     return b
 
 
-def make_module(boards: list[FakeBoard] | None = None) -> types.ModuleType:
-    """Fresh fake ``iio`` module serving ``boards`` by URI (``module.boards``)."""
+def make_module(boards: list[FakeBoard] | None = None, *,
+                scan_extra: dict[str, str] | None = None) -> types.ModuleType:
+    """Fresh fake ``iio`` module serving ``boards`` by URI (``module.boards``).
+
+    ``scan_contexts()`` lists every board plus ``scan_extra`` (``{uri: description}``, e.g. a
+    USB Pluto that is visible to the scan but cannot be opened as a context here).
+    """
     registry = {b.uri: b for b in (boards or [])}
+    extra = dict(scan_extra or {})
     mod = types.ModuleType("iio")
+    mod.scan_calls = 0
+
+    def scan_contexts() -> dict[str, str]:
+        mod.scan_calls += 1
+        found = {uri: b.scan_description() for uri, b in registry.items()}
+        found.update(extra)
+        return found
 
     class Context:
         def __init__(self, _context: Any = None):
@@ -292,6 +375,7 @@ def make_module(boards: list[FakeBoard] | None = None) -> types.ModuleType:
             return None
 
     mod.Context = Context
+    mod.scan_contexts = scan_contexts
     mod.Device = Device
     mod.Channel = Channel
     mod.DeviceAttr = DeviceAttr
@@ -301,9 +385,9 @@ def make_module(boards: list[FakeBoard] | None = None) -> types.ModuleType:
     return mod
 
 
-def install(monkeypatch: Any, *boards: FakeBoard) -> types.ModuleType:
+def install(monkeypatch: Any, *boards: FakeBoard, scan_extra: dict[str, str] | None = None) -> types.ModuleType:
     """Install a fake ``iio`` module serving ``boards`` (undone by ``monkeypatch``)."""
-    mod = make_module(list(boards))
+    mod = make_module(list(boards), scan_extra=scan_extra)
     monkeypatch.setitem(sys.modules, "iio", mod)
     return mod
 

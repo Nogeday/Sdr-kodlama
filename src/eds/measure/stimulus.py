@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 
 from ..core.config import AppConfig
-from ..core.errors import ConfigError, MeasurementError
+from ..core.errors import ConfigError, MeasurementError, NotSupported
 from ..core.types import IQBlock
 from ..core.units import db10, fmt_hz
 from ..dsp.detect import default_n_avg, usable_mask
@@ -42,6 +42,11 @@ TONE_HALFWIDTH_BINS: int = 5
 KNOWN_SEARCH_BINS: int = 3
 #: Generator / calibration-table level accuracy assumed when the operator gives none (dB).
 DEFAULT_LEVEL_UNCERTAINTY_DB: float = 1.0
+#: Anchored relative source (Pluto TX): accuracy of the anchor measurement at 0 dB (95 %, dB).
+ANCHOR_UNCERTAINTY_DB: float = 1.0
+#: ... plus this per dB of extrapolation below the anchor (TX attenuator step linearity and
+#: digital scaling, AD936x class; 90 dB below the anchor → ±1.8 dB).
+ATTENUATION_LINEARITY_DB_PER_DB: float = 0.02
 #: Two-sided 95 % normal quantile.
 Z95: float = 1.959963984540054
 
@@ -84,9 +89,50 @@ def opt_float(v: Any, what: str, lo: float | None = None, hi: float | None = Non
     return None if v is None else as_float(v, what, lo, hi)
 
 
-def source_power_range(src: Any) -> tuple[float, float]:
+def rx_max_input_dbm(dev: Any) -> float:
+    """Highest stimulus level a procedure may apply at the DUT's RX port (profile
+    ``rx_max_input_dbm``; ``inf`` when the profile states none)."""
+    v = getattr(getattr(dev, "profile", None), "rx_max_input_dbm", math.inf)
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return math.inf
+
+
+def source_power_range(src: Any, dev: Any = None) -> tuple[float, float]:
+    """Usable source setting range. With ``dev`` and an absolute source (setting = dBm at the
+    DUT input) the upper end is capped at :func:`rx_max_input_dbm` — no procedure may drive
+    the RX port above it. Relative sources are capped from a measured level instead
+    (:func:`relative_setting_cap`)."""
     lo, hi = getattr(src, "power_range_db", (-140.0, 0.0))
-    return float(lo), float(hi)
+    lo, hi = float(lo), float(hi)
+    if dev is not None and getattr(src, "absolute_power", False):
+        hi = min(hi, rx_max_input_dbm(dev))
+        if hi < lo:
+            raise MeasurementError(f"Kaynağın en düşük gücü ({lo:g} dBm) RX giriş sınırının "
+                                   f"({rx_max_input_dbm(dev):g} dBm) üstünde — zayıflatıcı ekleyin")
+    return lo, hi
+
+
+def input_dbm_estimate(dev: Any, level_dbfs: float, ref: LevelRef | None) -> float:
+    """Input power (dBm) of a tone read at ``level_dbfs`` (linear regime): calibrated level
+    reference, else the nominal AD936x level model ``dBFS ≈ dBm + G − 5`` (safety cap only)."""
+    if ref is not None and ref.calibrated:
+        return float(level_dbfs) + float(ref.offset_db)
+    return float(level_dbfs) - float(dev.gains[0]) - LEVEL_MODEL_OFFSET_DB
+
+
+def relative_setting_cap(ctx: MeasurementContext, dev: Any, setting: float, level_dbfs: float,
+                         ref: LevelRef | None) -> float:
+    """Highest setting of a *relative* source that keeps the RX input at or below
+    :func:`rx_max_input_dbm`, extrapolated from one linear reading (``setting`` read at
+    ``level_dbfs``). ``inf`` for absolute sources (capped by :func:`source_power_range`)."""
+    if getattr(ctx.source, "absolute_power", False):
+        return math.inf
+    cap = rx_max_input_dbm(dev)
+    if not math.isfinite(cap):
+        return math.inf
+    return float(setting) + cap - input_dbm_estimate(dev, level_dbfs, ref)
 
 
 def valid_bins(app: AppConfig, n_bins: int) -> np.ndarray:
@@ -161,7 +207,7 @@ def settled_capture(dev: Any, n: int) -> IQBlock:
 def nominal_setting(ctx: MeasurementContext, dev: Any, target_dbfs: float, ref: LevelRef | None) -> float:
     """First guess of the source setting that gives ``target_dbfs`` at the ADC."""
     src = ctx.source
-    lo, hi = source_power_range(src)
+    lo, hi = source_power_range(src, dev)
     if getattr(src, "absolute_power", False):
         if ref is not None and ref.calibrated:
             guess = target_dbfs + ref.offset_db
@@ -172,24 +218,68 @@ def nominal_setting(ctx: MeasurementContext, dev: Any, target_dbfs: float, ref: 
     return float(np.clip(guess, lo, hi))
 
 
-def level_uncertainty_db(ctx: MeasurementContext, ref: LevelRef | None, override: float | None) -> float | None:
-    """Systematic level uncertainty (≈95 %, dB) of absolute values.
+def source_anchor_dbm(src: Any) -> float | None:
+    """DUT input power at relative 0 dB of an *anchored relative* source (Pluto TX with
+    ``anchor_dbm``: ``P_dut = anchor_dbm − path_loss_db + P_rel``), else ``None``."""
+    if src is None:
+        return None
+    try:
+        anchor = getattr(src, "anchor_dbm", None)
+        loss = getattr(src, "path_loss_db", 0.0)
+    except Exception:  # noqa: BLE001 - remote proxy attribute access
+        return None
+    if anchor is None or isinstance(anchor, bool) or not isinstance(anchor, (int, float)):
+        return None
+    try:
+        loss = float(loss or 0.0)
+    except (TypeError, ValueError):
+        loss = 0.0
+    return float(anchor) - loss
 
-    ``override`` (parameter) wins. Otherwise: simulator source (exact by construction) → 0;
-    any other absolute generator or a calibration table → :data:`DEFAULT_LEVEL_UNCERTAINTY_DB`;
-    uncalibrated → ``None`` (no absolute level)."""
+
+def level_uncertainty_budget(ctx: MeasurementContext, ref: LevelRef | None, override: float | None, *,
+                             setting: float | None = None) -> tuple[float | None, str]:
+    """Systematic level uncertainty (≈95 %, dB) of absolute values and how it was obtained (TR).
+
+    * ``override`` (parameter) wins;
+    * uncalibrated (no table, no absolute source) → ``None`` (no absolute level);
+    * calibration table → :data:`DEFAULT_LEVEL_UNCERTAINTY_DB`;
+    * simulator source → 0 (exact by construction);
+    * anchored relative source (Pluto TX + ``anchor_dbm``) → ``U_anchor ⊕ k·|P_rel|`` with
+      ``P_rel`` the relative level of ``setting`` (default: the in-situ probe's setting):
+      the anchor holds at 0 dB only, every dB of TX attenuator / digital scaling below it is
+      extrapolated (:data:`ANCHOR_UNCERTAINTY_DB`, :data:`ATTENUATION_LINEARITY_DB_PER_DB`);
+    * any other absolute generator (SCPI, manual) → :data:`DEFAULT_LEVEL_UNCERTAINTY_DB`.
+    """
     if override is not None:
-        return float(override)
+        return float(override), "parametre (level_uncertainty_db)"
     src = ctx.source
     calibrated = (ref is not None and ref.calibrated) or bool(getattr(src, "absolute_power", False))
     if not calibrated:
-        return None
+        return None, "kalibrasyonsuz — mutlak seviye yok"
+    if ref is not None and ref.method == "kalibrasyon tablosu":
+        return DEFAULT_LEVEL_UNCERTAINTY_DB, f"kalibrasyon tablosu (varsayılan ±{DEFAULT_LEVEL_UNCERTAINTY_DB:g} dB)"
     from ..hal.sim.source import SimSignalSource
 
-    from_table = ref is not None and ref.method == "kalibrasyon tablosu"
-    if isinstance(src, SimSignalSource) and not from_table:
-        return 0.0
-    return DEFAULT_LEVEL_UNCERTAINTY_DB
+    if isinstance(src, SimSignalSource):
+        return 0.0, "simülatör kaynağı (tanım gereği kesin)"
+    anchor = source_anchor_dbm(src)
+    if anchor is not None:
+        s = setting if setting is not None else (ref.setting if ref is not None else None)
+        if s is None:
+            return None, "çapalı bağıl kaynak: seviye bilinmiyor — belirsizlik bilinmiyor (level_uncertainty_db verin)"
+        p_rel = float(s) - anchor
+        u = math.hypot(ANCHOR_UNCERTAINTY_DB, ATTENUATION_LINEARITY_DB_PER_DB * abs(p_rel))
+        return u, (f"çapalı bağıl kaynak (tahmini bütçe): çapa ±{ANCHOR_UNCERTAINTY_DB:g} dB ⊕ "
+                   f"{ATTENUATION_LINEARITY_DB_PER_DB:g} dB/dB × |P_bağıl| = {abs(p_rel):.1f} dB "
+                   "(zayıflatıcı + sayısal ölçekleme ekstrapolasyonu; kutu sızıntısı hariç)")
+    return DEFAULT_LEVEL_UNCERTAINTY_DB, f"mutlak üreteç (varsayılan ±{DEFAULT_LEVEL_UNCERTAINTY_DB:g} dB)"
+
+
+def level_uncertainty_db(ctx: MeasurementContext, ref: LevelRef | None, override: float | None, *,
+                         setting: float | None = None) -> float | None:
+    """Value part of :func:`level_uncertainty_budget`."""
+    return level_uncertainty_budget(ctx, ref, override, setting=setting)[0]
 
 
 @dataclass
@@ -271,7 +361,7 @@ def adjust_tone(ctx: MeasurementContext, dev: Any, f_src: float, target_dbfs: fl
     src = ctx.source
     if src is None:
         raise MeasurementError("Bu adım sinyal kaynağı gerektiriyor")
-    lo, hi = source_power_range(src)
+    lo, hi = source_power_range(src, dev)
     s = nominal_setting(ctx, dev, target_dbfs, ref) if setting is None else float(np.clip(setting, lo, hi))
     search = freq_search_hz(dev, f_src, dev.fs / nfft) if search_hz is None else float(search_hz)
     best: ToneProbe | None = None
@@ -287,11 +377,13 @@ def adjust_tone(ctx: MeasurementContext, dev: Any, f_src: float, target_dbfs: fl
         if not pr.visible:
             if s >= hi:
                 raise MeasurementError(
-                    f"Ton ({fmt_hz(f_src)}) kaynağın en yüksek gücünde ({hi:g}) bile görülmüyor — kablo/zayıflatıcı/"
-                    "kaynak bağlantısını kontrol edin")
+                    f"Ton ({fmt_hz(f_src)}) izin verilen en yüksek kaynak seviyesinde ({hi:g}; kaynak aralığı ve RX "
+                    "giriş sınırı) bile görülmüyor — kablo/zayıflatıcı/kaynak bağlantısını kontrol edin")
             s = min(hi, s + 20.0)
             continue
         best = pr
+        # relative source: never above the RX input limit, extrapolated from this reading
+        hi = max(lo, min(hi, relative_setting_cap(ctx, dev, pr.setting, pr.level_dbfs, ref)))
         err = float(target_dbfs) - pr.level_dbfs
         if abs(err) <= tol_db:
             return pr
@@ -304,6 +396,44 @@ def adjust_tone(ctx: MeasurementContext, dev: Any, f_src: float, target_dbfs: fl
     if best is None:
         raise MeasurementError(f"Ton ({fmt_hz(f_src)}) seviyesi {max_iter} denemede ayarlanamadı")
     return best
+
+
+def try_lo_offset(src: Any, hz: float) -> float | None:
+    """``src.set_lo_offset(hz)`` (LO = tone − ``hz``): the offset in effect, or ``None`` when the
+    source has no LO of its own (:class:`NotSupported`: simulator, lab generator). Other
+    errors (offset outside the source's band, :class:`ConfigError`) propagate."""
+    fn = getattr(src, "set_lo_offset", None)
+    if fn is None:
+        return None
+    try:
+        return float(fn(float(hz)))
+    except NotSupported:
+        return None
+
+
+def source_lo_offset_hz(src: Any) -> float | None:
+    """The source's configured single-tone LO offset (``tone_offset_hz``), ``None`` without an LO."""
+    try:
+        v = src.describe().get("tone_offset_hz")
+    except Exception:  # noqa: BLE001 - describe is informational
+        return None
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def source_artifacts(src: Any, e: float = 0.0) -> list[tuple[float, str]]:
+    """Apparent RF frequencies (``f / (1 + e)``) and Turkish labels of the stimulus's own
+    artifacts: the LO leakage at ``LO`` and the TX IQ image ``2·LO − f`` of every tone (Pluto /
+    HackRF TX, from ``describe()``: ``lo_hz``, ``tones_hz``). Empty for sources without an LO."""
+    try:
+        d = src.describe()
+    except Exception:  # noqa: BLE001 - describe is informational
+        return []
+    lo = d.get("lo_hz")
+    tones = d.get("tones_hz") or []
+    if not isinstance(lo, (int, float)) or isinstance(lo, bool):
+        return []
+    out = [(float(lo), "kaynak LO kaçağı")] + [(2.0 * float(lo) - float(t), "kaynak TX imajı") for t in tones]
+    return [(f / (1.0 + float(e)), lab) for f, lab in out]
 
 
 def known_search_hz(bin_hz: float) -> float:
@@ -335,4 +465,5 @@ def reference_level(ctx: MeasurementContext, dev: Any, f_hz: float, *, nfft: int
     if pr.snr_db < 30.0:
         log.warning("Seviye referansı: prob tonu SNR %.1f dB (< 30 dB) — referans güveni düşük", pr.snr_db)
     return LevelRef(float(pr.setting - pr.level_dbfs),
-                    f"kaynak referanslı (in-situ, {pr.setting:.1f} dBm @ {fmt_hz(f_probe)})", True, "dBm")
+                    f"kaynak referanslı (in-situ, {pr.setting:.1f} dBm @ {fmt_hz(f_probe)})", True, "dBm",
+                    setting=float(pr.setting))

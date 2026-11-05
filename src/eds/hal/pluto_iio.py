@@ -10,12 +10,23 @@ This module only touches a handful of ``ad9361-phy`` IIO attributes:
   ``hardwaregain_available`` ("[min step max]"), ``rssi`` ("105.25 dB").
 * input ``temp0``: ``input`` (milli-°C) or ``raw``/``scale``/``offset``.
 * context attrs: ``fw_version``, ``hw_serial`` (Pluto firmware) / ``usb,serial``.
+* ``cf-ad9361-lpc`` (AXI ADC core + RX DMA) register ``0x80000088`` — the ADC **DMA status**
+  register; bit 2 (``0x4``) = RX DMA **overflow** (samples dropped because no kernel buffer
+  was free), write-1-to-clear. Read through the driver's debugfs ``direct_reg_access``
+  (address bit 31 selects the core register space). Exactly what libiio's
+  ``examples/iio_adi_xflow_check.c`` polls (``val & 4`` → "Overflow detected", then writes
+  the value back to clear). SoapyPlutoSDR itself NEVER reports an overflow
+  (``rx_streamer::recv`` only returns an item count or ``SOAPY_SDR_TIMEOUT``), so this
+  register is the only overflow source on a Pluto (:meth:`PlutoIIO.read_clear_rx_overflow`).
 
 It uses the pylibiio API exactly as shipped with libiio 0.23–0.25 (``import iio``):
 ``iio.Context(uri)``, ``ctx.find_device(name)`` → ``Device | None``,
 ``dev.attrs[name].value`` (get/set **str**), ``dev.find_channel(id, is_output)`` →
 ``Channel | None``, ``chan.attrs[name].value``, ``ctx.attrs`` (name → str; objects with
-``.value`` are tolerated as well). Attribute I/O errors surface as ``OSError``.
+``.value`` are tolerated as well), ``dev.reg_read(addr) -> int`` / ``dev.reg_write(addr,
+value)`` (``iio_device_reg_read/_write``) and ``iio.scan_contexts() -> {uri: description}``
+(USB descriptions end in ``serial=<hw_serial>``, as ``iio_info -s`` prints them). I/O
+errors surface as ``OSError``.
 
 USB note: a second libiio *USB* context to a Pluto that SoapyPlutoSDR is already streaming
 from usually fails (interface busy). Use the network URI of the Pluto's USB-Ethernet
@@ -39,6 +50,11 @@ from ..core.errors import BackendUnavailable, ConfigError, DeviceError, DeviceNo
 log = logging.getLogger(__name__)
 
 PHY_NAME = "ad9361-phy"
+RX_DMA_DEVICE = "cf-ad9361-lpc"
+#: AXI ADC core "DMA status" register (bit 31 = core register space of ``direct_reg_access``).
+ADC_DMA_STATUS_REG = 0x80000088
+#: RX DMA overflow bit of :data:`ADC_DMA_STATUS_REG` (write-1-to-clear).
+ADC_DMA_STATUS_OVERFLOW = 0x4
 RX_CHANNEL = "voltage0"
 TEMP_CHANNEL = "temp0"
 GAIN_CONTROL_MODES = ("manual", "slow_attack", "fast_attack", "hybrid")
@@ -63,6 +79,7 @@ EXTERNAL_REF_NOTE = (
 
 _RANGE_RE = re.compile(r"^\s*\[\s*([-+0-9.eE]+)\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\s*\]\s*$")
 _NUM_RE = re.compile(r"[-+]?\d+(?:\.\d*)?(?:[eE][-+]?\d+)?")
+_SERIAL_RE = re.compile(r"serial=([0-9A-Za-z]+)")
 
 
 def import_iio() -> ModuleType:
@@ -100,6 +117,32 @@ def parse_number(text: str) -> float:
     return float(m.group(0))
 
 
+def scan_serials() -> dict[str, str]:
+    """``{uri: serial}`` of every libiio context the local scan finds (``iio_info -s``).
+
+    Uses ``iio.scan_contexts()``; the serial is the ``serial=...`` field of the context
+    description (USB: the USB serial string, which on a Pluto equals its ``hw_serial``;
+    network/DNS-SD: the ``hw_serial`` context attribute). Contexts without a serial are
+    omitted. The USB scan only reads descriptors, so it also lists a Pluto that another
+    process is streaming from. :class:`BackendUnavailable` without pylibiio,
+    :class:`DeviceError` if the scan itself fails.
+    """
+    iio = import_iio()
+    scan = getattr(iio, "scan_contexts", None)
+    if not callable(scan):
+        raise BackendUnavailable("pylibiio 'scan_contexts' sunmuyor (libiio < 0.21?); seri numarası taranamıyor")
+    try:
+        found = scan()
+    except (OSError, RuntimeError, ValueError) as e:
+        raise DeviceError(f"libiio bağlam taraması başarısız: {e}") from e
+    out: dict[str, str] = {}
+    for uri, desc in dict(found or {}).items():
+        m = _SERIAL_RE.search(str(desc))
+        if m:
+            out[str(uri)] = m.group(1)
+    return out
+
+
 class PlutoIIO:
     """Minimal ``ad9361-phy`` control over one libiio context (thread-safe)."""
 
@@ -119,6 +162,7 @@ class PlutoIIO:
             raise DeviceNotFound(f"{uri}: '{PHY_NAME}' IIO cihazı yok (Pluto/AD936x değil mi?)")
         self._ctx: Any = ctx
         self._phy: Any = phy
+        self._rxdma: Any = ctx.find_device(RX_DMA_DEVICE)
         self.xo_boot_hz: int | None = None
         try:
             self.xo_boot_hz = self.get_xo_correction()
@@ -216,6 +260,54 @@ class PlutoIIO:
         info["fw_version"] = self.firmware_version()
         return info
 
+    # ------------------------------------------------------------------ RX DMA overflow
+    def rx_overflow_supported(self) -> bool:
+        """True if ``cf-ad9361-lpc`` exists, the binding offers register access and the device
+        exposes the ``direct_reg_access`` debug attribute that ``iio_device_reg_read`` uses."""
+        dev = self._rxdma
+        if dev is None or not callable(getattr(dev, "reg_read", None)) or not callable(
+                getattr(dev, "reg_write", None)):
+            return False
+        try:
+            dbg = dev.debug_attrs
+        except (AttributeError, OSError):
+            return True                     # binding without debug_attrs: try at use time
+        return "direct_reg_access" in dbg
+
+    def _require_rxdma(self) -> Any:
+        if self._phy is None:
+            raise DeviceError(f"PlutoIIO ({self.uri}) kapalı")
+        if not self.rx_overflow_supported():
+            raise NotSupported(f"{self.uri}: '{RX_DMA_DEVICE}' yok ya da pylibiio register erişimi "
+                               "(Device.reg_read/reg_write) sunmuyor; RX overflow algılanamaz")
+        return self._rxdma
+
+    def read_rx_dma_status(self) -> int:
+        """Raw value of the AXI ADC DMA status register (``0x80000088``)."""
+        with self._lock:
+            dev = self._require_rxdma()
+            try:
+                return int(dev.reg_read(ADC_DMA_STATUS_REG)) & 0xFFFFFFFF
+            except OSError as e:
+                raise DeviceError(f"{self.uri}: {RX_DMA_DEVICE} DMA durum yazmacı okunamadı: {e}") from e
+
+    def clear_rx_overflow(self) -> None:
+        """Clear the RX overflow bit (write-1-to-clear), e.g. right after the stream starts."""
+        with self._lock:
+            dev = self._require_rxdma()
+            try:
+                dev.reg_write(ADC_DMA_STATUS_REG, ADC_DMA_STATUS_OVERFLOW)
+            except OSError as e:
+                raise DeviceError(f"{self.uri}: {RX_DMA_DEVICE} DMA durum yazmacı temizlenemedi: {e}") from e
+
+    def read_clear_rx_overflow(self) -> bool:
+        """True if the RX DMA dropped samples since the last call (the bit is then cleared)."""
+        with self._lock:
+            if not self.read_rx_dma_status() & ADC_DMA_STATUS_OVERFLOW:
+                return False
+            self.clear_rx_overflow()
+            return True
+
     # ------------------------------------------------------------------ tracking
     def set_tracking(self, bb_dc: bool | None = None, rf_dc: bool | None = None,
                      quad: bool | None = None) -> dict[str, bool]:
@@ -308,6 +400,7 @@ class PlutoIIO:
         """Drop the context (pylibiio destroys it when the last reference goes away)."""
         with self._lock:
             self._phy = None
+            self._rxdma = None
             self._ctx = None
 
     def __enter__(self) -> PlutoIIO:

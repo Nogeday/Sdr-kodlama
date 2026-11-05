@@ -96,22 +96,34 @@ def reset_baseline(ctx: MeasurementContext) -> None:
 
     Called before each measurement so that one measurement's settings (sample rate sweep,
     gain changes, tracking off) never leak into the next one.
+    Every step is attempted even if an earlier one fails; the first error is then raised
+    (``run_suite`` turns it into a ``failed`` result of the next measurement).
     """
+    errors: list[Exception] = []
+    steps: list[Callable[[], Any]] = []
     if ctx.source is not None:
-        ctx.source.set_enabled(False)
+        steps.append(lambda: ctx.source.set_enabled(False))
     for d in ctx.devices:
-        d.stop_stream()
-        d.configure(ctx.app.rx)
+        steps.append(lambda d=d: (d.stop_stream(), d.configure(ctx.app.rx)))
+    for step in steps:
+        try:
+            step()
+        except Exception as e:  # noqa: BLE001 - attempt every device, report the first error
+            errors.append(e)
+    if errors:
+        raise errors[0]
 
 
 @dataclass
 class SuiteResult:
     results: list[MeasurementResult] = field(default_factory=list)
     report_dir: Path | None = None
+    #: Why the suite stopped before its last measurement (empty = ran to the end).
+    aborted: str = ""
 
     @property
     def ok(self) -> bool:
-        return all(r.status != "failed" for r in self.results)
+        return not self.aborted and all(r.status != "failed" for r in self.results)
 
 
 def resolve_spec_ids(spec_ids: Iterable[str] | None) -> list[str]:
@@ -122,6 +134,42 @@ def resolve_spec_ids(spec_ids: Iterable[str] | None) -> list[str]:
     if unknown:
         raise MeasurementError(f"Bilinmeyen ölçüm(ler): {unknown} — geçerli: {list(SPEC_IDS)}")
     return ids
+
+
+#: ``write_report`` header row written when the suite stopped early.
+ABORT_META_KEY = "Ölçüm oturumu"
+
+
+def _placeholder(ctx: MeasurementContext, sid: str, status: str, error: str, summary: str) -> MeasurementResult:
+    """Result for a measurement that did not run (or ran into a session-level error)."""
+    from . import specs  # noqa: F401  (populate registry)
+    from .base import MEASUREMENTS
+
+    cls = MEASUREMENTS.get(sid)
+    try:
+        dev = ctx.dut.describe() if hasattr(ctx.dut, "describe") else {}
+    except Exception:  # noqa: BLE001 - a broken device must not hide the original error
+        dev = {}
+    res = MeasurementResult(spec_id=sid, title=getattr(cls, "title", sid), value=None,
+                            unit=getattr(cls, "unit", ""), status=status, error=error, summary=summary, device=dev)
+    res.conditions.setdefault("quick", bool(ctx.quick))
+    res.conditions.setdefault("simulated", bool(ctx.is_sim))
+    return res
+
+
+def _run_one(ctx: MeasurementContext, sid: str) -> MeasurementResult:
+    """Baseline reset + measurement; never raises for an ordinary error (STR-06): a device
+    error while restoring the baseline becomes a ``failed`` result of that measurement
+    (it is not run: its conditions would be unknown)."""
+    try:
+        reset_baseline(ctx)
+    except Exception as e:  # noqa: BLE001 - isolate the measurements from each other
+        log.exception("ölçüm öncesi temel duruma dönülemedi: %s", sid)
+        err = f"{type(e).__name__}: {e}"
+        return _placeholder(ctx, sid, "failed", f"Temel duruma (rx ayarları) dönülemedi: {err}",
+                            f"Başarısız: ölçüm öncesi cihaz yapılandırılamadı ({err}); ölçüm çalıştırılmadı")
+    log.info("ölçüm başlıyor: %s", sid)
+    return run_measurement(sid, ctx)
 
 
 def run_suite(
@@ -135,7 +183,14 @@ def run_suite(
     on_result: Callable[[MeasurementResult], None] | None = None,
     **build_kw: Any,
 ) -> SuiteResult:
-    """Run measurements in order, isolated from each other; returns results + report dir."""
+    """Run measurements in order, isolated from each other; returns results + report dir.
+
+    Isolation: an error of one measurement, of the baseline reset before it, of the target
+    evaluation, of the bus publication or of ``on_result`` never discards the others. If
+    the suite itself is interrupted (e.g. Ctrl-C), the measurements already completed are
+    still written to a report marked as interrupted (the not-run ones as ``skipped``) and
+    the exception is re-raised.
+    """
     ids = resolve_spec_ids(spec_ids)
     own_ctx = ctx is None
     if ctx is None:
@@ -148,34 +203,77 @@ def run_suite(
 
             publisher = publisher_from_config(app.bus, src="measure")
         try:
-            from .targets import apply_targets, load_targets
+            from .targets import VERDICT_NOTE_KEY, apply_targets, load_targets
 
             targets = load_targets(app.measure.targets_file)
         except Exception as e:  # noqa: BLE001 - targets are optional
             log.warning("KTR hedefleri yüklenemedi (%s); 'Hedef' sütunu boş kalacak", e)
-            targets, apply_targets = {}, None
-        for sid in ids:
-            reset_baseline(ctx)
-            log.info("ölçüm başlıyor: %s", sid)
-            res = run_measurement(sid, ctx)
-            if apply_targets is not None:
-                apply_targets([res], targets)
-            suite.results.append(res)
-            if publisher is not None:
-                from ..bus.topics import MEAS_RESULT
+            targets, apply_targets, VERDICT_NOTE_KEY = {}, None, "verdict_note"
+        completed = 0
+        running = False
+        try:
+            for sid in ids:
+                running = True
+                res = _run_one(ctx, sid)
+                if apply_targets is not None:
+                    try:
+                        apply_targets([res], targets)
+                    except Exception as e:  # noqa: BLE001
+                        log.exception("KTR hedefi değerlendirilemedi: %s", sid)
+                        res.passed = None
+                        res.extra[VERDICT_NOTE_KEY] = f"Hedef değerlendirilemedi: {type(e).__name__}: {e}"
+                suite.results.append(res)
+                completed += 1
+                running = False
+                if publisher is not None:
+                    try:
+                        from ..bus.topics import MEAS_RESULT
 
-                publisher.publish(MEAS_RESULT, res.bus_payload())
-            if on_result is not None:
-                on_result(res)
-            log.info("ölçüm bitti: %s -> %s %s (%s)", sid, res.value, res.unit, res.status)
+                        publisher.publish(MEAS_RESULT, res.bus_payload())
+                    except Exception as e:  # noqa: BLE001 - the bus is optional for a measurement
+                        log.warning("meas.result yayınlanamadı (%s): %s", sid, e)
+                        res.extra["publish_error"] = f"{type(e).__name__}: {e}"
+                if on_result is not None:
+                    try:
+                        on_result(res)
+                    except Exception:  # noqa: BLE001 - a caller's progress hook must not stop the suite
+                        log.exception("on_result geri çağrısı hata verdi: %s", sid)
+                log.info("ölçüm bitti: %s -> %s %s (%s)", sid, res.value, res.unit, res.status)
+        except BaseException as e:
+            why = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+            suite.aborted = why
+            rest = ids[len(suite.results):]
+            for k, sid in enumerate(rest):
+                if k == 0 and running:
+                    suite.results.append(_placeholder(ctx, sid, "failed", f"Ölçüm yarıda kesildi ({why})",
+                                                      f"Başarısız: ölçüm yarıda kesildi ({why})"))
+                else:
+                    suite.results.append(_placeholder(ctx, sid, "skipped", f"Oturum yarıda kesildi ({why})",
+                                                      "Atlandı: ölçüm oturumu bu ölçümden önce kesildi"))
+            log.error("ölçüm oturumu yarıda kesildi (%s); tamamlanan %d/%d ölçüm", why, completed, len(ids))
+            if write and completed:
+                try:
+                    suite.report_dir = _write(suite, ctx, app, title, completed=completed)
+                    log.error("tamamlanan ölçümlerin kısmi raporu yazıldı: %s", suite.report_dir)
+                except Exception:  # noqa: BLE001 - never mask the interruption
+                    log.exception("kısmi rapor yazılamadı")
+            raise
         if write:
-            from .report import write_report
-
-            kw = {"title": title} if title else {}
-            suite.report_dir = write_report(suite.results, ctx.out_dir, app=app, **kw)
+            suite.report_dir = _write(suite, ctx, app, title)
     finally:
         if publisher is not None:
             publisher.close()
         if own_ctx:
             close_context(ctx)
     return suite
+
+
+def _write(suite: SuiteResult, ctx: MeasurementContext, app: AppConfig, title: str | None,
+           completed: int | None = None) -> Path:
+    from .report import write_report
+
+    kw: dict[str, Any] = {"title": title} if title else {}
+    if suite.aborted:
+        kw["meta"] = {ABORT_META_KEY: f"YARIDA KESİLDİ ({suite.aborted}) — {completed}/{len(suite.results)} ölçüm "
+                                      "tamamlandı; kalanlar çalıştırılmadı"}
+    return write_report(suite.results, ctx.out_dir, app=app, **kw)

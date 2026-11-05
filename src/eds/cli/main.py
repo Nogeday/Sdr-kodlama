@@ -59,7 +59,31 @@ class _Parser(argparse.ArgumentParser):
 
     def error(self, message: str) -> None:  # type: ignore[override]
         self.print_usage(sys.stderr)
-        self.exit(EXIT_ERROR, f"{self.prog}: hata: {message}\n")
+        self.exit(EXIT_ERROR, f"{self.prog}: hata: {translate_usage_error(message)}\n")
+
+
+#: argparse (English) usage-error fragments → Turkish (operator-facing text is Turkish).
+_USAGE_TR: tuple[tuple[str, str], ...] = (
+    ("the following arguments are required: ", "şu argümanlar gerekli: "),
+    ("unrecognized arguments: ", "tanınmayan argümanlar: "),
+    ("one of the arguments ", "şu argümanlardan biri gerekli: "),
+    (" is required", ""),
+    (": not allowed with argument ", ": şu argümanla birlikte kullanılamaz: "),
+    ("invalid choice: ", "geçersiz seçim: "),
+    ("(choose from ", "(seçenekler: "),
+    ("expected at least one argument", "en az bir değer bekleniyordu"),
+    ("expected one argument", "bir değer bekleniyordu"),
+    ("invalid int value: ", "geçersiz tamsayı: "),
+    ("invalid float value: ", "geçersiz sayı: "),
+    ("argument ", "argüman "),
+)
+
+
+def translate_usage_error(message: str) -> str:
+    """Turkish rendering of the common argparse usage-error messages (unknown ones unchanged)."""
+    for en, tr in _USAGE_TR:
+        message = message.replace(en, tr)
+    return message
 
 
 def _add_globals(p: argparse.ArgumentParser, top: bool, skip: Sequence[str] = ()) -> None:
@@ -90,6 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
     from ..measure.base import SPEC_IDS
     from ..rx.node import COMMANDS
     from . import cmd_bus, cmd_cal, cmd_hw, cmd_measure
+    from .util import finite_float, nonneg_float, positive_float, positive_int
 
     p = _Parser(prog="eds", description=DESCRIPTION)
     p.add_argument("--version", action="version", version=f"eds {__version__}",
@@ -117,15 +142,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ---------------------------------------------------------------- rx / sweep
     sp = _sub(subs, "rx", "RX düğümünü çalıştır (akış → PSD → CFAR → ZeroMQ); stderr'de periyodik durum satırı")
-    sp.add_argument("--duration", type=float, metavar="S", default=None,
+    sp.add_argument("--duration", type=nonneg_float, metavar="S", default=None,
                     help="çalışma süresi [s] (varsayılan: Ctrl-C ya da 'stop' komutuna kadar)")
     sp.set_defaults(func=cmd_hw.cmd_rx)
 
     sp = _sub(subs, "sweep", "tek geniş bant tarama (hız + tespit tablosu, isteğe bağlı npz/PNG/bus)")
-    sp.add_argument("--start", type=float, metavar="HZ", help="başlangıç frekansı [Hz] (varsayılan sweep.start_hz)")
-    sp.add_argument("--stop", type=float, metavar="HZ", help="bitiş frekansı [Hz] (varsayılan sweep.stop_hz)")
-    sp.add_argument("--rbw", type=float, metavar="HZ", help="çözünürlük bant genişliği [Hz] (nfft'yi belirler)")
-    sp.add_argument("--fs", type=float, metavar="HZ", help="burst örnekleme hızı [S/s]")
+    sp.add_argument("--start", type=positive_float, metavar="HZ",
+                    help="başlangıç frekansı [Hz] (varsayılan sweep.start_hz)")
+    sp.add_argument("--stop", type=positive_float, metavar="HZ", help="bitiş frekansı [Hz] (varsayılan sweep.stop_hz)")
+    sp.add_argument("--rbw", type=positive_float, metavar="HZ",
+                    help="çözünürlük bant genişliği [Hz] (nfft'yi belirler)")
+    sp.add_argument("--fs", type=positive_float, metavar="HZ", help="burst örnekleme hızı [S/s]")
     sp.add_argument("--out", metavar="DOSYA.npz", help="sonucu kaydet (f_hz, p_db, meta JSON)")
     sp.add_argument("--png", metavar="DOSYA", help="spektrum analizörü ekran görüntüsü (PNG)")
     sp.add_argument("--publish", action="store_true", help="sonucu rx.sweep olarak bus'a yayınla")
@@ -138,12 +165,13 @@ def build_parser() -> argparse.ArgumentParser:
     cal_subs.required = True
     sp = _sub(cal_subs, "ppm", "referans saat (TCXO) ppm kalibrasyonu: CW referans ya da GSM FCCH")
     src = sp.add_mutually_exclusive_group(required=True)
-    src.add_argument("--ref-hz", type=float, metavar="F", help="bilinen frekanslı CW referans [Hz] (GPSDO kilitli)")
-    src.add_argument("--gsm-freq", type=float, metavar="F", help="GSM BCCH taşıyıcı frekansı [Hz] (FCCH)")
+    src.add_argument("--ref-hz", type=positive_float, metavar="F",
+                     help="bilinen frekanslı CW referans [Hz] (GPSDO kilitli)")
+    src.add_argument("--gsm-freq", type=positive_float, metavar="F", help="GSM BCCH taşıyıcı frekansı [Hz] (FCCH)")
     src.add_argument("--gsm-arfcn", type=int, metavar="N", help="GSM BCCH ARFCN numarası (FCCH)")
     sp.add_argument("--band", choices=("GSM900", "DCS1800"), default=None,
                     help="ARFCN bandı (varsayılan: numaradan otomatik)")
-    sp.add_argument("--repeats", type=int, metavar="N", default=None,
+    sp.add_argument("--repeats", type=positive_int, metavar="N", default=None,
                     help="CW: tekrar sayısı (vars. 5); FCCH: burst sayısı (vars. 10, en az 3)")
     sp.add_argument("--no-save", action="store_true", help="kalibrasyon deposuna kaydetme")
     sp.add_argument("--apply", action="store_true", help="sonucu cihaza uygula (cal.ppm_mode'a göre)")
@@ -151,17 +179,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_cal.cmd_cal_ppm)
 
     sp = _sub(cal_subs, "power", "mutlak güç kalibrasyonu (dBFS → dBm ofset tablosu, kalibre kaynakla)")
-    sp.add_argument("--freqs", type=float, nargs="+", required=True, metavar="HZ", help="ölçüm frekansları [Hz]")
-    sp.add_argument("--gains", type=float, nargs="+", required=True, metavar="DB", help="RX kazançları [dB]")
-    sp.add_argument("--p-in", type=float, nargs="+", required=True, metavar="DBM",
+    sp.add_argument("--freqs", type=positive_float, nargs="+", required=True, metavar="HZ",
+                    help="ölçüm frekansları [Hz]")
+    sp.add_argument("--gains", type=finite_float, nargs="+", required=True, metavar="DB", help="RX kazançları [dB]")
+    sp.add_argument("--p-in", type=finite_float, nargs="+", required=True, metavar="DBM",
                     help="RX girişindeki kaynak gücü [dBm] (tek değer ya da kazanç başına bir değer)")
     sp.add_argument("--no-save", action="store_true", help="kalibrasyon deposuna kaydetme")
     sp.add_argument("--publish", action="store_true", help="cal.result mesajı yayınla")
     sp.set_defaults(func=cmd_cal.cmd_cal_power)
 
     sp = _sub(cal_subs, "coherence", "çok kanallı grubun (2× Pluto) koherens kontrolü; depoya kaydet, cal.result yayınla")
-    sp.add_argument("--n", type=int, default=65536, metavar="N", help="blok başına örnek (vars. 65536)")
-    sp.add_argument("--blocks", type=int, default=8, metavar="N", help="blok sayısı (vars. 8)")
+    sp.add_argument("--n", type=positive_int, default=65536, metavar="N", help="blok başına örnek (vars. 65536)")
+    sp.add_argument("--blocks", type=positive_int, default=8, metavar="N", help="blok sayısı (vars. 8)")
     sp.add_argument("--no-save", action="store_true", help="kalibrasyon deposuna kaydetme")
     sp.add_argument("--no-publish", action="store_true", help="cal.result yayınlama")
     sp.set_defaults(func=cmd_cal.cmd_cal_coherence)
@@ -190,15 +219,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--frontend", metavar="UÇ", default=None, help="yayıncıların bağlandığı uç (vars. bus.proxy_frontend)")
     sp.add_argument("--backend", dest="backend_ep", metavar="UÇ", default=None,
                     help="abonelerin bağlandığı uç (vars. bus.proxy_backend)")
-    sp.add_argument("--duration", type=float, metavar="S", default=None, help="çalışma süresi [s] (vars. Ctrl-C)")
+    sp.add_argument("--duration", type=nonneg_float, metavar="S", default=None,
+                    help="çalışma süresi [s] (vars. Ctrl-C)")
     sp.set_defaults(func=cmd_bus.cmd_bus_proxy)
 
     sp = _sub(bus_subs, "echo", "bus mesajlarını dinle ve her birini tek satır yazdır")
     sp.add_argument("topics", nargs="*", metavar="TOPIC", help="dinlenecek topic'ler (varsayılan: hepsi)")
     sp.add_argument("--endpoint", metavar="UÇ", default=None,
                     help="bağlanılacak uç (vars. direct: bus.sub_endpoint, proxy: bus.proxy_backend)")
-    sp.add_argument("--count", type=int, metavar="N", default=None, help="N mesajdan sonra çık")
-    sp.add_argument("--timeout", type=float, metavar="S", default=None, help="en fazla S saniye dinle")
+    sp.add_argument("--count", type=positive_int, metavar="N", default=None, help="N mesajdan sonra çık")
+    sp.add_argument("--timeout", type=nonneg_float, metavar="S", default=None, help="en fazla S saniye dinle")
     sp.add_argument("--raw", action="store_true", help="zarfın tamamını JSON olarak yazdır")
     sp.set_defaults(func=cmd_bus.cmd_bus_echo)
 
@@ -209,12 +239,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--arg", action="append", default=[], metavar="ANAHTAR=DEĞER",
                     help="komut argümanı (değer TOML sözdizimi; ör. --arg hz=2.4e9); tekrarlanabilir")
     sp.add_argument("--target", default="*", metavar="AD", help="hedef cihaz adı ya da '*' (vars. '*')")
-    sp.add_argument("--wait-ack", type=float, default=0.0, metavar="S", help="ctl.ack için en fazla S saniye bekle")
+    sp.add_argument("--wait-ack", type=nonneg_float, default=0.0, metavar="S",
+                    help="ctl.ack için en fazla S saniye bekle")
     sp.add_argument("--endpoint", metavar="UÇ", default=None,
                     help="komut uç noktası (direct: bind, vars. bus.ctl_endpoints[0]; proxy: bus.proxy_frontend)")
     sp.add_argument("--ack-endpoint", metavar="UÇ", default=None,
                     help="ctl.ack dinleme ucu (vars. direct: bus.sub_endpoint, proxy: bus.proxy_backend)")
-    sp.add_argument("--sub-timeout", type=float, default=3.0, metavar="S",
+    sp.add_argument("--sub-timeout", type=nonneg_float, default=3.0, metavar="S",
                     help="komutu dinleyen düğümü bekleme süresi [s] (vars. 3)")
     sp.add_argument("--req-id", default=None, metavar="ID", help="istek kimliği (vars. rastgele)")
     sp.add_argument("--src", default="cli", metavar="AD", help="zarf 'src' alanı (vars. cli)")

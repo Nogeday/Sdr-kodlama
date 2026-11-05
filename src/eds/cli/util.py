@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import sys
@@ -25,6 +26,61 @@ def parse_literal(text: str) -> Any:
         return tomllib.loads(f"v = {text}")["v"]
     except tomllib.TOMLDecodeError:
         return text
+
+
+# ----------------------------------------------------------------------------- argparse types
+def _number(text: str) -> float:
+    try:
+        v = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"sayı bekleniyordu, {text!r} geldi") from None
+    if not math.isfinite(v):
+        raise argparse.ArgumentTypeError(f"sonlu bir sayı olmalı, {text!r} geldi")
+    return v
+
+
+def finite_float(text: str) -> float:
+    """argparse type: a finite number (``nan`` / ``inf`` rejected with a Turkish message)."""
+    return _number(text)
+
+
+def positive_float(text: str) -> float:
+    """argparse type: a finite number > 0 (frequencies, rates, RBW)."""
+    v = _number(text)
+    if v <= 0:
+        raise argparse.ArgumentTypeError(f"pozitif bir sayı olmalı, {text!r} geldi")
+    return v
+
+
+def nonneg_float(text: str) -> float:
+    """argparse type: a finite number >= 0 (durations, timeouts)."""
+    v = _number(text)
+    if v < 0:
+        raise argparse.ArgumentTypeError(f"negatif olmayan bir sayı olmalı, {text!r} geldi")
+    return v
+
+
+def positive_int(text: str) -> int:
+    """argparse type: an integer >= 1 (counts, repeats, block sizes)."""
+    try:
+        v = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"tamsayı bekleniyordu, {text!r} geldi") from None
+    if v < 1:
+        raise argparse.ArgumentTypeError(f"en az 1 olmalı, {text!r} geldi")
+    return v
+
+
+def nonfinite_paths(obj: Any, path: str = "") -> list[str]:
+    """Dotted paths of the non-finite floats (NaN, ±inf) inside ``obj`` — JSON cannot carry
+    them (the bus would send ``null``)."""
+    if isinstance(obj, float):
+        return [] if math.isfinite(obj) else [path or "(değer)"]
+    if isinstance(obj, dict):
+        return [p for k, v in obj.items() for p in nonfinite_paths(v, f"{path}.{k}" if path else str(k))]
+    if isinstance(obj, (list, tuple)):
+        return [p for i, v in enumerate(obj) for p in nonfinite_paths(v, f"{path}[{i}]")]
+    return []
 
 
 def parse_kv(item: str, what: str = "--set", literal: bool = True) -> tuple[str, Any]:

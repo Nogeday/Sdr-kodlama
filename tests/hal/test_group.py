@@ -69,6 +69,9 @@ class FakeMember(RxDevice):
         if self.barrier is not None:
             self.barrier.wait(timeout=2.0)
         ev = self.script.popleft() if self.script else None
+        if isinstance(ev, RawRead):
+            self.counter += ev.samples.shape[1]
+            return ev
         empty = np.empty((1, 0), np.complex64)
         if ev == "timeout":
             return RawRead(empty, timeout=True)
@@ -227,6 +230,33 @@ def test_timeout_propagates_and_marks_alignment_lost():
     blk = g.read(256)                                        # members no longer in lock-step
     assert blk.overflow
     assert not g.read(256).overflow
+    g.close()
+
+
+def test_member_timeout_flags_that_member_and_the_group():
+    """The member that timed out mid-block also flags its own next block (gap), not only the
+    group's misalignment flag (finding STR-08)."""
+    g, a, b = make_group()
+    g.configure(rxcfg())
+    g.start_stream()
+    b.script.append("timeout")
+    with pytest.raises(StreamTimeout):
+        g.read(256, timeout_s=0.1)
+    assert b._gap_pending and not a._gap_pending
+    assert g.read(256).overflow and b.stats.overflows == 0
+    g.close()
+
+
+def test_member_uncertain_overflow_span_becomes_group_settling():
+    g, a, b = make_group()
+    g.configure(rxcfg())
+    g.start_stream()
+    g.read(256)
+    x = np.ones((1, 256), np.complex64)
+    b.script.append(RawRead(x, overflow_before=True, uncertain_samples=600))   # e.g. Pluto DMA status
+    blk = g.read(256)
+    assert blk.overflow and blk.settling
+    assert [g.read(256).settling for _ in range(3)] == [True, True, False]
     g.close()
 
 

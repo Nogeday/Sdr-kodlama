@@ -20,24 +20,35 @@ backend = "soapy"
 profile = "ad9363_pluto"          # resmî sınırlar; jüri raporu YALNIZCA bu profille üretilir
 channels = [0]
 # --- Cihaz seçimi (SoapySDR device args) ------------------------------------
-# uri = "usb:" → libiio "ilk USB IIO cihazı"nı seçer; YALNIZCA tek Pluto takılıyken
-# çalışır. İki Pluto USB'deyken libiio "usb:" isteğini REDDEDER (EMLINK / "Too many
-# links") — bu durumda tam URI yazın:
-#   iio_info -s                          → "usb:1.5.5 [... serial=104473...]" satırları
-#   SoapySDRUtil --find="driver=plutosdr" → uri=usb:1.5.5, label=... (seri no dahil)
-# USB adresi (usb:BUS.DEV.IF) port/yeniden takma ile DEĞİŞEBİLİR; seri numarası sabittir.
-# Hangi URI'nin hangi Pluto olduğunu her oturumda seri numarasından doğrulayın
-# (kalibrasyon dosyaları cal/<seri>.json seri numarasıyla anahtarlanır).
-# Ek isteğe bağlı SoapyPlutoSDR argümanları: usb_direct = "1" (libusb doğrudan akış,
-# sürücü HAS_LIBUSB1 ile derlendiyse), "stream:bufflen" = "131072" (akış tamponu).
-args = { driver = "plutosdr", uri = "usb:" }
+# Bu tezgâhta İKİ Pluto da USB'ye takılıdır (Pluto B'nin 192.168.3.1 adresi de USB-Ethernet
+# arayüzüdür). uri = "usb:" ("tek USB IIO cihazını otomatik seç") bu durumda libiio
+# tarafından REDDEDİLİR: ENXIO, "No such device or address". Bu yüzden:
+#   (a) SERİ NUMARASI ile seçin (önerilir; USB adresi değişse de doğru cihaz açılır):
+#         args = { driver = "plutosdr", serial = "104473dc5993" }   # tam seri ya da tekil önek
+#       EDS seriyi libiio taramasıyla (iio_info -s) URI'ye çevirir — python3-libiio gerekir.
+#   (b) ya da tam URI yazın (aşağıdaki usb:1.5.5 bir YER TUTUCUDUR):
+#         iio_info -s → "0456:b673 (... PlutoSDR ...), serial=104473... [usb:1.5.5]"
+#       USB adresi (usb:BUS.DEV.IF) port/yeniden takma ile DEĞİŞEBİLİR.
+# SoapySDRUtil --find="driver=plutosdr" yalnızca uri ve label="PlutoSDR #i <uri>" gösterir
+# (seri numarası YOK). Kalibrasyon dosyaları cal/<seri>.json seri numarasıyla anahtarlanır.
+# SoapyPlutoSDR yalnızca uri / hostname / label cihaz argümanlarını ve "stream:bufflen" akış
+# argümanını okur (başka anahtarlar yok sayılır ve uyarı verilir). Akış tamponunu büyütmek
+# için [rx] buffer_size'ı kullanın ("stream:bufflen" da kabul edilir; settle penceresi gerçek
+# tampona göre hesaplanır).
+# Süreç başına TEK Pluto: SoapyPlutoSDR süreç başına tek libiio bağlamı tutar. pluto_tx uyaranı
+# (aşağıda) bu yüzden ayrı bir süreçte çalışır (source_args.isolate, varsayılan true).
+args = { driver = "plutosdr", uri = "usb:1.5.5" }
 # --- İnce libiio katmanı -----------------------------------------------------
 # SoapyPlutoSDR USB üzerinden akış yaparken ikinci bir libiio USB bağlamı genellikle
 # açılamaz → kontrol için Pluto'nun USB-Ethernet arayüzü (iiod) kullanılır.
 # Varsayılan Pluto IP'si 192.168.2.1. İKİ Pluto aynı anda bağlıysa IP'ler FARKLI olmalı:
 # Pluto'nun yığın-bellek sürücüsündeki config.txt → [NETWORK] ipaddr = 192.168.3.1,
 # ipaddr_host = 192.168.3.10 (2. Pluto), kaydet + sürücüyü "çıkar" (eject) → kalıcı.
-# "" = otomatik (args.uri), "none" = ince katman kapalı (xo_correction kullanılamaz).
+# İnce katman ŞUNLAR için gereklidir: xo_correction (donanım PPM), BB-DC/RF-DC/quadrature
+# tracking, hızlı AGC, AD9361 sıcaklığı ve OVERFLOW ALGILAMA (SoapyPlutoSDR örnek kaybını
+# raporlamaz; EDS cf-ad9361-lpc DMA durum yazmacını okur). EDS ince katmanın seri numarasını
+# akış cihazınınkiyle karşılaştırır; başka bir Pluto'ya bakıyorsa kullanmaz (uyarı).
+# "" = otomatik (args.uri), "none" = ince katman kapalı (yukarıdakiler kullanılamaz).
 control_uri = "ip:192.168.2.1"
 
 [rx]
@@ -144,7 +155,10 @@ targets_file = "ktr_targets.toml"
 #
 # Pluto B'yi IP ile seçmek (config.txt ile 192.168.3.1) USB adres karmaşasını önler; TX
 # akışı ağ üzerinden düşük hızda (1 MS/s = 4 MB/s) güvenle beslenir. Pluto A'nın 'uri'si
-# bu durumda tam USB URI olmalıdır (iki Pluto USB'de → "usb:" reddedilir, yukarıya bakın).
+# bu durumda tam USB URI (ya da serial) olmalıdır (iki Pluto USB'de → "usb:" ENXIO ile
+# reddedilir, yukarıya bakın). pluto_tx kaynağı varsayılan olarak AYRI bir süreçte açılır
+# (SoapyPlutoSDR süreç başına tek Pluto); source_args.isolate = false yalnızca bu süreçte
+# başka Pluto yokken güvenlidir.
 #
 # Pluto TX gücü BAĞILDIR (0 dB = en yüksek). anchor_dbm verilirse (bağıl 0 dB'de DUT
 # girişinde ölçülen güç, kablo/zayıflatıcı dahil) kaynak MUTLAK olur:

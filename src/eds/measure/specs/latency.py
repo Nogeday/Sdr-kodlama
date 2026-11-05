@@ -1,4 +1,4 @@
-"""Uçtan-uca gecikme [ms] — RF event → ``rx.detections`` delivered to a ZMQ subscriber.
+"""Uçtan uca gecikme [ms] — RF event → ``rx.detections`` delivered to a ZMQ subscriber.
 
 The measurement runs the REAL competition pipeline: an :class:`~eds.rx.node.RxNode` on the
 device under test (stream → Welch → CFAR → publish) with a :class:`~eds.bus.pubsub.Publisher`
@@ -6,29 +6,46 @@ on a private endpoint (``transport = "tcp"``: ``tcp://127.0.0.1:<free port>``, s
 path as a deployment; ``"inproc"``: in-process transport only) and a
 :class:`~eds.bus.pubsub.Subscriber` playing the consumer (GUI / DF / fusion).
 
-Mode A — pipeline latency (always)
-    For every ``rx.detections`` message (empty frames included):
-    ``L = t_recv_ns − t_acq_end_ns`` (end of the analysed window → delivery), split into
-    ``window = t_acq_end − t_acq`` (window length, not part of L), ``processing =
-    t_proc − t_acq_end`` (waiting for the block holding the window end + USB/queue + DSP),
-    ``publish = env.t_ns − t_proc`` (payload building/encoding) and ``transport = t_recv −
-    env.t_ns`` (ZMQ).
-
-Mode B — RF event latency (stimulus source present)
+Mode B — RF event latency (stimulus source present; the KTR value)
     ``n_events`` times: source off → wait for a quiet frame (window started after the
     switch-off, no detection near the tone) → random hold (decorrelates the event from the
-    block boundaries) → source on at ``fc + 0.15·fs`` with ≥ 25 dB SNR (``t_on`` = the
-    host time returned by ``set_enabled``; on the simulator the exact scene switch) → first
-    ``rx.detections`` message whose window ends at/after ``t_on`` and contains a detection
-    within ``±max(2·RBW, 5 kHz)`` of the tone (plus the TCXO tolerance when the node does
-    not correct the reference) → ``L = t_recv − t_on``. The tone level is set adaptively
-    from the SNR the pipeline itself reports, so absolute and relative sources work alike.
+    block boundaries) → source on at ``fc + 0.15·fs`` with ≥ 25 dB SNR → first
+    ``rx.detections`` message whose window ends at/after the earliest possible RF-on instant
+    and contains a detection within ``±max(2·RBW, 5 kHz)`` of the tone (plus the TCXO
+    tolerance when the node does not correct the reference) → ``L = t_recv − t_RF``. The
+    tone level is set adaptively from the SNR the pipeline itself reports, so absolute and
+    relative sources work alike.
 
-Headline value: p95 of Mode B when available, else p95 of Mode A. p50/p95/p99/max of both
-modes, the mean breakdown, a distribution-free 95 % confidence interval of the p95 and the
-pipeline parameters (block size, fs, nfft, averages, spectrum rate) are reported. On a
-simulator that is not real-time the samples are produced faster than the wall clock and
-the numbers are NOT meaningful: the result says so explicitly.
+    RF-on instant ``t_RF`` (the source call is bracketed by host times ``t_before`` /
+    ``t_after``; ``t_ret`` is the time the call returns):
+
+    * simulator source — the exact scene switch (``t_ret``), ± 0;
+    * streaming TX (``estimated_queue_latency_s`` = Q, Pluto TX) — the tone starts after the
+      samples already queued in the driver: ``t_RF = t_ret + Q`` ± ``Q/4`` (one of four
+      kernel buffers; staging buffer / partially played buffer);
+    * any other source (SCPI generator: ``:OUTP ON`` + ``*OPC?``; manual) — the RF switched
+      during the call: ``t_RF`` = midpoint of ``[t_before, t_after]`` ± half its width.
+
+    The correction, its uncertainty and the source type are recorded; an uncertainty larger
+    than :data:`MAX_TIMING_UNC_FRACTION` of the p95 blocks the target verdict.
+
+Mode A — host-side processing latency (always; NOT end-to-end)
+    For every ``rx.detections`` message (empty frames included): ``L_A = t_recv_ns −
+    t_acq_end_ns`` split into ``processing = t_proc − t_acq_end`` (queue + DSP),
+    ``publish = env.t_ns − t_proc`` and ``transport = t_recv − env.t_ns`` (ZMQ). The window
+    end ``t_acq_end`` is derived from the host time at which the block's READ RETURNED, so
+    the time its last sample spent in the device FIFO and on the USB link is NOT included:
+    Mode A is a lower bound of the RF-to-delivery latency (one buffer transfer,
+    ``buffer_size · bytes_per_sample / interface_practical_bytes_per_s``, is added as the
+    known minimum in the report). Without a source only Mode A exists and the result is
+    blocked (no target verdict).
+
+Headline value: p95 of Mode B (Mode A when no source). Statistics: p50, p95, max; p99 only
+for N ≥ :data:`P99_MIN_N` events; the distribution-free 95 % confidence interval of the p95
+(order statistics) exists only for N ≥ 72 and is then the result's uncertainty (combined
+with the RF-on timing uncertainty). On a simulator that is not real-time the samples are
+produced faster than the wall clock and the numbers are NOT meaningful: the result says so
+and carries a blocker.
 """
 
 from __future__ import annotations
@@ -52,6 +69,7 @@ from ...core.timeutil import iso_utc, mono, now_ns
 from ...core.units import fmt_hz
 from ..base import FigureSpec, Measurement, MeasurementResult, Series, register
 from ..common import base_conditions
+from ..targets import REASON_NONREALTIME
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +82,22 @@ _SNR_TOLERANCE_DB = 3.0
 _MAX_LEVEL_ITER = 8
 _LEVEL_STEP_UP_DB = 20.0
 _SNR_FRAMES = 3
+#: p99 is reported only from this many events on (below it, it is just the largest samples).
+P99_MIN_N = 100
+#: Smallest N for which the two-sided 95 % order-statistic CI of the p95 exists.
+P95_CI_MIN_N = 72
+#: Streaming TX: half-width of the RF-on estimate as a fraction of its queue latency.
+QUEUE_UNC_FRACTION = 0.25
+#: RF-on timing uncertainty above this fraction of the headline p95 blocks the verdict (the
+#: number would describe the source more than the receiver, e.g. a manual source).
+MAX_TIMING_UNC_FRACTION = 0.5
+TIMING_LABELS: dict[str, str] = {
+    "exact": "simülatör sahne geçişi (birebir)",
+    "queued": "akışlı TX: dönüş anı + kuyruk gecikmesi",
+    "bracket": "komut süresinin ortası (komut + *OPC? / onay)",
+}
+BLOCKER_MODE_A = ("kaynak yok: RF olayı ölçülmedi (Mod A host tarafı işleme gecikmesidir, cihaz FIFO/USB süresini "
+                  "içermez — uçtan uca gecikmenin alt sınırı)")
 
 
 @dataclass
@@ -71,7 +105,7 @@ class _Stats:
     n: int
     p50: float
     p95: float
-    p99: float
+    p99: float | None                     # None for n < P99_MIN_N
     max: float
     mean: float
     std: float
@@ -110,6 +144,7 @@ class _Event:
     f_det_hz: float = math.nan
     snr_db: float = math.nan
     quiet_ok: bool = True
+    t_on_unc_ms: float = 0.0               # half-width of the RF-on estimate
 
 
 # =============================================================================== statistics
@@ -139,7 +174,8 @@ def latency_stats(values_ms: list[float]) -> _Stats | None:
         return None
     xs = np.sort(x)
     return _Stats(n=int(x.size), p50=float(np.percentile(x, 50)), p95=float(np.percentile(x, 95)),
-                  p99=float(np.percentile(x, 99)), max=float(xs[-1]), mean=float(np.mean(x)),
+                  p99=float(np.percentile(x, 99)) if x.size >= P99_MIN_N else None, max=float(xs[-1]),
+                  mean=float(np.mean(x)),
                   std=float(np.std(x, ddof=1)) if x.size > 1 else 0.0, min=float(xs[0]),
                   p95_ci=quantile_ci(xs, 0.95))
 
@@ -174,13 +210,13 @@ def _int_param(v: Any, what: str, lo: int = 1) -> int:
 @register
 class LatencyMeasurement(Measurement):
     spec_id = "latency"
-    title = "Uçtan-uca gecikme"
+    title = "Uçtan uca gecikme"
     unit = "ms"
     default_params = {
         "transport": "tcp",            # tcp (deployment path) | inproc
         "duration_s": 5.0,             # Mode A collection time
         "quick_duration_s": 1.5,
-        "n_events": 20,                # Mode B events
+        "n_events": 100,               # Mode B events (≥ 72: CI of the p95; ≥ 100: p99)
         "quick_n_events": 6,
         "offset_frac": 0.15,           # tone at fc + offset_frac * fs
         "snr_db": 30.0,                # tone SNR target (pipeline-reported, RBW-referred)
@@ -221,6 +257,44 @@ class LatencyMeasurement(Measurement):
         if info is None or getattr(info, "backend", "") != "sim":
             return False
         return str(info.extra.get("realtime", "true")).lower() == "false"
+
+    def _timing_kind(self) -> str:
+        """How the RF-on instant of ``ctx.source`` is estimated (see module doc)."""
+        from ...hal.sim.source import SimSignalSource
+
+        src = self.ctx.source
+        if isinstance(src, SimSignalSource):
+            return "exact"
+        if self._queue_latency_s() is not None:
+            return "queued"
+        return "bracket"
+
+    def _queue_latency_s(self) -> float | None:
+        try:
+            q = getattr(self.ctx.source, "estimated_queue_latency_s", None)
+        except Exception:  # noqa: BLE001 - a remote proxy may fail on attribute access
+            return None
+        if isinstance(q, bool) or not isinstance(q, (int, float)) or not math.isfinite(float(q)) or q <= 0:
+            return None
+        return float(q)
+
+    def _switch(self, on: bool) -> tuple[int, int, int]:
+        """Switch the source; ``(t_lo, t_est, t_hi)`` [ns]: the interval in which the RF
+        output changed and its best estimate (module doc)."""
+        src = self.ctx.source
+        t_before = now_ns()
+        t_ret = int(src.set_enabled(on))
+        t_after = now_ns()
+        kind = self._timing_kind()
+        if kind == "exact":
+            return t_ret, t_ret, t_ret
+        if kind == "queued":
+            q = self._queue_latency_s() or 0.0
+            est = t_ret + int(round(q * 1e9))
+            h = int(round(QUEUE_UNC_FRACTION * q * 1e9))
+            return est - h, est, est + h
+        lo, hi = min(t_before, t_ret), max(t_after, t_ret)
+        return lo, (lo + hi) // 2, hi
 
     # ------------------------------------------------------------------ run
     def run(self) -> MeasurementResult:
@@ -384,7 +458,7 @@ class LatencyMeasurement(Measurement):
         history: list[tuple[float, float]] = []
         for _ in range(_MAX_LEVEL_ITER):
             p_set = float(src.set_power(p))
-            t_on = src.set_enabled(True)
+            t_on = self._switch(True)[2]                    # latest possible RF-on instant
             snrs: list[float] = []
             end = mono() + prm["event_timeout_s"]
             while len(snrs) < _SNR_FRAMES and (remaining := end - mono()) > 0:
@@ -393,7 +467,7 @@ class LatencyMeasurement(Measurement):
                     continue
                 det = self._near(msg, f_src, tol)
                 snrs.append(float(det["snr_db"]) if det is not None else -math.inf)
-            src.set_enabled(False)
+            self._switch(False)
             snr = max(snrs) if snrs else -math.inf
             history.append((p_set, snr))
             if not math.isfinite(snr):
@@ -416,7 +490,6 @@ class LatencyMeasurement(Measurement):
 
     def _mode_b(self, sub: Subscriber, node: Any, prm: dict[str, Any],
                 last_spec: Message | None) -> tuple[dict[str, Any], list[_Event]]:
-        src = self.ctx.source
         dev = node.device
         app = self.ctx.app
         fs = float(dev.fs)
@@ -425,7 +498,7 @@ class LatencyMeasurement(Measurement):
         rbw = float(last_spec.data["rbw_hz"]) if last_spec is not None else 2.0 * fs / float(app.dsp.nfft)
         tol = self._tolerance_hz(node, f_src, rbw)
         margin = self._flush_margin_ns(node)
-        t_iso = int(src.set_enabled(False))
+        t_iso = self._switch(False)[2]
         # the isolated scene must be quiet at the tone frequency before anything is measured
         quiet = self._wait_for(sub, prm["quiet_timeout_s"],
                                lambda m: int(m.data["t_acq_ns"]) >= t_iso + margin and self._near(m, f_src, tol) is None)
@@ -442,7 +515,7 @@ class LatencyMeasurement(Measurement):
         rng = np.random.default_rng(prm["seed"])
         events: list[_Event] = []
         for i in range(prm["n_events"]):
-            t_off = src.set_enabled(False)
+            t_off = self._switch(False)[2]
             quiet = self._wait_for(sub, prm["quiet_timeout_s"],
                                    lambda m, t=t_off: int(m.data["t_acq_ns"]) >= t + margin
                                    and self._near(m, f_src, tol) is None)
@@ -450,10 +523,12 @@ class LatencyMeasurement(Measurement):
             end = mono() + hold
             while (remaining := end - mono()) > 0:      # keep draining while holding
                 sub.recv(remaining)
-            t_on = int(src.set_enabled(True))
-            ev = _Event(index=i, t_on_ns=t_on, hold_s=hold, quiet_ok=quiet is not None)
+            t_lo, t_on, t_hi = self._switch(True)
+            ev = _Event(index=i, t_on_ns=t_on, hold_s=hold, quiet_ok=quiet is not None,
+                        t_on_unc_ms=(t_hi - t_lo) / 2e6)
+            # a window that ended before the EARLIEST possible RF-on instant cannot hold the tone
             hit = self._wait_for(sub, prm["event_timeout_s"],
-                                 lambda m, t=t_on: self._near(m, f_src, tol)
+                                 lambda m, t=t_lo: self._near(m, f_src, tol)
                                  if int(m.data["t_acq_end_ns"]) >= t else None)
             if hit is not None:
                 msg, det = hit
@@ -469,10 +544,18 @@ class LatencyMeasurement(Measurement):
             else:
                 log.warning("Mod B: olay %d %.1f s içinde tespit edilmedi", i, prm["event_timeout_s"])
             events.append(ev)
-        src.set_enabled(False)
+        self._switch(False)
         return level, events
 
     # ------------------------------------------------------------------ result
+    def _transfer_ms(self, dev: Any) -> float:
+        """Known minimum the Mode-A clock misses: one device buffer crossing the interface."""
+        prof = dev.profile
+        rate = float(getattr(prof, "interface_practical_bytes_per_s", 0.0) or 0.0)
+        if rate <= 0:
+            return 0.0
+        return 1e3 * float(dev.buffer_size) * float(prof.bytes_per_sample) * int(getattr(dev, "num_channels", 1)) / rate
+
     def _result(self, dev: Any, prm: dict[str, Any], a: _ModeA, events: list[_Event], level: dict[str, Any],
                 node_stats: dict[str, Any], nonrt: bool) -> MeasurementResult:
         app = self.ctx.app
@@ -486,15 +569,21 @@ class LatencyMeasurement(Measurement):
         mode = "B" if st_b is not None else "A"
         fs = float(dev.fs)
         nfft, averages = int(app.dsp.nfft), int(app.dsp.averages)
+        transfer_ms = self._transfer_ms(dev)
         extra: dict[str, Any] = {"mode": mode, "transport": prm["transport"], "realtime": not nonrt}
         extra.update(st_a.to_dict("mode_a"))
         if st_b is not None:
             extra.update(st_b.to_dict("mode_b"))
-        bd_a = {"window_ms": _mean(a.window_ms), "processing_ms": _mean(a.processing_ms),
-                "publish_ms": _mean(a.publish_ms), "transport_ms": _mean(a.transport_ms)}
+        bd_a = {"processing_ms": _mean(a.processing_ms), "publish_ms": _mean(a.publish_ms),
+                "transport_ms": _mean(a.transport_ms)}
         extra["mode_a_breakdown_mean_ms"] = bd_a
+        extra["mode_a_window_mean_ms"] = _mean(a.window_ms)          # analysed span; NOT part of L_A
         extra["mode_a_messages"] = len(a.latency_ms)
         extra["mode_a_detections"] = a.n_detections
+        extra["usb_transfer_min_ms"] = transfer_ms
+        extra["mode_a_p95_plus_transfer_ms"] = st_a.p95 + transfer_ms
+        timing_kind = self._timing_kind() if self.ctx.source is not None else ""
+        timing_unc_ms = max((e.t_on_unc_ms for e in events), default=0.0)
         if events:
             bd_b = {"acquisition_ms": _mean([e.acquisition_ms for e in events if e.detected]),
                     "processing_ms": _mean([e.processing_ms for e in events if e.detected]),
@@ -506,6 +595,13 @@ class LatencyMeasurement(Measurement):
             extra["mode_b_timeouts"] = len(events) - n_det
             extra["mode_b_quiet_timeouts"] = sum(1 for e in events if not e.quiet_ok)
             extra["mode_b_tone"] = level
+            q = self._queue_latency_s()
+            extra["source_timing"] = {
+                "kind": timing_kind, "label": TIMING_LABELS.get(timing_kind, timing_kind),
+                "correction_ms": (q or 0.0) * 1e3 if timing_kind == "queued" else 0.0,
+                "uncertainty_ms": timing_unc_ms,
+                "uncertainty_mean_ms": _mean([e.t_on_unc_ms for e in events]),
+            }
         extra.update({
             "block_size": int(app.rx.block_size), "fs_hz": fs, "nfft": nfft, "averages": averages,
             "window_samples": int(node_stats["window_samples"]), "window_ms": node_stats["window_samples"] / fs * 1e3,
@@ -518,28 +614,50 @@ class LatencyMeasurement(Measurement):
         })
         if nonrt:
             extra["warning"] = NONREALTIME_WARNING
+        # uncertainty of the headline p95: distribution-free CI (N ≥ 72) + RF-on timing
+        ci = headline.p95_ci
+        unc: float | None = None
+        if ci is not None:
+            unc = max(headline.p95 - ci[0], ci[1] - headline.p95) + (timing_unc_ms if mode == "B" else 0.0)
         src = self.ctx.source
         conditions = base_conditions(
             dev, nfft=nfft, averages=averages, window=app.dsp.window, block_size=int(app.rx.block_size),
-            queue_blocks=int(app.rx.queue_blocks), spectrum_rate_hz=float(app.bus.spectrum_rate_hz),
-            transport=prm["transport"], source=getattr(src, "name", "yok") if src is not None else "yok",
-            n_events=len(events), mode_a_duration_s=prm["duration_s"],
+            buffer_size=int(dev.buffer_size), queue_blocks=int(app.rx.queue_blocks),
+            spectrum_rate_hz=float(app.bus.spectrum_rate_hz), transport=prm["transport"],
+            source=getattr(src, "name", "yok") if src is not None else "yok", n_events=len(events),
+            mode_a_duration_s=prm["duration_s"], headline_mode=mode,
         )
         if events:
             conditions.update({"f_tone_hz": level["f_src_hz"], "tone_snr_db": level["snr_db"],
-                               "tone_power": level["power"], "freq_tolerance_hz": level["tolerance_hz"]})
+                               "tone_power": level["power"], "freq_tolerance_hz": level["tolerance_hz"],
+                               "source_timing": TIMING_LABELS.get(timing_kind, timing_kind),
+                               "source_timing_unc_ms": timing_unc_ms,
+                               "source_queue_correction_ms": extra["source_timing"]["correction_ms"]})
 
         def ms(v: float) -> str:
             return f"{v:.1f}"
 
+        def pct(st: _Stats) -> str:
+            tail = f"p99 {ms(st.p99)}, " if st.p99 is not None else ""
+            return f"p50 {ms(st.p50)}, {tail}maks {ms(st.max)} ms"
+
+        def ci_txt(st: _Stats) -> str:
+            if st.p95_ci is None:
+                return f"p95 için %95 güven aralığı hesaplanamadı (N = {st.n} < {P95_CI_MIN_N})"
+            return f"p95 %95 GA [{ms(st.p95_ci[0])}, {ms(st.p95_ci[1])}] ms"
+
         parts = []
         if st_b is not None:
             parts.append(f"p95 = {ms(st_b.p95)} ms (Mod B, RF olayı → ZMQ teslimi, {n_det}/{len(events)} olay; "
-                         f"p50 {ms(st_b.p50)}, p99 {ms(st_b.p99)}, maks {ms(st_b.max)} ms)")
-            parts.append(f"boru hattı (Mod A) p95 = {ms(st_a.p95)} ms")
+                         f"{pct(st_b)}; {ci_txt(st_b)}; RF açılma anı: {TIMING_LABELS.get(timing_kind, timing_kind)}"
+                         + (f", düzeltme +{extra['source_timing']['correction_ms']:.1f} ms" if timing_kind == "queued"
+                            else "") + f", belirsizlik ±{timing_unc_ms:.2f} ms)")
+            parts.append(f"host tarafı işleme (Mod A, FIFO/USB hariç) p95 = {ms(st_a.p95)} ms")
         else:
-            parts.append(f"p95 = {ms(st_a.p95)} ms (Mod A, pencere sonu → ZMQ teslimi, {st_a.n} kare; "
-                         f"p50 {ms(st_a.p50)}, p99 {ms(st_a.p99)}, maks {ms(st_a.max)} ms; kaynak yok → Mod B atlandı)")
+            parts.append(f"p95 = {ms(st_a.p95)} ms (Mod A: host tarafı işleme gecikmesi, okuma dönüşünden ZMQ "
+                         f"teslimine, {st_a.n} kare; {pct(st_a)}; kaynak yok → Mod B atlandı). Cihaz FIFO/USB süresi "
+                         f"dahil değildir: uçtan uca gecikme ≥ {ms(st_a.p95 + transfer_ms)} ms (+ bir tampon aktarımı "
+                         f"{ms(transfer_ms)} ms)")
         summary = "; ".join(parts)
         if events and n_det < len(events):
             summary += f"; {len(events) - n_det} olay zaman aşımı"
@@ -552,17 +670,31 @@ class LatencyMeasurement(Measurement):
             summary += f"; {note}"
         if nonrt:
             summary = f"{NONREALTIME_WARNING} {summary}"
+        stat_txt = (f"Başlık değeri p95; p99 yalnız N ≥ {P99_MIN_N} olayda verilir. p95 için dağılımdan bağımsız %95 "
+                    f"güven aralığı (sıra istatistikleri) yalnız N ≥ {P95_CI_MIN_N} olayda vardır"
+                    + (f" ve belirsizlik olarak verilmiştir (± {unc:.2f} ms, RF açılma anı belirsizliği dahil)."
+                       if unc is not None else f"; bu ölçümde N = {headline.n}, güven aralığı hesaplanamadı."))
         method = (
             "Yarışma boru hattının kendisi ölçülür: RxNode (akış → Welch PSD → CFAR → ZMQ yayını) DUT üzerinde "
-            f"özel bir {prm['transport']} uç noktasına yayın yapar, ölçüm bir ZMQ abonesidir. Mod A: her rx.detections "
-            "mesajı için t_recv − t_acq_end (döküm: pencere, işleme = blok tamamlanması + kuyruk + DSP, yayın, "
-            "iletim). Mod B: kaynak kapalı → sessiz kare doğrulaması → rastgele bekleme → kaynak açık (t_on = "
-            "set_enabled dönüş anı) → tonu (fc + 0.15·fs, ≥ 25 dB SNR) içeren ve penceresi t_on'dan sonra biten ilk "
-            "rx.detections mesajının aboneye ulaştığı an; L = t_recv − t_on. Tüm zaman damgaları aynı host'ta "
-            "time.time_ns() (duvar saati). Başlık değeri p95; p95 için dağılımdan bağımsız %95 güven aralığı "
-            "(sıra istatistikleri) ektedir.")
+            f"özel bir {prm['transport']} uç noktasına yayın yapar, ölçüm bir ZMQ abonesidir. Mod B (RF olayı): kaynak "
+            "kapalı → sessiz kare doğrulaması → rastgele bekleme → kaynak açık → tonu (fc + 0.15·fs, ≥ 25 dB SNR) "
+            "içeren ve penceresi en erken olası RF açılma anından sonra biten ilk rx.detections mesajının aboneye "
+            "ulaştığı an; L = t_recv − t_RF. t_RF: simülatörde sahne geçiş anı; akışlı TX'te (Pluto) çağrı dönüşü + "
+            "sürücü kuyruğu gecikmesi (± çeyreği); diğer kaynaklarda (SCPI: :OUTP ON + *OPC?) komut süresinin ortası "
+            "(± yarısı). Mod A (host tarafı): her rx.detections mesajı için t_recv − t_acq_end; t_acq_end blok "
+            "okumasının dönüş anından türetildiği için cihaz FIFO'sunda ve USB'de geçen süre DAHİL DEĞİLDİR (alt "
+            "sınır; döküm: işleme = kuyruk + DSP, yayın, iletim). Mod B dökümünde edinim/işleme ayrımı da aynı "
+            "nedenle yaklaşıktır (toplam L bundan etkilenmez). Tüm zaman damgaları aynı host'ta time.time_ns() (duvar saati). "
+            + stat_txt)
         res = self.new_result(round(headline.p95, 3), summary=summary, method=method, conditions=conditions,
-                              extra=extra)
+                              extra=extra, uncertainty=unc)
+        if nonrt:
+            res.blockers.append(REASON_NONREALTIME)
+        if mode == "A":
+            res.blockers.append(BLOCKER_MODE_A)
+        elif timing_unc_ms > MAX_TIMING_UNC_FRACTION * headline.p95:
+            res.blockers.append(f"RF açılma anı belirsizliği ±{timing_unc_ms:.1f} ms, p95'in %"
+                                f"{100 * MAX_TIMING_UNC_FRACTION:.0f}'undan büyük ({self.ctx.source.name} kaynağı)")
         res.table = self._table(a, events, prm["max_table_rows"])
         res.figures = self._figures(dev, st_a, st_b, a, events, bd_a, extra, nonrt)
         return res
@@ -578,53 +710,65 @@ class LatencyMeasurement(Measurement):
                          "publish_ms": e.publish_ms if e.detected else None,
                          "transport_ms": e.transport_ms if e.detected else None,
                          "f_det_hz": e.f_det_hz if e.detected else None, "snr_db": e.snr_db if e.detected else None,
-                         "hold_s": e.hold_s, "status": "tespit" if e.detected else "zaman aşımı"})
+                         "hold_s": e.hold_s, "t_rf_ns": e.t_on_ns, "t_rf_unc_ms": e.t_on_unc_ms,
+                         "status": "tespit" if e.detected else "zaman aşımı"})
         for i in _subsample(len(a.latency_ms), max_rows):
             rows.append({"mode": "A", "index": i, "latency_ms": a.latency_ms[i], "acquisition_ms": None,
                          "window_ms": a.window_ms[i], "processing_ms": a.processing_ms[i],
                          "publish_ms": a.publish_ms[i], "transport_ms": a.transport_ms[i], "f_det_hz": None,
-                         "snr_db": None, "hold_s": None, "status": "kare"})
+                         "snr_db": None, "hold_s": None, "t_rf_ns": None, "t_rf_unc_ms": None, "status": "kare"})
         return rows
 
     def _figures(self, dev: Any, st_a: _Stats, st_b: _Stats | None, a: _ModeA, events: list[_Event],
                  bd_a: dict[str, float], extra: dict[str, Any], nonrt: bool) -> list[FigureSpec]:
         info = {"fs": fmt_hz(extra["fs_hz"]), "Blok": f"{extra['block_size']} ({extra['block_ms']:.1f} ms)",
-                "Pencere": f"{extra['window_ms']:.1f} ms", "version": __version__,
+                "Pencere": f"{extra['window_ms']:.1f} ms (L'ye dahil değil)", "version": __version__,
                 "date": iso_utc(now_ns()), "serial": str(getattr(dev.info, "serial", ""))}
         if nonrt:
             info["UYARI"] = "gerçek zamanlı olmayan simülatör — değer anlamsız"
 
         def pct_lines(st: _Stats) -> list[tuple[float, str]]:
-            return [(st.p50, f"p50 = {st.p50:.1f} ms"), (st.p95, f"p95 = {st.p95:.1f} ms"),
-                    (st.p99, f"p99 = {st.p99:.1f} ms")]
+            lines = [(st.p50, f"p50 = {st.p50:.1f} ms"), (st.p95, f"p95 = {st.p95:.1f} ms")]
+            if st.p99 is not None:
+                lines.append((st.p99, f"p99 = {st.p99:.1f} ms"))
+            return lines
 
         figs = []
         if st_b is not None:
             figs.append(FigureSpec(
-                name="latency_mode_b_cdf", title="Uçtan-uca gecikme — Mod B (RF olayı → ZMQ teslimi)", kind="hist",
+                name="latency_mode_b_cdf", title="Uçtan uca gecikme — Mod B (RF olayı → ZMQ teslimi)", kind="hist",
                 series=[Series(x=[], y=[e.latency_ms for e in events if e.detected], label="Mod B olay gecikmesi")],
                 xlabel="Gecikme [ms]", ylabel="Olay sayısı", vlines=pct_lines(st_b), info=dict(info)))
         figs.append(FigureSpec(
-            name="latency_mode_a_cdf", title="Boru hattı gecikmesi — Mod A (pencere sonu → ZMQ teslimi)", kind="hist",
+            name="latency_mode_a_cdf", title="Host tarafı işleme gecikmesi — Mod A (okuma dönüşü → ZMQ teslimi, "
+                                             "FIFO/USB hariç)", kind="hist",
             series=[Series(x=[], y=list(a.latency_ms), label="Mod A kare gecikmesi")],
             xlabel="Gecikme [ms]", ylabel="Kare sayısı", vlines=pct_lines(st_a), info=dict(info)))
-        labels_a = [("window_ms", "Pencere (analiz edilen süre)"), ("processing_ms", "İşleme (blok + kuyruk + DSP)"),
-                    ("publish_ms", "Yayın (serileştirme)"), ("transport_ms", "İletim (ZMQ)")]
-        figs.append(FigureSpec(
-            name="latency_mode_a_breakdown", title="Gecikme dökümü — Mod A (ortalama)", kind="xy",
-            series=[Series(x=[float(i)], y=[float(bd_a[k])], label=f"{lab}: {bd_a[k]:.2f} ms", style="bar")
-                    for i, (k, lab) in enumerate(labels_a)],
-            xlabel="Bileşen (0 pencere · 1 işleme · 2 yayın · 3 iletim)", ylabel="Süre [ms]", xlim=(-0.6, 3.6),
-            info=dict(info)))
+        # one stacked bar per mode (cumulative, largest first): the bar top is the mean latency
+        # itself and every visible slice one component; the analysed window is NOT a component
+        figs.append(self._breakdown_figure(
+            "latency_mode_a_breakdown", "Gecikme dökümü — Mod A (host tarafı, ortalama; FIFO/USB hariç)",
+            [("İşleme (kuyruk + DSP)", bd_a["processing_ms"]), ("Yayın (serileştirme)", bd_a["publish_ms"]),
+             ("İletim (ZMQ)", bd_a["transport_ms"])], info))
         bd_b = extra.get("mode_b_breakdown_mean_ms")
         if st_b is not None and bd_b:
-            labels_b = [("acquisition_ms", "Edinim (olay → pencere sonu)"),
-                        ("processing_ms", "İşleme (blok + kuyruk + DSP)"),
-                        ("publish_ms", "Yayın (serileştirme)"), ("transport_ms", "İletim (ZMQ)")]
-            figs.append(FigureSpec(
-                name="latency_mode_b_breakdown", title="Gecikme dökümü — Mod B (ortalama, olay başına)", kind="xy",
-                series=[Series(x=[float(i)], y=[float(bd_b[k])], label=f"{lab}: {bd_b[k]:.2f} ms", style="bar")
-                        for i, (k, lab) in enumerate(labels_b)],
-                xlabel="Bileşen (0 edinim · 1 işleme · 2 yayın · 3 iletim)", ylabel="Süre [ms]", xlim=(-0.6, 3.6),
-                info=dict(info)))
+            figs.append(self._breakdown_figure(
+                "latency_mode_b_breakdown", "Gecikme dökümü — Mod B (RF olayı → ZMQ, ortalama, olay başına)",
+                [("Edinim (olay → pencere sonu)", bd_b["acquisition_ms"]),
+                 ("İşleme (kuyruk + DSP)", bd_b["processing_ms"]), ("Yayın (serileştirme)", bd_b["publish_ms"]),
+                 ("İletim (ZMQ)", bd_b["transport_ms"])], info))
         return figs
+
+    @staticmethod
+    def _breakdown_figure(name: str, title: str, comps: list[tuple[str, float]], info: dict[str, str]) -> FigureSpec:
+        """Single stacked bar: cumulative sums drawn largest first, so the visible slice of the
+        bar is one component and its top is the total (= the mean latency of the mode)."""
+        vals = [(lab, float(v) if math.isfinite(v) and v > 0 else 0.0) for lab, v in comps]
+        cum = np.cumsum([v for _, v in vals]).tolist()
+        series = [Series(x=[1.0], y=[cum[i]], label=f"{lab}: {v:.2f} ms", style="bar")
+                  for i, (lab, v) in reversed(list(enumerate(vals)))]
+        total = cum[-1] if cum else 0.0
+        return FigureSpec(
+            name=name, title=title, kind="xy", series=series,
+            markers=[(1.0, total, f"toplam {total:.2f} ms")], xlabel="yığılmış çubuk (bileşenler alttan üste)",
+            ylabel="Süre [ms]", xlim=(0.4, 1.6), ylim=(0.0, 1.3 * total if total > 0 else 1.0), info=dict(info))

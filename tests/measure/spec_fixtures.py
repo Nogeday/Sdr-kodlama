@@ -9,6 +9,12 @@ image_rejection, freq_resolution) on the simulator.
   and whether the stimulus was left enabled.
 * :func:`check_contract` — the jury-facing result contract every spec must satisfy.
 * :func:`thermal_n_rbw_dbfs`, :func:`adc_noise_dbfs` — level-equation ground truth.
+* :class:`SimLoSource` — a Pluto-TX-like simulated generator with its own LO (LO leakage and
+  TX IQ image emitters, ``set_lo_offset``); :class:`DelayedSimSource` — a generator whose on/off
+  switching reaches the RF only ``delay_s`` after the call (libiio TX queue);
+  :func:`replace_source` installs either in a context.
+* :func:`without_quadrature_control` — a DUT whose quadrature tracking cannot be switched
+  (Pluto without the thin libiio layer).
 
 Other test modules may import these helpers read-only.
 """
@@ -17,6 +23,9 @@ from __future__ import annotations
 
 import json
 import math
+import queue
+import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -24,6 +33,9 @@ from pathlib import Path
 from typing import Any
 
 from eds.core.config import AppConfig, CalConfig, DeviceConfig, DspConfig, MeasureConfig, RxConfig, SimConfig
+from eds.core.errors import ConfigError
+from eds.hal.sim.source import SimSignalSource
+from eds.hal.sim.world import Emitter, SimWorld
 from eds.measure import plots
 from eds.measure.base import MeasurementContext, MeasurementResult, run_measurement
 from eds.measure.session import build_context, close_context
@@ -126,3 +138,140 @@ def thermal_n_rbw_dbfs(dev: Any, gain_db: float, rbw_hz: float) -> float:
 def n_rbw_dbfs(dev: Any, gain_db: float, rbw_hz: float, fs: float) -> float:
     """Total noise in one RBW: thermal ⊕ ADC floor."""
     return db_sum(thermal_n_rbw_dbfs(dev, gain_db, rbw_hz), adc_noise_dbfs(dev) - 10.0 * math.log10(fs / rbw_hz))
+
+
+def input_p1db_dbm(dev: Any, gain_db: float) -> float:
+    """Simulator ground truth of the input 1 dB compression point (``inf`` without the model)."""
+    fn = getattr(dev, "input_p1db_dbm", None)
+    return float(fn(gain_db)) if callable(fn) else math.inf
+
+
+# --------------------------------------------------------------------------- stimulus doubles
+def replace_source(ctx: MeasurementContext, factory: Any) -> Any:
+    """Close the context's stimulus, then install ``factory(ctx.world)`` (returned). The old
+    source is closed first: a new simulated source may reuse its emitter name."""
+    if ctx.source is not None:
+        ctx.source.set_enabled(False)
+        ctx.source.close()
+    ctx.source = factory(ctx.world)
+    return ctx.source
+
+
+class SimLoSource(SimSignalSource):
+    """Pluto-TX-like simulated generator: the tone ``f`` is synthesised ``lo_offset`` above an LO,
+    so the LO leakage (``leak_dbc``) sits at ``f − lo_offset`` and the TX IQ image
+    (``image_dbc``) at ``f − 2·lo_offset`` — both follow the tone's level and on/off state.
+    ``set_lo_offset`` moves the LO (|offset| ≤ 0.4·``tx_fs``, else :class:`ConfigError`) and
+    ``describe()`` reports ``lo_hz`` / ``tones_hz`` / ``tone_offset_hz`` like ``SoapyTxSource``."""
+
+    max_tones = 1
+
+    def __init__(self, world: SimWorld, *, name: str = "sim_src", lo_offset_hz: float = 199951.171875,
+                 leak_dbc: float = -40.0, image_dbc: float = -40.0, tx_fs: float = 1e6, **kw: Any):
+        self.tone_offset_hz = float(lo_offset_hz)
+        self.leak_dbc, self.image_dbc, self.tx_fs = float(leak_dbc), float(image_dbc), float(tx_fs)
+        self.lo_offsets_used: list[float] = []
+        super().__init__(world, name=name, **kw)
+        for e in self._artifacts():
+            world.add_emitter(e)
+
+    def _artifacts(self) -> list[Emitter]:
+        f, off = self._freq, self.tone_offset_hz
+        p = self._power - self._path_loss
+        return [Emitter(name=f"{self.name}_lo", freq_hz=f - off, power_dbm=p + self.leak_dbc, kind="cw", cabled=True,
+                        enabled=self._enabled),
+                Emitter(name=f"{self.name}_img", freq_hz=f - 2.0 * off, power_dbm=p + self.image_dbc, kind="cw",
+                        cabled=True, enabled=self._enabled)]
+
+    def _sync(self) -> None:
+        if not self._closed:
+            self.world.replace_emitters(remove=[e.name for e in self._artifacts()], add=self._artifacts())
+
+    def set_frequency(self, hz: float) -> float:
+        out = super().set_frequency(hz)
+        self._sync()
+        return out
+
+    def set_power(self, dbm: float) -> float:
+        out = super().set_power(dbm)
+        self._sync()
+        return out
+
+    def set_enabled(self, on: bool) -> int:
+        self._check_open()
+        self._enabled = bool(on)
+        return self.world.set_enabled_many(self.emitter_names, self._enabled)
+
+    def set_tones(self, freqs_hz: list[float], powers: list[float]) -> None:
+        raise ConfigError("SimLoSource: yalnız tek ton")
+
+    def set_lo_offset(self, hz: float) -> float:
+        hz = float(hz)
+        if hz == 0.0 or abs(hz) > 0.4 * self.tx_fs:
+            raise ConfigError(f"LO ofseti {hz:g} Hz TX bandı dışında")
+        self.tone_offset_hz = hz
+        self.lo_offsets_used.append(hz)
+        self._sync()
+        return hz
+
+    @property
+    def emitter_names(self) -> list[str]:
+        return [self.name, f"{self.name}_lo", f"{self.name}_img"]
+
+    def describe(self) -> dict[str, Any]:
+        d = super().describe()
+        d.update({"lo_hz": self._freq - self.tone_offset_hz, "tones_hz": [self._freq],
+                  "tone_offset_hz": self.tone_offset_hz})
+        return d
+
+    def close(self) -> None:
+        if not self._closed:
+            self.world.replace_emitters(remove=[f"{self.name}_lo", f"{self.name}_img"])
+        super().close()
+
+
+class DelayedSimSource(SimSignalSource):
+    """Simulated generator whose on/off switching reaches the RF ``delay_s`` after the call
+    (in call order), like the Pluto TX whose queued libiio buffers still play. ``settle_s`` is
+    the settle time the source *reports* to the measurement helpers."""
+
+    def __init__(self, world: SimWorld, *, delay_s: float, settle_s: float, **kw: Any):
+        super().__init__(world, **kw)
+        self.delay_s, self.settle_s = float(delay_s), float(settle_s)
+        self._q: queue.Queue = queue.Queue()
+        self._worker = threading.Thread(target=self._run, daemon=True)
+        self._worker.start()
+
+    def _run(self) -> None:
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            due, on = item
+            time.sleep(max(0.0, due - time.perf_counter()))
+            if not self._closed:
+                SimSignalSource.set_enabled(self, on)
+
+    def set_enabled(self, on: bool) -> int:
+        self._check_open()
+        self._q.put((time.perf_counter() + self.delay_s, bool(on)))
+        return time.time_ns()
+
+    def close(self) -> None:
+        self._q.put(None)
+        self._worker.join(timeout=5.0)
+        super().close()
+
+
+def without_quadrature_control(dev: Any) -> None:
+    """Make ``dev`` behave like a Pluto without the thin libiio layer: quadrature tracking
+    requests are ignored and reported as ``"unsupported"`` (BB/RF DC tracking still apply)."""
+    orig = dev.set_tracking
+
+    def set_tracking(dc: bool | None = None, rf_dc: bool | None = None, quadrature: bool | None = None):
+        out = dict(orig(dc=dc, rf_dc=rf_dc)) if (dc is not None or rf_dc is not None) else {}
+        if quadrature is not None:
+            out["quadrature"] = "unsupported"
+        return out
+
+    dev.set_tracking = set_tracking
