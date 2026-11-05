@@ -1,0 +1,75 @@
+# ADALM-Pluto sınıfı AD9363 — RESMÎ datasheet sınırları (varsayılan profil).
+# Bu sınırlar dışına çıkan her konfigürasyon donanıma gitmeden REDDEDİLİR.
+# Pluto'nun AD9364 "hack" modu için ayrı profil: ad9364_pluto_ext.toml (bilerek seçilmeli).
+
+name = "ad9363_pluto"
+chip = "AD9363"
+description = "ADALM-Pluto (AD9363, 1R1T, 12-bit, 40 MHz TCXO ±25 ppm, USB 2.0)"
+status = "supported"
+backend_hint = "soapy"
+soapy_driver = "plutosdr"
+
+rx_channels = 1
+tx_channels = 1
+coherent_rx = false          # tek kanal; 2 Pluto birbirine koherent DEĞİL (ortak ref + kalibrasyon gerekir)
+
+adc_bits = 12
+full_scale_counts = 2048.0   # CS16 değer aralığı [-2048, 2047]
+
+freq_min_hz = 325e6
+freq_max_hz = 3.8e9
+bw_min_hz = 200e3
+bw_max_hz = 20e6
+
+# AD9363 temel bant hızı 25e6/48 (≈520.8 kS/s) .. 61.44 MS/s; SoapyPlutoSDR FPGA x8
+# desimasyonu ile 25e6/384 (≈65.1 kS/s)'e iner. ÜST sınır çipin; SÜRDÜRÜLEBİLİR sınır
+# USB 2.0 ile belirlenir ve `eds measure max_rate` ile ÖLÇÜLÜR.
+sample_rate_min_hz = 65104.17
+sample_rate_max_hz = 61.44e6
+
+ref_clock_hz = 40e6
+ref_clock_ppm = 25.0
+
+interface = "usb2"
+interface_max_bytes_per_s = 53.248e6       # USB 2.0 HS bulk teorik (13×512 B / 125 µs)
+interface_practical_bytes_per_s = 24e6     # libiio+USB2 pratik eşik (uyarı için; ölçümle güncelleyin)
+bytes_per_sample = 4                       # 16-bit I + 16-bit Q (12-bit veri)
+kernel_buffers = 4                         # retune sonrası bayat kalabilecek libiio çekirdek tamponu
+default_buffer_size = 65536
+
+# max_rate ölçümünde denenecek hızlar (S/s)
+candidate_sample_rates_hz = [
+    0.521e6, 1.0e6, 1.92e6, 2.4e6, 3.0e6, 3.84e6, 4.0e6, 5.0e6, 6.0e6, 7.68e6,
+    8.0e6, 10.0e6, 12.0e6, 15.36e6, 20.0e6, 30.72e6, 61.44e6,
+]
+
+notes = [
+    "Sıfır-IF (direct conversion): merkezde DC çivisi ve IQ dengesizliği kaynaklı imaj vardır.",
+    "Retune sonrası libiio çekirdek tamponlarında eski frekansın örnekleri kalır; settle_buffers ile atılır.",
+    "PPM düzeltmesi tercihen donanımda (ad9361-phy xo_correction) uygulanır; yoksa yazılımda.",
+    "Harici referans (Rev C/D CLK_IN) firmware ortam değişkeni ile seçilir; bkz. docs/HARDWARE_PLUTO.md.",
+]
+
+
+# AD9361/AD9363 "full gain table" — kazanç aralığı banda bağlı.
+# Doğrulama: iio_attr -u <uri> -c ad9361-phy voltage0 hardwaregain_available
+[[gain_bands]]
+f_min_hz = 70e6
+f_max_hz = 1300e6
+gain_min_db = -1.0
+gain_max_db = 73.0
+step_db = 1.0
+
+[[gain_bands]]
+f_min_hz = 1300e6
+f_max_hz = 4000e6
+gain_min_db = -3.0
+gain_max_db = 71.0
+step_db = 1.0
+
+[[gain_bands]]
+f_min_hz = 4000e6
+f_max_hz = 6000e6
+gain_min_db = -10.0
+gain_max_db = 62.0
+step_db = 1.0

@@ -1,0 +1,34 @@
+# PLANLANAN (Faz-1): HackRF One — TX (karıştırma/aldatma) için. Half-duplex, 8-bit.
+name = "hackrf_one"
+chip = "MAX2837 + RFFC5072 + MAX5864"
+description = "HackRF One (planlanan, TX odaklı)"
+status = "planned"
+backend_hint = "soapy"
+soapy_driver = "hackrf"
+rx_channels = 1
+tx_channels = 1
+coherent_rx = false
+adc_bits = 8
+full_scale_counts = 128.0
+freq_min_hz = 1e6
+freq_max_hz = 6e9
+bw_min_hz = 1.75e6
+bw_max_hz = 28e6
+sample_rate_min_hz = 2e6
+sample_rate_max_hz = 20e6
+ref_clock_hz = 25e6
+ref_clock_ppm = 20.0
+interface = "usb2"
+interface_max_bytes_per_s = 53.248e6
+interface_practical_bytes_per_s = 40e6
+bytes_per_sample = 2
+kernel_buffers = 0
+default_buffer_size = 131072
+candidate_sample_rates_hz = [2e6, 4e6, 8e6, 10e6, 16e6, 20e6]
+
+[[gain_bands]]
+f_min_hz = 1e6
+f_max_hz = 6e9
+gain_min_db = 0.0
+gain_max_db = 102.0
+step_db = 2.0

@@ -1,0 +1,36 @@
+# PLANLANAN (Faz-1): KrakenSDR — 5 kanal koherent RTL-SDR (R820T2), DF için.
+# Koherens Heimdall DAQ firmware'i ve dahili gürültü kaynağı kalibrasyonu ile sağlanır;
+# backend: eds.hal içinde "heimdall" (henüz yok). Arayüz RxDevice ile aynıdır:
+# num_channels=5, coherent=True -> DF modülü değişmeden çalışır.
+name = "krakensdr"
+chip = "5x R820T2 + RTL2832U"
+description = "KrakenSDR 5-kanal koherent alıcı (planlanan)"
+status = "planned"
+backend_hint = "heimdall"
+rx_channels = 5
+tx_channels = 0
+coherent_rx = true
+adc_bits = 8
+full_scale_counts = 128.0
+freq_min_hz = 24e6
+freq_max_hz = 1766e6
+bw_min_hz = 0.9e6
+bw_max_hz = 2.56e6
+sample_rate_min_hz = 0.9e6
+sample_rate_max_hz = 2.56e6
+ref_clock_hz = 28.8e6
+ref_clock_ppm = 1.0
+interface = "ethernet(heimdall)"
+interface_max_bytes_per_s = 100e6
+interface_practical_bytes_per_s = 60e6
+bytes_per_sample = 2
+kernel_buffers = 0
+default_buffer_size = 1048576
+candidate_sample_rates_hz = [1.024e6, 2.048e6, 2.4e6, 2.56e6]
+
+[[gain_bands]]
+f_min_hz = 24e6
+f_max_hz = 1766e6
+gain_min_db = 0.0
+gain_max_db = 49.6
+step_db = 0.1

@@ -1,0 +1,35 @@
+# PLANLANAN: bladeRF 2.0 micro (AD9361, 2R2T koherent, USB 3.0). Aynı SoapySDR backend'i
+# ile çok-kanallı akış (channels=[0,1]) -> HAL değişmeden çalışır.
+name = "bladerf2_micro"
+chip = "AD9361"
+description = "bladeRF 2.0 micro (planlanan)"
+status = "planned"
+backend_hint = "soapy"
+soapy_driver = "bladerf"
+rx_channels = 2
+tx_channels = 2
+coherent_rx = true
+adc_bits = 12
+full_scale_counts = 2048.0
+freq_min_hz = 47e6
+freq_max_hz = 6e9
+bw_min_hz = 200e3
+bw_max_hz = 56e6
+sample_rate_min_hz = 520834
+sample_rate_max_hz = 61.44e6
+ref_clock_hz = 38.4e6
+ref_clock_ppm = 1.0
+interface = "usb3"
+interface_max_bytes_per_s = 400e6
+interface_practical_bytes_per_s = 300e6
+bytes_per_sample = 4
+kernel_buffers = 0
+default_buffer_size = 65536
+candidate_sample_rates_hz = [4e6, 10e6, 20e6, 30.72e6, 61.44e6]
+
+[[gain_bands]]
+f_min_hz = 47e6
+f_max_hz = 6e9
+gain_min_db = -15.0
+gain_max_db = 60.0
+step_db = 1.0

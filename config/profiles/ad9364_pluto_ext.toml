@@ -1,0 +1,51 @@
+# UYARI: Pluto'nun AD9364 moduna "unlock" edilmiş hâli (fw_setenv attr_val ad9364).
+# Resmî AD9363 spesifikasyonu DEĞİLDİR; 3.8 GHz üstü/325 MHz altı ve 20 MHz üstü BW'de
+# performans garanti edilmez. Jüri raporlarında yalnızca ad9363_pluto profili kullanılmalı.
+
+name = "ad9364_pluto_ext"
+chip = "AD9364 (Pluto unlocked)"
+description = "Genişletilmiş Pluto (70 MHz–6 GHz, ≤56 MHz BW) — spesifikasyon dışı, opt-in"
+status = "supported"
+backend_hint = "soapy"
+soapy_driver = "plutosdr"
+rx_channels = 1
+tx_channels = 1
+coherent_rx = false
+adc_bits = 12
+full_scale_counts = 2048.0
+freq_min_hz = 70e6
+freq_max_hz = 6e9
+bw_min_hz = 200e3
+bw_max_hz = 56e6
+sample_rate_min_hz = 65104.17
+sample_rate_max_hz = 61.44e6
+ref_clock_hz = 40e6
+ref_clock_ppm = 25.0
+interface = "usb2"
+interface_max_bytes_per_s = 53.248e6
+interface_practical_bytes_per_s = 24e6
+bytes_per_sample = 4
+kernel_buffers = 4
+default_buffer_size = 65536
+candidate_sample_rates_hz = [1.0e6, 2.4e6, 4.0e6, 6.0e6, 8.0e6, 10.0e6, 15.36e6, 20.0e6, 30.72e6, 61.44e6]
+
+notes = ["Spesifikasyon dışı mod. Ölçüm raporları bu profil ile üretilirse raporda uyarı basılır."]
+
+
+[[gain_bands]]
+f_min_hz = 70e6
+f_max_hz = 1300e6
+gain_min_db = -1.0
+gain_max_db = 73.0
+
+[[gain_bands]]
+f_min_hz = 1300e6
+f_max_hz = 4000e6
+gain_min_db = -3.0
+gain_max_db = 71.0
+
+[[gain_bands]]
+f_min_hz = 4000e6
+f_max_hz = 6000e6
+gain_min_db = -10.0
+gain_max_db = 62.0

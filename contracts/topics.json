@@ -1,0 +1,61 @@
+{
+  "$comment": "TEK DOĞRULUK KAYNAĞI: ZeroMQ topic kayıt defteri. Topic adı değişecekse YALNIZCA burayı ve src/eds/bus/topics.py sabitlerini değiştirin; tests/bus/test_contracts.py ikisinin birebir eşleştiğini doğrular. Çerçeve: ZMQ multipart [topic(utf-8), json(utf-8)]. Her mesaj envelope.schema.json zarfını taşır; 'data' alanı aşağıdaki şemaya uyar.",
+  "version": 1,
+  "envelope": "envelope.schema.json",
+  "topics": {
+    "rx.status": {
+      "schema": "rx.status.schema.json",
+      "producer": "rx",
+      "rate": "1 Hz (bus.status_period_s)",
+      "description": "RX düğümü sağlık/durum: frekans, hız, kazanç, overflow/drop sayaçları, sıcaklık, PPM, headroom."
+    },
+    "rx.spectrum": {
+      "schema": "rx.spectrum.schema.json",
+      "producer": "rx",
+      "rate": "<= bus.spectrum_rate_hz",
+      "description": "Anlık bant PSD karesi (dBm kalibreli ya da dBFS), RBW ve zaman damgalarıyla."
+    },
+    "rx.detections": {
+      "schema": "rx.detections.schema.json",
+      "producer": "rx",
+      "rate": "her spektrum karesi (boş liste dahil)",
+      "description": "CFAR ile tespit edilen sinyaller (merkez/tepe frekansı, BW, güç, SNR)."
+    },
+    "rx.sweep": {
+      "schema": "rx.sweep.schema.json",
+      "producer": "rx",
+      "rate": "tarama başına 1",
+      "description": "Geniş bant tarama sonucu (325 MHz–3.8 GHz), max-hold desimasyonlu spektrum + tespitler + tarama hızı."
+    },
+    "cal.result": {
+      "schema": "cal.result.schema.json",
+      "producer": "rx|calib",
+      "rate": "olay",
+      "description": "Kalibrasyon sonucu (ppm, güç, IQ/imaj, koherens) ve nasıl uygulandığı."
+    },
+    "df.bearing": {
+      "schema": "df.bearing.schema.json",
+      "producer": "df",
+      "rate": "tespit başına",
+      "description": "Yön bulma kestirimi (Faz-0: 2 elemanlı interferometre; Faz-1: Kraken MUSIC)."
+    },
+    "meas.result": {
+      "schema": "meas.result.schema.json",
+      "producer": "measure",
+      "rate": "ölçüm başına",
+      "description": "KTR nicel spec ölçüm sonucu (değer, birim, koşullar, hedef, geçti/kaldı)."
+    },
+    "ctl.rx": {
+      "schema": "ctl.rx.schema.json",
+      "producer": "gui|operator",
+      "rate": "olay",
+      "description": "RX düğümüne komut (frekans/kazanç/hız/BW ayarı, tarama başlat, ping)."
+    },
+    "ctl.ack": {
+      "schema": "ctl.ack.schema.json",
+      "producer": "rx",
+      "rate": "komut başına",
+      "description": "ctl.* komutunun sonucu (req_id ile eşleşir)."
+    }
+  }
+}

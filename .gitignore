@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Ölçüm çıktıları (rapor klasörleri büyük olabilir; seçilenleri elle commit'leyin)
+reports/*
+!reports/.gitkeep
+
+# Cihaza özel kalibrasyon dosyaları seri numarasıyla oluşur; takım isterse commit'leyebilir
+cal/*.json
+!cal/.gitkeep
+!cal/example_*.json
+
+# IQ kayıtları
+*.npz
+*.cfile
+*.sigmf-data

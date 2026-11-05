@@ -1,0 +1,34 @@
+# PLANLANAN: Ettus USRP B210 (AD9361, 2x2 koherent, USB 3.0) — SoapyUHD üzerinden.
+name = "usrp_b210"
+chip = "AD9361"
+description = "USRP B210 (planlanan)"
+status = "planned"
+backend_hint = "soapy"
+soapy_driver = "uhd"
+rx_channels = 2
+tx_channels = 2
+coherent_rx = true
+adc_bits = 12
+full_scale_counts = 2048.0
+freq_min_hz = 70e6
+freq_max_hz = 6e9
+bw_min_hz = 200e3
+bw_max_hz = 56e6
+sample_rate_min_hz = 200e3
+sample_rate_max_hz = 61.44e6
+ref_clock_hz = 40e6
+ref_clock_ppm = 2.0
+interface = "usb3"
+interface_max_bytes_per_s = 400e6
+interface_practical_bytes_per_s = 250e6
+bytes_per_sample = 4
+kernel_buffers = 0
+default_buffer_size = 65536
+candidate_sample_rates_hz = [4e6, 10e6, 20e6, 30.72e6, 56e6]
+
+[[gain_bands]]
+f_min_hz = 70e6
+f_max_hz = 6e9
+gain_min_db = 0.0
+gain_max_db = 76.0
+step_db = 1.0
