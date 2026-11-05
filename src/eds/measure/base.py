@@ -23,6 +23,7 @@ import logging
 import traceback
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from typing import Any, ClassVar
 
@@ -170,6 +171,65 @@ class MeasurementContext:
     @property
     def dut(self):
         return self.devices[0]
+
+    @property
+    def is_sim(self) -> bool:
+        return self.world is not None
+
+    def _source_prefix(self) -> str | None:
+        return getattr(self.source, "name", None) if self.source is not None else None
+
+    @contextmanager
+    def terminated_input(self):
+        """RX input terminated in 50 Ω (noise-floor measurements).
+
+        Simulator: every emitter (scene *and* source) is disabled for the duration and
+        restored afterwards. Hardware: the operator is prompted to fit / remove the load.
+        """
+        if self.world is not None:
+            saved = {e.name: e.enabled for e in self.world.emitters}
+            for name in saved:
+                self.world.set_enabled(name, False)
+            try:
+                yield
+            finally:
+                for name, on in saved.items():
+                    if self.world.get(name) is not None:
+                        self.world.set_enabled(name, on)
+        else:
+            self.prompt("DUT RX girişini anten/kablodan ayırıp 50 Ω sonlandırıcı takın, ardından Enter.")
+            try:
+                yield
+            finally:
+                self.prompt("50 Ω sonlandırıcıyı çıkarıp ölçüm kablosunu/anteni yeniden bağlayın, ardından Enter.")
+
+    @contextmanager
+    def isolated_source(self):
+        """Only the stimulus reaches the RX (cabled bench setup).
+
+        Simulator: scene emitters that do not belong to the source are disabled and
+        restored afterwards. Hardware: the operator is asked to cable the source to the
+        RX input (through the attenuator) — over-the-air signals are then negligible.
+        """
+        if self.world is not None:
+            pref = self._source_prefix()
+            saved = {e.name: e.enabled for e in self.world.emitters
+                     if not (pref and (e.name == pref or e.name.startswith(pref + "_")))}
+            for name in saved:
+                self.world.set_enabled(name, False)
+            try:
+                yield
+            finally:
+                for name, on in saved.items():
+                    if self.world.get(name) is not None:
+                        self.world.set_enabled(name, on)
+        else:
+            self.prompt("Sinyal kaynağını zayıflatıcı üzerinden DUT RX girişine kablo ile bağlayın, ardından Enter.")
+            yield
+
+    def param(self, spec_id: str, key: str, default: Any = None) -> Any:
+        p = self.params.get(spec_id, {})
+        return p.get(key, default) if isinstance(p, dict) else default
 
 
 class Measurement(ABC):
