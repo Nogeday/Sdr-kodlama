@@ -54,8 +54,8 @@
 | Zaman | Bus mesajları `time.time_ns()` (duvar saati); süreler `perf_counter`. `IQBlock.t_ns` = ilk örneğin tahmini host zamanı (okumanın **dönüş** anından geriye; cihaz FIFO/USB süresi dahil değildir). |
 | Açılar | Derece; `wrap_deg` (−180, 180]. DF azimutu: dizi eksenine dik (broadside) = 0°, **dizi ekseni boyunca 2. elemana doğru pozitif** (bkz. eds.df). |
 | Süreç başına Pluto | Bir süreçte en fazla **bir** SoapyPlutoSDR cihazı (RX ya da `pluto_tx`) açıktır (`claim_pluto`); ikincisi `DeviceError`. Fazlası `[[device]] isolation` / `source_args.isolate` ile alt süreçte (§5). |
-| Uyaran tavanı | Ölçüm prosedürleri RX girişini `DeviceProfile.rx_max_input_dbm`'in (AD9363: −5 dBm) üstüne sürmez (`eds.measure.stimulus.rx_max_input_dbm`, `source_power_range`, `relative_setting_cap`, `adjust_tone`). Bilinen istisna: `latency`'nin uyarlamalı ton seviyesi yalnız kaynağın `power_range_db`'siyle sınırlıdır (MEASUREMENTS §0.4). |
-| Koşulsuz sayı yok | `MeasurementResult.blockers` (Türkçe nedenler) boş değilse, sonuç hızlı modda (`conditions["quick"]`), gerçek zamanlı olmayan simülatörde ya da birim/kalibrasyon uyuşmazlığında **hedef kararı verilmez** (`passed=None`, rapor "KARŞILAŞTIRILMADI"). `run_measurement` her sonuca `conditions["quick"]` ve `conditions["simulated"]` yazar. |
+| Uyaran tavanı | Ölçüm prosedürleri RX girişini `DeviceProfile.rx_max_input_dbm`'in (AD9363: −5 dBm) üstüne sürmez (`eds.measure.stimulus.rx_max_input_dbm`, `source_power_range`, `relative_setting_cap`, `adjust_tone`). `latency`'nin uyarlamalı ton seviyesi de bu tavana uyar: mutlak kaynakta `source_power_range`, bağıl kaynakta düğümün yayınladığı ton bant gücünden her okumada yeniden ekstrapole edilen `relative_setting_cap`; bağıl kaynakta ton okunmadan seçilen ayarlar (ilk ayar, görünmeyen tona +20 dB adım) yalnız kaynak aralığı ve önceki okumaların tavanıyla sınırlıdır (MEASUREMENTS §0.4). |
+| Koşulsuz sayı yok | `MeasurementResult.blockers` (Türkçe nedenler) boş değilse, sonuç hızlı modda (`conditions["quick"]`), gerçek zamanlı olmayan simülatörde, birim/kalibrasyon uyuşmazlığında, sağlanmayan `[<spec>.require]` koşulunda ya da kararı belirlemeyen sınır değerde (`extra["value_bound"]`, `targets.bound_reason`) **hedef kararı verilmez** (`passed=None`, rapor "KARŞILAŞTIRILMADI"). `run_measurement` her sonuca `conditions["quick"]` ve `conditions["simulated"]` yazar. |
 | Hatalar | Yalnızca `eds.core.errors` alt sınıfları fırlatılır (bus'ın kendi hataları da `EDSError` alt sınıfıdır). |
 | Dil | Kod/docstring İngilizce; kullanıcıya dönük metin (CLI, rapor, profil ihlalleri, uyarılar) Türkçe. |
 
@@ -122,7 +122,8 @@ config_dir() profiles_dir() contracts_dir() cal_dir() reports_dir()
 ### 3.2 `eds.hal`
 
 ```python
-# base — RxDevice sözleşmesi (paket kökünden: RxDevice, RawRead, GAIN_MODES, open_*, enumerate_devices, get_sim_world)
+# base — RxDevice sözleşmesi (paket kökünden: RxDevice, RawRead, GAIN_MODES, open_*, enumerate_devices, get_sim_world,
+#        isolation_plan, ProcessRxDevice, ProcessSignalSource)
 GAIN_MODES = ("manual", "hw_slow", "hw_fast", "hw_hybrid")
 RawRead(samples (n_ch, k) complex64, overflow_before=False, timeout=False, t_ns=0, hw_time_ns=None,
         uncertain_samples=0)          # backend _read_raw dönüşü; uncertain_samples: boşluk bu kadar örnek içinde bir yerde
@@ -150,14 +151,22 @@ ISOLATION_MODES = ("auto", "inproc", "subprocess")
 get_sim_world(app) -> SimWorld                      # AppConfig başına tek paylaşılan sahne (config nesnesine iliştirilir)
 is_pluto_config(dev) -> bool                        # soapy + driver (args ya da profil soapy_driver) == "plutosdr"
 pluto_tx_in_process(app) -> bool                    # measure.source="pluto_tx" ve isolate=false
-isolation_plan(app, devices=None) -> {ad: "inproc"|"subprocess"}   # §5 karar tablosu
-open_device(dev, app=None) -> RxDevice              # dev.isolation="subprocess" → ProcessRxDevice; "auto" tek başına = süreç içi
+plutos_open_in_process() -> list[str]               # bu süreçte ZATEN açık Pluto'ların sahipleri (claim_pluto kaydı)
+isolation_plan(app, devices=None) -> {ad: "inproc"|"subprocess"}   # §5 karar tablosu (zaten açık Pluto'lar dahil)
+open_device(dev, app=None) -> RxDevice              # dev.isolation="subprocess" → ProcessRxDevice; "auto": Pluto ise ve bu
+                                                    #   süreçte zaten açık bir Pluto varsa alt süreç, yoksa süreç içi
 open_devices(app, names=None) -> list[RxDevice]     # plana göre yerleştirir; hata olursa açılanları kapatır
 open_group(app, names=None) -> RxDevice             # 1 cihaz → kendisi; çok → DeviceGroup
 enumerate_devices(backend="soapy", args=None) -> list[dict]
 # proc — süreç yalıtımı (§5)
-ProcessRxDevice(cfg, app=None, *, opener=None) (RxDevice, backend_name="proc")  .pid .alive
-    # base mantığı üst süreçte; ilkeller + set_tracking/set_ppm_correction/read_sensors/runtime_limits/describe RPC
+ProcessRxDevice(cfg, app=None, *, opener=None) (RxDevice, backend_name="proc")  .pid .alive .settle_samples
+    # base mantığı üst süreçte; ilkeller + set_tracking/set_ppm_correction/read_sensors/runtime_limits/describe RPC;
+    # .settle_samples = alt süreç cihazının penceresi (aynı buffer_size/settle_buffers için hesaplandıysa)
+    # MIRRORED_ATTRS düz öznitelik olarak yansıtılır (alt süreç cihazında varsa): her kontrol çağrısında VE
+    #   değiştikleri okuma yanıtında; sürümlü anlık görüntü (en yenisi kazanır)
+MIRRORED_ATTRS = ("overflow_source", "dma_overflow_events", "thin_serial_verified", "ts_gap_events", "agc_mode_actual",
+                  "stream_format", "native_format", "native_format_source", "stream_mtu", "xo_correction_hz", "xo_boot_hz")
+backend_attrs(dev) -> dict                          # dev'in MIRRORED_ATTRS değerleri, düz veri (yok/düz olmayan atlanır)
 ProcessSignalSource(target: "modül:Sınıf" | type, args=(), kwargs=None) (SignalSource)  .pid .alive
     # set_frequency/set_power/set_enabled/set_tones/set_lo_offset/describe/close iletilir; name, absolute_power,
     # max_tones, power_range_db, freq_range_hz yansıtılır; diğer public öznitelikler erişimde alt süreçten okunur
@@ -166,7 +175,8 @@ app_to_plain(app) / app_from_plain(d) ; target_path(t) / resolve_target(p) ; pac
 RemoteTraceback(tb) ; DEFAULT_OPENER = "eds.hal.factory:open_device"
 # soapy_backend
 SoapyRxDevice(cfg, profile, *, stream_format="CS16"|"CF32", detect_ts_gaps=True, overflow_poll_s=0.02)
-    .is_pluto .thin_uri() -> str .thin_layer() -> PlutoIIO | None    # ince katman: ilk ihtiyaçta, seri doğrulamalı
+    .is_pluto .thin_uri() -> str .thin_layer() -> PlutoIIO | None    # ince katman: Pluto'da cihaz açılışında açılır
+                                                                     #   (bir kez, yeniden denenmez), seri doğrulamalı
     .runtime_limits()          # plutosdr: sürücünün sabit 0..73'ü yalnız "gain_db_driver" (profil yetkili)
     .set_tracking(...)         # BB-DC / quadrature: Soapy DC-offset / IQ-balance modu varsa "soapy", yoksa (Pluto)
                                #   ince katman "iio"; RF-DC her zaman ince katman; hiçbiri → "unsupported" + uyarı
@@ -175,6 +185,10 @@ SoapyRxDevice(cfg, profile, *, stream_format="CS16"|"CF32", detect_ts_gaps=True,
     .read_sensors()            # Soapy sensörleri + temperature_c / rssi_db (ince katman ya da Soapy sıcaklık sensörü)
     # öznitelikler: overflow_source ("driver"|"dma_status"|"none"), dma_overflow_events, native_format(_source),
     #   stream_mtu, xo_boot_hz, xo_correction_hz, thin_serial_verified, agc_mode_actual, ts_gap_events
+    #   (hepsi proc.MIRRORED_ATTRS: ProcessRxDevice'ta da okunur)
+    # overflow_source açılışta belirlenir: Pluto olmayan "driver"; Pluto ASLA "driver" değildir — açılışta açılan
+    #   ince katman RX DMA durum yazmacını (0x80000088) okuyabiliyorsa "dma_status", yoksa "none"; akış başı yeniden
+    #   denetler (bit temizlenir), yoklama hatası "none" yapar
 STREAM_FORMATS, PLUTO_DRIVER="plutosdr", PLUTO_DEVICE_ARGS={driver,uri,hostname,label,serial},
 PLUTO_STREAM_ARGS={bufflen}, STREAM_ARG_PREFIX="stream:", DEFAULT_OVERFLOW_POLL_S=0.02
 import_soapy() kwargs_to_dict(kw) release_device(sdr, dev) -> "deleter"|"unmake"|"dropped"
@@ -203,6 +217,9 @@ DeviceGroup(devices, *, assume_coherent=False, read_margin_s=5.0) (RxDevice, bac
     .members .worker_threads .last_skew_ns .detach()
     .set_ppm_correction(ppm | list) -> ortak yol | "mixed" ; .set_tracking(...) -> ortak yol | "mixed"
     .read_sensors() -> "<üye>.<anahtar>" ; .runtime_limits() (kesişim) ; .describe()["members"]
+    .overflow_source -> str            # en zayıf üye: herhangi biri "none" → "none", yoksa biri "dma_status" →
+                                       #   "dma_status", yoksa "driver"; hiçbir üye belirtmiyorsa (sim) ""
+    .overflow_source_members -> {üye: overflow_source | ""} ; describe()["overflow_source", "overflow_source_members"]
     # herhangi bir üyede overflow / başarısız okuma → grup bloğu overflow=True; üyenin belirsiz aralığı → settling
 # tx — uyaran sözleşmesi
 SignalSource (soyut): name, absolute_power, max_tones, power_range_db, freq_range_hz
@@ -228,9 +245,12 @@ quantize_tone_freq(f, fs, n) ; DIGITAL_FULL_AMPLITUDE=0.5, DIGITAL_RANGE_DB=60, 
 SimWorld, Emitter, Scene (sim.world) ; SimRxDevice(cfg, profile, world) (sim.device) ; SimSignalSource (sim.source)
 ```
 
-`SoapyRxDevice` ve `SimRxDevice` arka uca özgü öznitelikleri (`overflow_source`,
-`thin_layer()`, `true_ppm` ...) `ProcessRxDevice` üzerinden **erişilemez**; değerleri yalnızca
-`describe()` çıktısında görünür (§5).
+`SoapyRxDevice`'ın `proc.MIRRORED_ATTRS`'taki arka uca özgü öznitelikleri (`overflow_source`,
+`dma_overflow_events`, `thin_serial_verified`, `ts_gap_events`, `agc_mode_actual`,
+`stream_format`, `native_format(_source)`, `stream_mtu`, `xo_correction_hz`, `xo_boot_hz`)
+`ProcessRxDevice` üzerinde düz öznitelik olarak yansıtılır (alt süreçteki cihazda yoksa —
+simülatör — vekilde de yoktur); diğerleri (`thin_layer()`, `SimRxDevice.true_ppm` ...)
+**erişilemez**, değerleri yalnızca `describe()` çıktısında görünür (§5).
 
 ### 3.3 `eds.dsp`
 
@@ -301,12 +321,22 @@ RxStreamer(device, block_size, queue_blocks=32, on_block=None, read_timeout_s=2.
 GainController(device, cfg: AgcConfig, history_len=1024)
     .update(block) -> float | None     # yeni kazanç uygulandıysa döner; settling / eski kazançlı blokları yok sayar
     .settle(max_iter=8, n=16384, timeout_s=2.0) -> float ; .propose(levels, gain_db, *, one_shot=False)
-    .reset() .last_levels .history .low_count .gain_db ; last_settle_status
+    .reset() .last_levels .history .low_count .gain_db .compressed .last_gain_slope
+    .last_settle_status                # "ok"|"at_max_gain"|"at_min_gain"|"too_strong"|"max_iter"
+    # ön uç sıkışması: settle() yaptığı her kazanç değişiminin eğimini değerlendirir; eğimsiz biten saldırıda bir
+    #   prob yakalama (PROBE_STEP_DB aşağı, bant minimumu yakınsa ≥ LINEARITY_MIN_STEP_DB yukarı; kazanç geri yüklenir);
+    #   eğim < COMPRESSION_SLOPE_MAX → kazanç bant minimumu, "too_strong" (harici zayıflatıcı). update() yalnız kendi
+    #   saldırı çiftlerini değerlendirir (prob yok) → .compressed; reset() sıkışma durumunu da siler
 validate_agc_config(cfg) ; classify_levels(levels, cfg) -> "attack"|"low"|"ok" ; gain_delta_db(levels, cfg, *, one_shot)
+gain_slope(levels_a, gain_a_db, levels_b, gain_b_db, cfg) -> float | None   # ΔL/ΔG (RMS ve tepe eğiminin büyüğü;
+    # 1.0 = doğrusal); None: |ΔG| < LINEARITY_MIN_STEP_DB, kırpma, yüksek kazançlı tepe < target_peak_dbfs ya da
+    # düşük kazançlı RMS < −50 dBFS
+COMPRESSION_SLOPE_MAX = 0.85 ; LINEARITY_MIN_STEP_DB = 3.0 ; PROBE_STEP_DB = 6.0
 # sweep
 Sweeper(device, cfg: SweepConfig, dsp: DspConfig, detect: DetectConfig,
         calibrate: Callable[[Spectrum], Spectrum] | None = None, agc: AgcConfig | None = None, *, timeout_s=2.0)
     .plan() -> list[float] ; .run(on_step=None) -> SweepResult ; .abort()   (run() MeasurementError fırlatır)
+    # kurucu konfigürasyonu tarama başlamadan doğrular (ConfigError; sweep.publish_max_points pozitif tamsayı dahil)
     .nfft .df_hz .rbw_hz .step_hz .usable_half_bins .dc_notch_bins .n_capture .buffer_size .n_bins .effective_averages
 SweepResult(f_hz, p_db, unit, calibrated, rbw_hz, n_steps, step_hz, steps, duration_s, rate_hz_per_s,
             timing{tune_s, settle_s, capture_s, dsp_s, other_s}, detections, t_start_ns, t_end_ns, sweep_id,
@@ -334,7 +364,8 @@ blokları atlanır → bitişik örnekler `welch_len(nfft, averages, overlap)` u
 pencerelere toplanır (overflow, host drop, fc/fs/kazanç/ppm değişiminde sıfırlanır) → Welch →
 kalibrasyon (`apply_calibration`, ppm ekseni + güç tablosu) → `detect` → her pencere için
 `rx.detections`, en fazla `spectrum_rate_hz` ile `rx.spectrum`; `t_acq_ns = t_acq_end_ns − n/fs`.
-Her `status_period_s`'de `rx.status` (cihaz `overflow_source = "none"` ise overflow sayacı
+Her `status_period_s`'de `rx.status` (`stream.overflow_source` = cihazın beyanı — alt
+süreçteki `ProcessRxDevice` ve `DeviceGroup` dahil; `"none"` ise overflow sayacı
 "bilinmiyor"dur). `sweep` komutu akışı durdurur, `Sweeper` çalıştırır, `rx.sweep` yayınlar,
 RX ayarlarını geri yükleyip akışı yeniden başlatır (hata → `error` + yeniden deneme döngüsü).
 
@@ -371,6 +402,7 @@ CalibrationStore(dir=None → cal/)  .load(serial) (yoksa boş) .save(cal) -> Pa
 # apply
 apply_calibration(spec, cal, ppm_mode, ppm_hw=None) -> Spectrum   # kopya; ppm_hw None → spec.meta["block_meta"]
 apply_ppm_to_device(device, cal, ppm_mode) -> "hardware"|"soapy"|"software"|"off"   # rx.status'ta "off" → "none"
+    # "PPM kalibrasyonu yok" uyarısı cihaz serisi başına süreçte bir kez (tekrarları DEBUG)
 check_temperature(cal, device, warn_delta_c=5.0) -> str | None
 make_cal_payload(cal_kind, device, values, applied_via, *, t_ns=None, temperature_c=None, serial=None) -> dict
 PPM_MODES = ("auto", "hardware", "software", "off") ; CAL_KINDS = ("ppm", "power", "image_rejection", "coherence", "iq")
@@ -387,16 +419,31 @@ phase_offset(x0, x1) -> (phase_rad, coherence 0..1) ; align(x1, delay) ; valid_s
 CoherenceReport(delay_samples, phase_deg, coherence, phase_drift_deg_per_s, phase_std_deg, n_blocks, coherent, note,
                 drift_std_deg_per_s, freq_offset_hz, delay_std_samples, delay_resolvable, peak_corr, fs_hz, n,
                 ref_channel, channel, t_ns, block_phases_deg, block_delays, block_coherence, criteria, pairs) .to_dict()
+    # drift_std_deg_per_s: blok içi (alt blok faz saçılımı) ve bloklar arası (doğrusal uyum artığı) kestirimin büyüğü
+    # criteria: drift_deg_s, coherence_min, phase_std_max_deg, drift_k_sigma, drift_threshold_deg_s
 check_coherence(device, n=65536, blocks=8, *, ref_channel=0, channels=None, max_lag=None, drift_limit_deg_s=1.0,
-                coherence_min=0.9, phase_std_max_deg=5.0, timeout_s=2.0, max_attempts=3) -> CoherenceReport
-analyze_coherence(x0_blocks, x1_blocks, fs, t_s=None, ...) -> CoherenceReport    # saf hesap
+                coherence_min=0.9, phase_std_max_deg=5.0, timeout_s=2.0, max_attempts=3, drift_k_sigma=3.0)
+                -> CoherenceReport
+    # coherent ⇔ |drift| < max(drift_limit_deg_s, drift_k_sigma·drift_std_deg_per_s) (= criteria["drift_threshold_deg_s"];
+    #   eşik genişlediyse not bunu belirtir; koherent sonuçta ±1 °/s sınırı bu kayıtla doğrulanamadı der),
+    #   coherence > coherence_min, phase_std < phase_std_max_deg. Tüm bloklar TEK gecikmeyle (çözülebilir blok
+    #   kestirimlerinin medyanı) hizalanır.
+analyze_coherence(x0_blocks, x1_blocks, fs, t_s=None, *, max_lag=None, drift_limit_deg_s=1.0, coherence_min=0.9,
+                  phase_std_max_deg=5.0, drift_k_sigma=3.0) -> CoherenceReport    # saf hesap; drift_k_sigma=0: çıplak sınır
+drift_threshold(limit_deg_s, drift_std_deg_s, k_sigma=3.0) -> float    # max(limit, k·σ); σ sonlu değilse limit
+collect_reports() (context manager) -> list[CoherenceReport]   # blok içinde check_coherence'ın döndürdüğü raporlar
+                                                               #   (eds cal coherence çıkış kodu 3)
+DRIFT_LIMIT_DEG_S = 1.0 ; COHERENCE_MIN = 0.9 ; PHASE_STD_MAX_DEG = 5.0 ; DRIFT_K_SIGMA = 3.0
 # interferometer  (eleman 0 x = 0, eleman 1 x = +baseline_m)
 Interferometer2(baseline_m, phase_cal_rad=0.0, delay_cal_samples=0.0, *, calibrated=None)
     .calibrate(x0, x1, f_hz, true_az_deg=0.0, *, fs=None, f_bb_hz=None, bw_hz=None, estimate_delay=True) -> dict
     .bearing(x0, x1, f_hz, f_bb_hz=None, bw_hz=None, *, fs=None) -> Bearing
+    # ikisi de NaN/sonsuz örnekte MeasurementError; bearing() sonlu olmayan faz farkı/koherenste de
     .measure_phase(...) .solutions_deg(dphi, f) .geometric_phase_rad(az, f) .d_over_lambda(f) .max_unambiguous_hz
 Bearing(az_deg, ambiguous_deg (DİĞER çözümler), phase_deg, coherence, quality, f_hz, calibrated, sin_az, d_over_lambda)
     .ambiguous .solutions_deg .to_dict() .to_bus_payload(array_name, t_acq_ns=None, method="interferometer2")
+    # to_bus_payload: az_deg / phase_deg / bir ambiguous_deg öğesi sonlu değilse MeasurementError (şema sayı ister;
+    #   sonlu olmayan coherence / quality → 0)
 # metrics
 angle_errors(est, true) ; rms_angle_error(est, true) ; summarize(est, true) -> {rms, mean, std, max_abs, n}
 ```
@@ -440,13 +487,15 @@ MessageValidationError  # hem jsonschema.ValidationError hem BusError
 SPEC_IDS = ("sensitivity", "dynamic_range", "inst_bw", "scan_speed", "freq_resolution", "df_rms",
             "image_rejection", "max_rate", "latency")
 Series(x, y, label="", style="line"|"marker"|"step"|"bar", yerr=None, role=""|"pass"|"fail"|"warn"|"ref")
+    # role → sabit anlamsal renk (plots.ROLE_COLORS: pass yeşil, fail kırmızı, warn amber, ref gri)
 FigureSpec(name, title, kind="xy"|"spectrum"|"hist"|"polar", series, xlabel, ylabel, hlines, vlines, markers,
-           info, logx, logy, ylim, xlim, xticks: list[(x, etiket)])
+           info, logx, logy, ylim, xlim, xticks: list[(x, etiket)])   # xticks: kategorik x ekseni (çok satırlı etiket olur)
 MeasurementResult(spec_id, title, value, unit, summary, method, conditions, extra, uncertainty, target, target_op,
                   passed, table, figures, status="ok"|"skipped"|"failed", error, device, t_start_ns, duration_s,
                   artifacts, blockers: list[str])
     .evaluate_target(target, op) ; .to_dict(with_figures=True) ; .bus_payload()   # meas.result
-    # extra["value_bound"] = "lower" | "upper" | "" (≥ / ≤ sınır; targets.py şu an kullanmaz)
+    # extra["value_bound"] = "lower" | "upper" | "" (≥ / ≤ sınır; kararı belirlemeyen sınır → karar yok,
+    #   targets.bound_reason)
 MeasurementContext(app, devices, source=None, world=None, cal=None, out_dir="", prompt, params, quick=False)
     .dut (devices[0]) .is_sim .param(spec_id, key, default) ; .terminated_input() .isolated_source() (context manager)
 Measurement(ctx, **params)   # ClassVar: spec_id, title, unit, requires ⊆ {"source", "two_channels"}, default_params
@@ -464,7 +513,10 @@ tone(ctx, f_hz, power) (context manager)        # kaynak aç (stimulus_changed d
 LevelRef(offset_db, method, calibrated, unit, setting=None)
 level_reference(ctx, dev, f_hz, gain_db, *, nfft=4096, averages=8, probe_offset_hz=None, probe_dbfs=-25) -> LevelRef
     # sıra: kalibrasyon tablosu → mutlak kaynakla yerinde referans → offset 0 (dBFS, calibrated=False)
-base_conditions(dev, spec=None, **extra) ; source_conditions(ctx) ; spectrum_screenshot(spec, name, title, ...) -> FigureSpec
+base_conditions(dev, spec=None, **extra) ; source_conditions(ctx)
+spectrum_screenshot(spec, name, title, *, offset_db=0.0, unit=None, markers=None, max_points=4001, ref_level=None,
+                    extra_info=None, xlim_hz=None) -> FigureSpec
+    # x ekseni: xlim_hz; verilmezse tam açıklıklı spektrumda tam fc ± fs/2, dilim / birleştirilmiş taramada çiziciye kalır
 # stimulus — spec'lerin ortak uyaran/ton yardımcıları
 qparam(m, key) ; as_float / as_int / as_float_list / opt_float (Türkçe ConfigError)
 rx_max_input_dbm(dev) -> float ; source_power_range(src, dev=None) -> (lo, hi)  # mutlak kaynakta RX tavanıyla kırpılı
@@ -487,11 +539,20 @@ close_context(ctx, close_devices=True) ; reset_baseline(ctx)   # her ölçümden
 run_suite(app, spec_ids=None, *, ctx=None, write=True, publish=False, title=None, on_result=None, **build_kw)
     -> SuiteResult(results, report_dir, aborted) .ok    # Ctrl-C: kısmi rapor "YARIDA KESİLDİ", sonra yeniden fırlat
 resolve_spec_ids(ids)
-# targets — config/ktr_targets.toml: [spec] target, op ("<="|">="), note, [spec.require]
+# targets — config/ktr_targets.toml: [spec] target, op ("<="|">="), note + isteğe bağlı [spec.require]
+#   (<ad>_min / <ad>_max (listede en kötü öğe) / <ad>_count_min / diğerleri eşitlik; anahtar önce conditions'ta,
+#   yoksa extra'da aranır; kayıtlı olmayan koşul = sağlanmamış)
 Target(target, op, note="", require=()) .passes(v) .describe(unit) ; load_targets(path=None) ; parse_targets(raw)
 apply_targets(results, targets)          # yerinde; karar verilemiyorsa passed=None + extra["verdict_note"]
 verdict_blockers(r, target=None) -> list[str] ; unmet_requirements(r, require) ; resolve_targets_path(path)
-REASON_QUICK, REASON_NONREALTIME, REASON_NO_COHERENCE
+bound_reason(r, target=None) -> str      # extra["value_bound"] kararı belirlemiyorsa Türkçe neden, yoksa "":
+                                         #   alt ≥X: ">=" için X<hedef, "<=" için X≤hedef sonuçsuz; üst ≤X: "<=" için X>hedef,
+                                         #   ">=" için X≥hedef sonuçsuz; kararı belirleyen sınır normal karşılaştırılır
+REASON_QUICK, REASON_NONREALTIME, REASON_NO_COHERENCE ; VALUE_BOUND_KEY = "value_bound"
+# specs — ölçüm başına modül (ayrıntı: MEASUREMENTS); dışa açık yardımcı örneği:
+max_rate.device_args_conditions(dev) -> (etkin argümanlar, yok sayılan adlar)   # Pluto: yalnız driver/uri/hostname/
+                                         #   label/serial + stream:bufflen etkin; Pluto olmayan / sim: hepsi olduğu gibi
+max_rate.BLOCKER_NO_OVERFLOW             # gerçek donanımda overflow_source = "none" → karar yok
 # report / plots
 write_report(results, out_dir, app=None, title=DEFAULT_TITLE, meta=None) -> Path
     # out_dir/<stamp>/: report.html, summary.md, summary.csv, results.json, tables/*.csv, figures/*.png
@@ -511,11 +572,13 @@ eds [-c DOSYA] [--set ANAHTAR=DEĞER]... [--backend sim|soapy] [-v] KOMUT
   info                           etkin konfigürasyon, profil sınırları, RX doğrulaması, Pluto süreç yalıtım planı
   rx [--duration S]              RX düğümü (stderr durum satırı)
   sweep [--start HZ] [--stop HZ] [--rbw HZ] [--fs HZ] [--out F.npz] [--png F] [--publish]
-  cal ppm | power | coherence    kalibrasyon (cal/<seri>.json, cal.result)
+  cal ppm | power | coherence    kalibrasyon (cal/<seri>.json, cal.result; coherence: koherent değilse çıkış 3)
   measure [ÖLÇÜM...|all] [--quick] [--source sim|pluto_tx|scpi|manual|none] [--out DİZİN] [--publish]
           [--no-report] [--title BAŞLIK] [--yes]
   bus proxy | echo TOPIC... | send ctl.rx --cmd ... --arg k=v [--wait-ack S]
-Çıkış kodları: 0 tamam, 1 konfigürasyon/kullanım hatası, 2 en az bir ölçüm başarısız, 130 Ctrl-C.
+Çıkış kodları: 0 tamam, 1 konfigürasyon/kullanım/cihaz/bus hatası, 2 en az bir ölçüm (measure) ya da komut onayı
+(bus send) başarısız, 3 `eds cal coherence`: kanallar koherent değil (rapor yine kaydedilir/yayınlanır; DF
+betikleri bu kodla durmalı), 130 Ctrl-C.
 ```
 
 Sayısal seçenekler `finite_float` / `positive_float` / `nonneg_float` / `positive_int`
@@ -624,30 +687,47 @@ birini kapatmak diğerinin bağlamını yok eder. EDS bunu iki katmanda çözer:
 | 2 Pluto `[[device]]` (2× Pluto DF grubu) | iki cihaz da kendi alt sürecinde (`ProcessRxDevice`) |
 | 1 Pluto + `measure.source = "pluto_tx"` (vars.) | DUT süreç içinde; TX Pluto alt süreçte (`open_source` yalıtır) |
 | 1 Pluto + `pluto_tx`, `source_args.isolate = false` | DUT alt süreçte, kaynak süreç içinde |
+| 1 Pluto, bu süreçte zaten açık bir Pluto varken (`claim_pluto` kaydı, `factory.plutos_open_in_process()`; ör. CLI'nın önceden açtığı bir cihaz ya da süreç içi `pluto_tx` kaynağı) | yeni Pluto alt süreçte |
 | tek Pluto / sim cihazları / Pluto olmayan soapy | süreç içinde |
 
 `"inproc"` / `"subprocess"` zorlar (zorla `inproc` bir süreçte birden çok Pluto bırakırsa
-günlük uyarısı). Bir sim cihazı yalnızca zorlanınca yalıtılır; o zaman alt süreç **kendi**
-`SimWorld`'ünü kurar (ortak sahne, geometri ve ppm sırası kaybolur; `build_context` bu
-durumda `source = "sim"`'i `ConfigError` ile reddeder).
+günlük uyarısı). Tek cihaz açan `open_device` `"auto"`yu yalnız cihaz Pluto ise ve bu süreçte
+zaten açık bir Pluto varsa alt sürece koyar (tek cihaz kendisiyle çakışamaz);
+`open_devices` / `open_group` planı uygular. Bir sim cihazı yalnızca zorlanınca yalıtılır; o
+zaman alt süreç **kendi** `SimWorld`'ünü kurar (ortak sahne, geometri ve ppm sırası kaybolur;
+`build_context` bu durumda `source = "sim"`'i `ConfigError` ile reddeder).
 
 **`ProcessRxDevice`:** `multiprocessing` *spawn* alt süreci cihazı
 `factory.open_device` ile (yalıtım `inproc`'a zorlanmış, `AppConfig` düz veriden yeniden
 kurulmuş) açar. `RxDevice` taban mantığı (profil doğrulaması, kazanç kırpma, settling, boşluksuz
 okuma, istatistik) üst süreçte kalır; ilkeller ve isteğe bağlı özellikler RPC'dir. İki boru
 (kontrol + veri), alt süreçte her biri ayrı thread: bloklayan okuma retune/`stop_stream`'i
-geciktirmez. Okuma yanıtı `struct <BBxxiqqq` başlık + kanal kazançları + ham complex64 tampon
-(`send_bytes`/`recv_bytes_into`, pickle yok). Alt süreç hataları aynı `eds.core.errors` sınıfı
+geciktirmez. Okuma yanıtı `struct <BBHiqqqq` başlık (status, bayraklar
+overflow_before|timeout|has_hw_time|attrs, kazanç sayısı, kanal sayısı, k, t_ns, hw_time_ns,
+`uncertain_samples`) + aynı mesajda kanal kazançları (float64) ve — `attrs` bayrağıyla —
+değişen `MIRRORED_ATTRS`'ın pickle'lanmış `(sürüm, {ad: değer})`'i, ardından ham complex64
+tampon (`send_bytes`/`recv_bytes_into`, dizi pickle'ı yok). `uncertain_samples`
+`RawRead.uncertain_samples`'tır (Pluto DMA overflow'unun belirsiz aralığı; üst süreç onu süreç
+içindeki gibi `settling` işaretler). Alt süreç hataları aynı `eds.core.errors` sınıfı
 ve mesajıyla yeniden fırlatılır (`err.child_traceback`, `__cause__ = RemoteTraceback`); EDS dışı
 hata `DeviceError` olur. Alt süreç ölürse bekleyen ve sonraki çağrılar `DeviceError`
 (okumada `StreamError`); `close()` alt süreci kapatıp biçer; çöp toplama / çıkışta
 `multiprocessing.util.Finalize` boruları kapatır, alt süreç cihazını kapatıp çıkar. Alt süreç
 SIGINT'i yok sayar (Ctrl-C yalnız üst süreçte). Bekleme sırasında kesilen çağrı boruları
-senkron bırakır; kesilen okumanın örnekleri bir overflow boşluğu olur. `info` ve durum
-(fc/fs/bw/kazançlar/mod/ppm/yeni uyarılar) her kontrol çağrısından sonra yansıtılır;
-`backend_name = "proc"`, `info.backend` alt sürecin backend'idir. Arka uca özgü öznitelikler
-(`overflow_source`, `thin_layer()`, `true_ppm` ...) yansıtılmaz; yalnızca `describe()`'da
-görünür.
+senkron bırakır; kesilen okumanın örnekleri bir overflow boşluğu olur (duyurduğu belirsiz
+aralık sonraki bloğa taşınır). `info` ve durum (fc/fs/bw/kazançlar/mod/ppm/yeni uyarılar) her
+kontrol çağrısından sonra yansıtılır; settling penceresi de (alt sürecin `settle_samples`'ı,
+hesaplandığı `buffer_size`/`settle_buffers` ile; Soapy cihazında gerçek `bufflen`'e göre),
+`buffer_size`/`settle_buffers` ise yalnız backend onları kendisi değiştirdiyse benimsenir.
+`backend_name = "proc"`, `info.backend` alt sürecin backend'idir. Arka uca özgü
+`MIRRORED_ATTRS` (`overflow_source`, `dma_overflow_events`, `thin_serial_verified`,
+`ts_gap_events`, `agc_mode_actual`, `stream_format`, `native_format(_source)`, `stream_mtu`,
+`xo_correction_hz`, `xo_boot_hz`) alt süreç cihazında varsa düz öznitelik olarak yansıtılır —
+her kontrol çağrısından sonra VE değiştikleri okuma yanıtıyla (ör. akış ortasında sayılan DMA
+overflow'u ya da kapanan algılama); anlık görüntüler alt süreçte tek kilit altında sürüm
+numarası alır, hangi borudan önce gelirse gelsin en yenisi kazanır. Böylece RX düğümü,
+ölçümler ve raporlar süreç içindekiyle aynı değerleri görür. Diğerleri (`thin_layer()`,
+`true_ppm` ...) yansıtılmaz; yalnızca `describe()`'da görünür.
 
 **`ProcessSignalSource`:** herhangi bir kaynak sınıfını (vars. `eds.hal.tx_hw:SoapyTxSource`)
 alt süreçte çalıştırır; `set_*`, `set_lo_offset`, `describe`, `close` iletilir, hata türleri
@@ -663,8 +743,8 @@ arkasında tutmalıdır (spawn); `eds` CLI ve pytest bunu zaten sağlar.
 | Kaynak | `overflow_source` | Ne olur |
 |---|---|---|
 | Soapy sürücüsü `SOAPY_SDR_OVERFLOW` / donanım zaman damgası sıçraması (`detect_ts_gaps`) | `"driver"` | Sonraki blok `overflow=True` (boşluk tam önünde). |
-| Pluto + ince katman: `cf-ad9361-lpc` DMA durum yazmacı `0x80000088`, bit 2 (W1C) | `"dma_status"` | Akış başlarken temizlenir; başarılı okumalardan sonra en fazla `overflow_poll_s` (20 ms) aralıkla okunup temizlenir. Bit set → sonraki `RawRead.overflow_before=True`, `uncertain_samples = settle_samples` (kayıp o anda kuyrukta bekleyen tamponların arkasındadır): blok `overflow=True`, ardından gelen `settle_samples` örnek `settling`. Yoklama hatası → algılama uyarıyla kapanır. |
-| Pluto, ince katman yok | `"none"` | SoapyPlutoSDR `readStream` overflow **bildirmez**: kayıp algılanamaz (akış başlarken uyarı); süreç içi cihazda `rx.status` `stream.overflow_source = "none"` taşır, `eds rx` sayacı "bilinmiyor" gösterir. `ProcessRxDevice` / `DeviceGroup` bu özniteliği ve üyelerin geç uyarılarını yansıtmaz. |
+| Pluto + ince katman: `cf-ad9361-lpc` DMA durum yazmacı `0x80000088`, bit 2 (W1C) | `"dma_status"` | Cihaz açılışında açılan ince katman yazmacı okuyabiliyorsa açılıştan itibaren `"dma_status"` (salt okuma; `eds devices --probe` akıştan önce gösterir). Akış başlarken temizlenir; başarılı okumalardan sonra en fazla `overflow_poll_s` (20 ms) aralıkla okunup temizlenir. Bit set → sonraki `RawRead.overflow_before=True`, `uncertain_samples = settle_samples` (kayıp o anda kuyrukta bekleyen tamponların arkasındadır): blok `overflow=True`, ardından gelen `settle_samples` örnek `settling`. Yoklama hatası → algılama uyarıyla kapanır (`"none"`). |
+| Pluto, ince katman yok (ya da yazmaç okunamıyor) | `"none"` | Açılıştan itibaren `"none"` (Pluto hiçbir zaman `"driver"` değildir). SoapyPlutoSDR `readStream` overflow **bildirmez**: kayıp algılanamaz (akış başlarken uyarı); `rx.status` `stream.overflow_source = "none"` taşır, `eds rx` sayacı "bilinmiyor" gösterir. Alt süreçteki Pluto'da da aynı: `ProcessRxDevice` özniteliği (ve akış başlangıcı uyarısını kontrol çağrısıyla) yansıtır; `DeviceGroup`'ta değer en zayıf üyedir (bir üye `"none"` → grup `"none"`; üye başına `describe()["overflow_source_members"]`). Grup üyelerin uyarı metinlerini kendi `warnings`'ine almaz (üye uyarısı günlükte ve `describe()["members"]`'da). |
 | Simülatör | (öznitelik yok) | USB/FIFO modeli `overflow_before` üretir (yalnızca `realtime = true`). |
 
 Ortak kurallar (`RxDevice.read`): bildirilen her boşlukta yarım blok atılır ve blok yeniden

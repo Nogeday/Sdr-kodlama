@@ -125,8 +125,9 @@ seviyelerini tavanla kırpar, `freq_resolution` iki-ton testinde ton başına ay
 `min(tek ton ayarı, tavan − 3 dB)` yapar (iki eşit tonun toplamı +3 dB), `latency`'nin
 uyarlamalı ton seviyesi aynı iki sınırı kullanır (bağıl kaynakta tavan, düğümün yayınladığı ton
 bant gücünden her okumada yeniden ekstrapole edilir). Tavan ya da kaynağın üst gücü bir aramayı
-durdurursa sonuç **sınır** (≥) olarak işaretlenir. Görünmeyen tona +20 dB adım okumasızdır
-(yalnız kaynak aralığı ve mutlak kaynakta tavanla sınırlı) — TX→RX yolundaki **≥ 30 dB sabit
+durdurursa sonuç **sınır** (≥) olarak işaretlenir. `latency`'de ton okunmadan seçilen ayarlar
+(ilk ayar, görünmeyen tona +20 dB adım) okumasızdır: mutlak kaynakta tavanla, bağıl kaynakta
+yalnız kaynak aralığı ve önceki okumaların tavanıyla sınırlı — TX→RX yolundaki **≥ 30 dB sabit
 zayıflatıcı** (HARDWARE §8) bu yüzden her durumda zorunludur.
 
 ### 0.5 Raporlanan her sonuçta
@@ -347,8 +348,8 @@ spur'ları SFDR'yi sınırlayabilir → raporda kaynak belirtilir.
 `extra["value_bound"] = "lower"` P_max tavan/kaynakla sınırlandıysa.
 
 **Raporlanan.** Ek: `p_max_dbfs`, `p_max_criterion`, `p_max_input` / `p1db_input` / `clip_input` (+ birimleri
-`*_unit`: dBm ya da dBFS), `compression_at_p_max_db`,
-`small_signal_gain_db`, `clip_input`, SFDR dBc/dBFS, imaj hariç SFDR, baskın spur frekansı/
+`*_unit`: dBm ya da dBFS; ilk kırpan nokta `first_clip_input`), `compression_at_p_max_db`,
+`small_signal_gain_db`, SFDR dBc/dBFS, imaj hariç SFDR, baskın spur frekansı/
 imaj mı/ayrık mı, `close_in_max_dbc`, `source_artifacts`, `source_lo_offset_hz`,
 `dr_total_db` (+ yöntem, alt sınır mı, `p_max_gmin_criterion`, `p1db_input_gmin_dbm`,
 `mds_gmax_dbm`, `snr_req_db`, `rx_max_input_dbm`), N_RBW(G) tablosu. Şekiller: taşıyıcı +
@@ -799,7 +800,7 @@ soket yolu; `"inproc"`: yalnız süreç içi) ve tüketiciyi oynayan bir `Subscr
   eklenir (`mode_a_p95_plus_transfer_ms`). `duration_s` (5 s; hızlı 1.5 s) toplanır.
 
 **Değer ve belirsizlik.** Mod B p95 (kaynak yoksa Mod A p95 + `BLOCKER_MODE_A`, karar yok).
-Belirsizlik: p95 güven aralığının yarı genişliği (N ≥ 72) + RF-açık zamanlama belirsizliği;
+Belirsizlik: p95 güven aralığının büyük yarısı (N ≥ 72) + RF-açık zamanlama belirsizliği;
 N < 72'de özet ve yöntem “p95 için %95 güven aralığı hesaplanamadı (N = … < 72)” yazar.
 Gerçek zamanlı olmayan simülatörde `REASON_NONREALTIME` blocker.
 

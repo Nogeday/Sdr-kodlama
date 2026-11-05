@@ -87,6 +87,10 @@ için kullanılır; yetkili kaynak profildir.
     `max(attack_step_db = 10, tepe − hedef)` dB düşür; tepe < −35 dBFS `hold_blocks` (4) blok
     sürerse en fazla `decay_step_db = 3` dB artır.
     Kazanç değişimi sonrası bloklar “settling” işaretlenir ve AGC onları yok sayar.
+    Düşük kazançta ön uç ADC'den önce sıkışır (tepe tam ölçeğin altında doyar, kırpma görünmez):
+    AGC bunu kazanç değişimindeki seviye eğiminden algılar (ΔL/ΔG < 0.85 → `compressed`;
+    `settle()` kazancı en düşüğe alıp `last_settle_status = "too_strong"` bildirir — harici
+    zayıflatıcı gerekli).
   * Ölçümler kırpılmış blokları kullanmaz; dinamik alan ölçümü kırpma eşiğini `clip_fraction > 0`
     ya da kanal başına tepe ≥ −0.5 dBFS ile, ön uç sıkışmasını küçük sinyal kazancından 1 dB
     düşüşle bulur (`P_max = min(kırpma, P1dB)`; düşük kazançta AD936x ön ucu ADC'den önce sıkışır).
@@ -193,13 +197,19 @@ damgası vermez. EDS bu yüzden ince katman üzerinden AXI ADC **DMA durum yazma
 `overflow_poll_s` (vars. 20 ms) aralıkla yoklanır; bit set ise **sonraki blok**
 `overflow = True` olur ve kayıp, olduğu anda kuyrukta bekleyen tamponların arkasında
 olduğundan, sonraki `settle_samples` örnek `settling` işaretlenir (pencere birleştirme, DF
-hizalaması ve `capture()` bu aralığı kullanmaz). İnce katman yoksa overflow **algılanamaz**
-(`overflow_source = "none"`, akış başlarken uyarı; `rx.status` `stream.overflow_source = "none"`
-taşır ve `eds rx` overflow sayacını “bilinmiyor (sürücü raporlamaz)” gösterir — 0 değil).
-Alt süreçteki Pluto'larda ve `DeviceGroup`'ta (2× Pluto) `overflow_source` ve üyelerin akış
-başlangıcı uyarıları ana süreçteki `rx.status`'a yansıtılmaz: orada bu durum yalnızca alt
-sürecin günlük uyarısı olarak (terminal/stderr) görünür — DF tezgahında her iki cihazın
-`control_uri`'sini (`iio_info -u ip:…`, yukarıdaki `iio_reg` komutu) ayrıca doğrulayın.
+hizalaması ve `capture()` bu aralığı kullanmaz). İnce katman cihazla birlikte açılır;
+`overflow_source` açılıştan itibaren bilinir (`eds devices --probe` akıştan önce gösterir): ince
+katman yazmacı okuyabiliyorsa `"dma_status"`, yoksa `"none"` (Pluto hiçbir zaman `"driver"`
+değildir). İnce katman yoksa overflow **algılanamaz** (`overflow_source = "none"`, akış
+başlarken uyarı; `rx.status` `stream.overflow_source = "none"` taşır ve `eds rx` overflow
+sayacını “bilinmiyor (sürücü raporlamaz)” gösterir — 0 değil). Bu, alt süreçteki Pluto'lar
+için de geçerlidir: `ProcessRxDevice` `overflow_source`, `dma_overflow_events` gibi öznitelikleri
+alt süreçten yansıtır (her kontrol çağrısında ve değiştikleri okuma yanıtında), akış başlangıcı
+uyarısı da kontrol çağrısıyla gelir. `DeviceGroup`'ta (2× Pluto) `rx.status` grubun değerini
+taşır: en zayıf üye (bir üye `"none"` ise grup `"none"`; üye başına
+`describe()["overflow_source_members"]`). Grup üyelerin uyarı metinlerini kendi uyarılarına
+almaz: üyenin uyarısı alt sürecin günlüğünde (terminal/stderr) görünür — DF tezgahında her iki
+cihazın `control_uri`'sini (`iio_info -u ip:…`, yukarıdaki `iio_reg` komutu) ayrıca doğrulayın.
 Bir okuma zaman aşımı (`StreamTimeout`) da boşluk sayılır: sonraki blok `overflow = True`.
 Akışı durdurmak, takılmış bir `iio_buffer_refill`'i ancak libiio bağlam zaman aşımıyla
 (vars. 5 s; SoapyPlutoSDR'de ayarlanamaz) bitirir.
@@ -251,6 +261,7 @@ EDS bunu iki katmanda çözer (ayrıntı: ARCHITECTURE §5):
 | 2 Pluto `[[device]]` (DF grubu) | iki cihaz da kendi alt sürecinde | `dual_pluto.toml` → `rx0=subprocess, rx1=subprocess` |
 | 1 Pluto DUT + `measure.source = "pluto_tx"` | DUT süreç içinde, TX Pluto alt süreçte | `rx_pluto.toml` → `rx0=inproc; pluto_tx kaynağı ayrı süreçte` |
 | 1 Pluto DUT + `pluto_tx`, `source_args.isolate = false` | DUT alt süreçte, kaynak süreç içinde | – |
+| 1 Pluto, bu süreçte zaten açık bir Pluto varken (ör. önceden açılmış cihaz ya da süreç içi `pluto_tx`) | yeni Pluto alt süreçte (tek cihaz açan `open_device` için de) | – |
 | tek Pluto / simülatör / Pluto olmayan Soapy cihazı | süreç içinde | `rx_sim.toml` |
 
   `isolation = "inproc"` / `"subprocess"` yerleşimi zorlar (zorla `inproc` bir süreçte birden
@@ -267,8 +278,11 @@ mesajla ana süreçte yeniden fırlatılır; alt süreç ölürse sonraki çağr
 (`pluto_tx` önce RF'yi kapatır). Ctrl-C yalnız ana sürece gider; ana süreç cihazları sırayla
 kapatır. Kendi Python betiğinizde yalıtılmış cihaz açıyorsanız üst düzeyi
 `if __name__ == "__main__":` arkasına alın (spawn kuralı; `eds` CLI ve pytest zaten uyar).
-Arka uca özgü değerler (ince katman, `overflow_source`, `xo_correction_boot_hz` …) alt
-süreçteki cihazda yalnızca `describe()` çıktısında görünür.
+Arka uca özgü değerlerden `overflow_source`, `dma_overflow_events`, `thin_serial_verified`,
+`xo_correction_hz`, `xo_boot_hz` … (`eds.hal.proc.MIRRORED_ATTRS`) ana süreçteki vekilde de
+öznitelik olarak bulunur (RX düğümü, ölçümler ve raporlar süreç içindekiyle aynı değerleri
+görür); ince katman nesnesi (`thin_layer()`) gibi diğerleri yalnızca `describe()` çıktısında
+görünür (ör. `control_uri`, `thin_layer`).
 
 ---
 
@@ -304,7 +318,7 @@ iio_attr -u ip:192.168.2.1 -C fw_version          # firmware sürümü
 iio_attr -u ip:192.168.2.1 -d ad9361-phy xo_correction
 iio_reg -u ip:192.168.2.1 cf-ad9361-lpc 0x80000088  # RX DMA durum yazmacı (bit 2 = overflow); okuma temizlemez
 python -c "import SoapySDR, iio; print('ok')"     # .venv içinde (system-site-packages)
-eds devices --backend soapy --probe               # EDS ile aç: describe (ince katman, thin_serial_verified, xo_correction_boot_hz ...)
+eds devices --backend soapy --probe               # EDS ile aç: describe (ince katman, thin_serial_verified, overflow_source, xo_correction_boot_hz ...)
 eds info -c config/dual_pluto.toml                # profil doğrulaması + süreç yalıtım planı (rx0/rx1 = subprocess)
 ```
 
@@ -403,10 +417,13 @@ EDS'te ilgili modüller: `eds.hal.group.DeviceGroup`, `eds.df.coherence`
    kestirimi için belirsizdir; gecikme tonlar arasında frekansa bağlı faz eğimi üretir
    (`Δφ = 2π·Δf_bb·Δn/fs`). **Herhangi bir overflow'da hizalama kaybolur** (grup bloğu
    `overflow = True`) → gecikme + faz yeniden kalibre edilir.
-5. **Koherens kontrolü.** `check_coherence` faz kaymasını (°/s; eşik 1 °/s), koherensi (0…1;
-   eşik 0.9) ve blok faz kararlılığını (≤ 5°) ölçer (`eds cal coherence` ile de). `coherent =
-   False` iken DF sonucu kullanılmamalıdır: `df_rms` ölçümü devam eder ama özet “KOHERENS YOK -
-   ortak 40 MHz referans gerekli” taşır ve hedef kararı verilmez (KARŞILAŞTIRILMADI).
+5. **Koherens kontrolü.** `check_coherence` faz kaymasını (°/s; eşik `max(1 °/s, 3σ)`, σ =
+   kayma kestiriminin standart hatası — kısa/zayıf kayıtta 1 °/s doğrulanamazsa not bunu yazar,
+   daha uzun yakalama ya da daha güçlü ortak sinyal gerekir), koherensi (0…1; eşik 0.9) ve blok
+   faz kararlılığını (< 5°) ölçer (`eds cal coherence` ile de; koherent değilse çıkış kodu 3,
+   DF betikleri bununla durmalı). `coherent = False` iken DF sonucu kullanılmamalıdır: `df_rms`
+   ölçümü devam eder ama özet “KOHERENS YOK - ortak 40 MHz referans gerekli” taşır ve hedef
+   kararı verilmez (KARŞILAŞTIRILMADI).
 6. **Geometri.** İki eleman arası `d = λ/2` belirsizliksiz ±90° verir; 0.15 m ⇒ 1 GHz'e kadar
    belirsizliksiz (`f ≤ c/(2d)`). Azimut konvansiyonu: dizi eksenine dik (broadside) = 0°,
    dizi ekseni boyunca 2. elemana (rx1) doğru pozitif. `sin θ` doğrusal olmadığından hata
@@ -477,9 +494,11 @@ için önerilir).
 **Uyaran tavanı.** Profil `rx_max_input_dbm = -5` dBm: ölçüm prosedürleri uyaranı RX girişinde
 bu değerin üstüne çıkarmaz (mutlak kaynakta ayar tavanı, bağıl kaynakta doğrusal okumadan
 ekstrapole edilen tavan; tavanda duran arama sonucu “≥” sınır olarak raporlanır). Bu yazılım
-sınırı sabit zayıflatıcının **yerine geçmez**: `latency` ölçümünün uyarlamalı tonu ve operatör
-hataları (yanlış kablo, sıfıra alınmış kademeli zayıflatıcı) için ≥ 30 dB sabit zayıflatıcı
-hatta kalır (+7 dBm − 30 dB = −23 dBm < −5 dBm).
+sınırı sabit zayıflatıcının **yerine geçmez**: okuma olmadan seçilen seviyeler (ör. `latency`'de
+bağıl kaynakla ilk ayar ve görünmeyen tona +20 dB adım: yalnız kaynak aralığı ve önceki
+okumaların tavanıyla sınırlı — `latency`'nin uyarlamalı tonu aksi halde tavana uyar) ve
+operatör hataları (yanlış kablo, sıfıra alınmış kademeli zayıflatıcı) için ≥ 30 dB sabit
+zayıflatıcı hatta kalır (+7 dBm − 30 dB = −23 dBm < −5 dBm).
 
 ### 7.2 DF faz/gecikme kalibrasyonu
 
@@ -555,8 +574,9 @@ sürekli döngü):
 * Yazılım tavanı: profil `rx_max_input_dbm = -5` dBm (+2.5 dBm mutlak maksimumun altında pay;
   düşük kazançta ön uç ≈ 0 dBm'de sıkışır). Ölçüm prosedürleri uyaranı bunun üstüne sürmez
   (§7.1) — yine de sabit zayıflatıcı **zorunludur** (yazılım tavanı yanlış kablolamayı ve
-  `latency`'nin uyarlamalı ton seviyesini kapsamaz). Başka bir RX için profil değerini veri
-  sayfasından girin (`rx_max_input_dbm`; tanımsızsa `inf` = tavan yok).
+  okumasız seviyeleri — ör. `latency`'de bağıl kaynakla görünmeyen tona +20 dB — kapsamaz).
+  Başka bir RX için profil değerini veri sayfasından girin (`rx_max_input_dbm`; tanımsızsa
+  `inf` = tavan yok).
 * Kablo takıp çıkarmadan önce TX'i kapatın (`set_enabled(False)`); konnektörleri statik
   boşalmaya karşı koruyun (ESD bilekliği, önce gövdeye dokunun). SMA'ları tork anahtarıyla
   sıkın; gevşek konnektör seviye hatası ve faz kayması üretir.
