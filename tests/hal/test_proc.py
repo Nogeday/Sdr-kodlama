@@ -853,4 +853,8 @@ def test_open_source_pluto_tx_errors_come_from_the_worker():
     # the error crossed the process boundary with its EDS type and the worker's traceback.
     with pytest.raises(DeviceError) as e:
         open_source("pluto_tx", {"args": {"driver": "eds_test_no_such_driver"}})
-    assert "SoapyTxSource" in e.value.child_traceback or "import_soapy" in e.value.child_traceback
+    # The worker traceback is abbreviated, so only rely on the frame that is always present:
+    # the SoapyTxSource constructor in tx_hw.py (import_soapy without SoapySDR, Device.make
+    # "no match" with a real SoapySDR installation).
+    tb = e.value.child_traceback
+    assert "tx_hw.py" in tb or "SoapyTxSource" in tb or "import_soapy" in tb

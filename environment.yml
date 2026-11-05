@@ -1,0 +1,31 @@
+# EDS — conda ortamı (Linux ve Windows, x86-64). Ayrıntılar: docs/KURULUM.md
+#
+#   conda env create -f environment.yml      # ilk kurulum
+#   conda activate eds
+#   pip install -e ".[dev]"                   # EDS paketinin kendisi (düzenlenebilir kurulum)
+#
+# Sürüm sabitlemeleri BİLİNÇLİDİR:
+#   * conda-forge'daki soapysdr-module-plutosdr 0.2.4 → soapysdr <0.9 ve libiio-c <1.0 ister.
+#     SoapySDR 0.9 / libiio 1.0 seçilirse Pluto modülü kurulamaz.
+#   * pylibiio 0.2x: eds.hal.pluto_iio bu Python API'sine (iio.Context, Device.reg_read, ...)
+#     göre yazıldı; libiio 1.0 Python bağlamaları farklıdır.
+# Bu dosya linux-64 ve win-64 için çözülerek doğrulandı (SoapySDR 0.8.1, SoapyPlutoSDR 0.2.4,
+# libiio 0.26, Python 3.12).
+name: eds
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  # SDR yığını
+  - soapysdr=0.8.1               # SoapySDR + Python bağlamaları + SoapySDRUtil
+  - soapysdr-module-plutosdr     # SoapyPlutoSDR sürücüsü (driver=plutosdr)
+  - libiio-c>=0.26,<1            # libiio (USB/ağ arka uçları)
+  - pylibiio>=0.26,<1            # libiio Python bağlamaları ("import iio") — ince Pluto katmanı
+  # EDS bağımlılıkları (pip de kurar; conda'dan gelmeleri Windows'ta derleme gerektirmez)
+  - numpy
+  - pyzmq
+  - matplotlib
+  - jsonschema
+  - pytest
+  - ruff

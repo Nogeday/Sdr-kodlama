@@ -296,8 +296,24 @@ def _setup_logging(verbosity: int) -> tuple[logging.Handler, int]:
     return handler, old
 
 
+def _safe_console_encoding() -> None:
+    """Never crash on Turkish text when the console/pipe encoding cannot represent it.
+
+    On Windows a redirected stdout uses the ANSI code page (cp1252 on English Windows cannot
+    encode ş/ğ/İ/ı). Characters that do not fit are replaced instead of raising
+    UnicodeEncodeError. UTF-8 streams (Linux, PYTHONUTF8=1, Windows Terminal) are untouched.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        enc = (getattr(stream, "encoding", None) or "").lower().replace("-", "")
+        if enc in ("utf8", "utf8sig") or not hasattr(stream, "reconfigure"):
+            continue
+        with contextlib.suppress(Exception):
+            stream.reconfigure(errors="replace")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the ``eds`` CLI; returns the process exit code."""
+    _safe_console_encoding()
     parser = build_parser()
     try:
         args = parser.parse_args(list(argv) if argv is not None else None)

@@ -35,17 +35,27 @@ Rapor: reports/20261105-201723   (report.html, summary.md/.csv, results.json, ta
 
 ---
 
-## 1. Hızlı başlangıç (Ubuntu 22.04 / 24.04)
+## 1. Hızlı başlangıç (Linux ve Windows)
+
+> 📘 **Adım adım, görsel kurulum rehberi:** [`docs/KURULUM.md`](docs/KURULUM.md) — Linux, Windows,
+> WSL2, Pluto bağlantısı, sorun giderme.
+
+Önerilen yol her iki işletim sisteminde de aynıdır: [Miniforge](https://github.com/conda-forge/miniforge)
+ve depodaki [`environment.yml`](environment.yml) (SoapySDR 0.8.1 + SoapyPlutoSDR 0.2.4 + libiio 0.26,
+derleme gerektirmez):
 
 ```bash
 git clone https://github.com/Nogeday/Sdr-kodlama.git && cd Sdr-kodlama
-./scripts/install_ubuntu.sh          # apt: libiio, SoapySDR, python3-soapysdr/libiio; SoapyPlutoSDR derlemesi;
-                                     # udev kuralı; .venv (--system-site-packages) + pip install -e ".[dev]"
-source .venv/bin/activate
+conda env create -f environment.yml      # Windows: "Miniforge Prompt" içinde
+conda activate eds
+pip install -e ".[dev]"
 
-make test                            # ~1600 test, donanım gerekmez (fizik tabanlı AD9363 simülatörü)
-make demo                            # simülatörde 9 KTR ölçümü (hızlı) → reports/<zaman>/report.html
+python -m pytest                         # ~1670 test, donanım gerekmez (fizik tabanlı AD9363 simülatörü)
+eds -c config/rx_sim.toml measure all --quick   # simülatörde 9 KTR ölçümü → reports/<zaman>/report.html
 ```
+
+Ubuntu'da conda yerine sistem paketleriyle: `./scripts/install_ubuntu.sh` (apt + SoapyPlutoSDR
+derlemesi + udev + `.venv`), sonra `source .venv/bin/activate` ve `make test`.
 
 Donanımla:
 ```bash

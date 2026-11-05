@@ -509,3 +509,18 @@ aoa_deg = 25.0
     assert "KOHERENT" in cap.out and "DEĞİL" not in cap.out
     assert "havadan gelen 1 emitter (ota)" in cap.err
     assert seen["world"].get("ota").enabled is True                       # scene restored
+
+
+def test_cli_survives_a_console_that_cannot_encode_turkish(monkeypatch):
+    """English Windows + redirected output = cp1252: Turkish text must not crash the CLI."""
+    import io
+    import sys
+
+    from eds.cli.main import main
+
+    out = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+    monkeypatch.setattr(sys, "stdout", out)
+    assert main(["profiles"]) == 0
+    out.flush()
+    text = out.buffer.getvalue().decode("cp1252")
+    assert "ad9363_pluto" in text

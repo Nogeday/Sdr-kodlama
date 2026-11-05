@@ -14,10 +14,10 @@ install:
 	$(PY) -m pip install -e ".[dev]"
 
 test:
-	$(PY) -m pytest -q
+	$(PY) -m pytest
 
 test-fast:
-	$(PY) -m pytest -q -m "not realtime"
+	$(PY) -m pytest -m "not realtime"
 
 lint:
 	ruff check src tests
