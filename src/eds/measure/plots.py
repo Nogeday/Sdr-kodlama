@@ -277,10 +277,18 @@ def _bar_geometry(x: np.ndarray, logx: bool) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _apply_axes(ax: Any, fig: FigureSpec) -> None:
+    from matplotlib.ticker import FuncFormatter, NullFormatter
+
+    # mathtext is disabled (Turkish text safety), so log axes need plain-number labels
+    plain = FuncFormatter(lambda v, _pos: f"{v:g}")
     if fig.logx:
         ax.set_xscale("log")
+        ax.xaxis.set_major_formatter(plain)
+        ax.xaxis.set_minor_formatter(NullFormatter())
     if fig.logy:
         ax.set_yscale("log")
+        ax.yaxis.set_major_formatter(plain)
+        ax.yaxis.set_minor_formatter(NullFormatter())
     if fig.xlim is not None:
         ax.set_xlim(*fig.xlim)
     if fig.ylim is not None:
@@ -383,22 +391,44 @@ def _draw_spectrum(f: Any, fig: FigureSpec) -> None:
     ordered.insert(1 if ordered and ordered[0][0] == "Ref" else 0,
                    ("Ölçek", f"{ydiv:g} {'dB' if unit.lower().startswith('db') else unit}/div"))
     ordered += list(items.items())
-    per_row = 6
-    rows = [ordered[i:i + per_row] for i in range(0, len(ordered), per_row)][:2]
+    # flow layout: each key/value pair takes its rendered width; wrap to a new row when full
+    renderer = f.canvas.get_renderer()
+    fig_w_px = f.get_figwidth() * f.dpi
+    x_left, x_right, gap, kv_gap = 0.022, 0.978, 0.020, 0.006
+    cells = []
+    for k, v in ordered:
+        key = f.text(0, 0, k, ha="left", va="center", fontsize=9, color=SA_MUTED, zorder=5)
+        val = f.text(0, 0, v, ha="left", va="center", fontsize=10.5, color=SA_TEXT,
+                     fontweight="bold", zorder=5)
+        kw = key.get_window_extent(renderer).width / fig_w_px
+        vw = val.get_window_extent(renderer).width / fig_w_px
+        cells.append((key, val, kw, vw))
+    rows: list[list[tuple[float, tuple[Any, Any, float, float]]]] = []
+    cur: list[tuple[float, tuple[Any, Any, float, float]]] = []
+    x = x_left
+    for cell in cells:
+        w = cell[2] + kv_gap + cell[3]
+        if cur and x + w > x_right:
+            rows.append(cur)
+            cur, x = [], x_left
+        cur.append((x, cell))
+        x += w + gap
+    if cur:
+        rows.append(cur)
+    for row in rows[3:]:                       # at most 3 rows; drop the rest
+        for _, (key, val, _, _) in row:
+            key.remove()
+            val.remove()
+    rows = rows[:3] or [[]]
     bar_h = 0.045 * len(rows)
     bar_top = 0.905
     f.add_artist(Rectangle((0.012, bar_top - bar_h), 0.976, bar_h, transform=f.transFigure,
-                           fc=SA_PANEL, ec=SA_EDGE, lw=0.8))
-    renderer = f.canvas.get_renderer()
-    fig_w_px = f.get_figwidth() * f.dpi
+                           fc=SA_PANEL, ec=SA_EDGE, lw=0.8, zorder=1))
     for r, row in enumerate(rows):
         yy = bar_top - 0.0225 - 0.045 * r
-        for c, (k, v) in enumerate(row):
-            xx = 0.022 + c * (0.966 / per_row)
-            key = f.text(xx, yy, k, ha="left", va="center", fontsize=9, color=SA_MUTED)
-            key_w = key.get_window_extent(renderer).width / fig_w_px
-            f.text(xx + key_w + 0.006, yy, v, ha="left", va="center", fontsize=10.5,
-                   color=SA_TEXT, fontweight="bold")
+        for xx, (key, val, kw, _) in row:
+            key.set_position((xx, yy))
+            val.set_position((xx + kw + kv_gap, yy))
 
     # --- screen
     ax_top = bar_top - bar_h - 0.02

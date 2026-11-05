@@ -15,7 +15,11 @@ Mirrors the real binding where EDS depends on it:
   ``getFrequencyRange`` / ``getSampleRateRange`` / ``getBandwidthRange`` lists of ``Range``.
 * SoapyPlutoSDR behaviour: driver key "PlutoSDR", native CS16 full scale 2048, ``bufflen``
   stream arg = MTU, ``kernel_buffers × MTU`` stale (old-frequency) samples after a retune
-  while streaming, CS16 tone of ``tone_counts`` counts.
+  while streaming, CS16 tone of ``tone_counts`` counts. ``find``/``make`` IGNORE the
+  ``serial`` arg (``FakeConfig.filters_serial = False``; set it for drivers such as UHD that
+  filter natively), so ``make({"serial": ...})`` without ``uri`` opens the first device.
+  ``getHardwareInfo`` reports the opened entry's serial (``hw_serial``, from its ``serial``
+  key or the ``serial=...`` field of its libiio ``label``) and ``uri``.
 
 Scripting: ``dev.rx_script`` / ``dev.tx_script`` (``collections.deque``) entries consumed by
 the next ``readStream`` / ``writeStream``:
@@ -202,6 +206,7 @@ class FakeConfig:
     make_error: str = ""
     tx_pacing_s: float = 0.0005
     tx_record_limit: int = 1_000_000
+    filters_serial: bool = False            # SoapyPlutoSDR ignores 'serial'; UHD-like drivers filter
 
 
 @dataclass
@@ -247,8 +252,19 @@ def _parse_args(args: Any) -> dict[str, str]:
 _MATCH_KEYS = ("driver", "serial", "uri", "label")
 
 
-def _matches(entry: dict[str, str], filt: dict[str, str]) -> bool:
+def entry_serial(entry: dict[str, str]) -> str:
+    """Serial of an entry: ``serial`` key, else ``serial=...`` inside the libiio ``label``."""
+    if entry.get("serial"):
+        return entry["serial"]
+    label = entry.get("label", "")
+    i = label.find("serial=")
+    return label[i + 7:].split()[0].rstrip(",)") if i >= 0 else ""
+
+
+def _matches(entry: dict[str, str], filt: dict[str, str], filters_serial: bool = True) -> bool:
     for k in _MATCH_KEYS:
+        if k == "serial" and not filters_serial:
+            continue
         if k in filt:
             a, b = entry.get(k, ""), filt[k]
             if (a.lower() != b.lower()) if k == "driver" else (a != b):
@@ -275,14 +291,14 @@ def make_module(config: FakeConfig | None = None, **overrides: Any) -> types.Mod
         @staticmethod
         def enumerate(args: Any = None) -> list[SoapySDRKwargs]:
             filt = _parse_args(args)
-            return [SoapySDRKwargs(e) for e in cfg.devices if _matches(e, filt)]
+            return [SoapySDRKwargs(e) for e in cfg.devices if _matches(e, filt, cfg.filters_serial)]
 
         @classmethod
         def make(cls, args: Any = None) -> Device:
             a = _parse_args(args)
             if cfg.make_error:
                 raise RuntimeError(cfg.make_error)
-            entry = next((e for e in cfg.devices if _matches(e, a)), None)
+            entry = next((e for e in cfg.devices if _matches(e, a, cfg.filters_serial)), None)
             if entry is None:
                 raise RuntimeError("SoapySDR::Device::make() no match")
             obj = object.__new__(cls)
@@ -350,7 +366,13 @@ def make_module(config: FakeConfig | None = None, **overrides: Any) -> types.Mod
 
         def getHardwareInfo(self) -> SoapySDRKwargs:  # noqa: N802
             self._rec("getHardwareInfo")
-            return SoapySDRKwargs(cfg.hardware_info)
+            info = dict(cfg.hardware_info)
+            ser = entry_serial(self.entry)
+            if ser and "hw_serial" in info:
+                info["hw_serial"] = ser
+            if self.entry.get("uri") and "uri" in info:
+                info["uri"] = self.entry["uri"]
+            return SoapySDRKwargs(info)
 
         def __str__(self) -> str:
             return f"{cfg.driver_key}:{cfg.hardware_key}"

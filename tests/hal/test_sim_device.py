@@ -61,10 +61,12 @@ def test_tone_at_bin_centre_reads_power_in_single_bin():
 
 
 def test_analog_lpf_attenuation_and_aliasing():
+    """Analog Butterworth alone (digital decimation chain off; the combined response is
+    covered by tests/hal/test_sim_digital_filter.py)."""
     fs = 2e6
     corner = fs / 2.0                                    # bw = fs -> corner bw/2 = 1 MHz
     w = make_world(Emitter("edge", F0 + corner, -60.0), Emitter("alias", F0 + 1.6e6, -60.0))
-    d = make_device(w, fs=fs, gain=40, ppm=0.0)
+    d = make_device(w, fs=fs, gain=40, ppm=0.0, digital_filter=False)
     x = d.capture(65536).samples[0]
     # exactly at the corner the 3rd-order Butterworth is -3.01 dB; at fs/2 the tone sits on
     # the Nyquist edge (+-fs/2 alias), so measure on both edges together
@@ -90,7 +92,7 @@ def test_thermal_noise_density_at_high_gain():
 
 def test_noise_is_shaped_by_butterworth():
     fs, bw = 4e6, 2e6
-    d = make_device(make_world(seed=7), fs=fs, bw=bw, gain=70.0)
+    d = make_device(make_world(seed=7), fs=fs, bw=bw, gain=70.0, digital_filter=False)
     x = d.capture(1 << 19).samples[0]
     s = psd(x, fs, 4096)
     centre = s.density_db(-200e3, 200e3)
@@ -648,6 +650,12 @@ def test_identity_sensors_and_tracking():
     {"usb_bytes_per_s": 0.0},
     {"seed": -3},
     {"adc_noise_lsb_rms": -1.0},
+    {"digital_filter": 1},
+    {"dig_pass_frac": 0.6},                              # pass >= stop (0.60)
+    {"dig_pass_frac": 0.0},
+    {"dig_pass_frac": 0.55, "dig_stop_frac": 0.9},       # pass edge beyond Nyquist
+    {"dig_stop_db": 10.0},
+    {"dig_stop_frac": "0.6"},
 ])
 def test_sim_params_validated(sim):
     with pytest.raises(ConfigError):

@@ -85,6 +85,8 @@ usable_fraction = 0.8
 dc_notch_bins = 3
 
 [detect]
+# çoklu çözünürlük CFAR: 1 = doğal bin; D > 1 = D komşu bin ortalaması (geniş bant LTE/Wi-Fi için)
+resolutions = [1, 16, 128]
 method = "os_cfar"
 pfa = 1e-6
 guard_bins = 4

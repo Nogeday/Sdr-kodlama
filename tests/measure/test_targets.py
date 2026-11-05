@@ -41,8 +41,12 @@ def _write(tmp_path: Path, text: str, name: str = "t.toml") -> Path:
     return p
 
 
-def _res(spec_id: str, value: float | None, status: str = "ok") -> MeasurementResult:
-    return MeasurementResult(spec_id=spec_id, title=spec_id, value=value, unit="dB", status=status)
+def _res(spec_id: str, value: float | None, status: str = "ok", unit: str | None = None) -> MeasurementResult:
+    from eds.measure import specs  # noqa: F401  (populate registry)
+    from eds.measure.base import MEASUREMENTS
+
+    return MeasurementResult(spec_id=spec_id, title=spec_id, value=value,
+                             unit=unit if unit is not None else MEASUREMENTS[spec_id].unit, status=status)
 
 
 def test_load_targets_parses_values_ops_and_notes(tmp_path):
@@ -168,3 +172,17 @@ def test_apply_targets_is_authoritative_and_stores_note(tmp_path):
 def test_target_describe():
     assert Target(-100.0, "<=").describe("dBm") == "≤ -100 dBm"
     assert Target(4.0, ">=").describe() == "≥ 4"
+
+
+def test_uncalibrated_or_wrong_unit_gets_no_verdict(tmp_path):
+    from eds.measure.targets import VERDICT_NOTE_KEY
+
+    targets = load_targets(_write(tmp_path, GOOD))
+    dbfs = _res("sensitivity", -130.0, unit="dBFS")          # uncalibrated: dBFS vs dBm target
+    uncal = _res("sensitivity", -130.0)
+    uncal.extra["calibrated"] = False
+    ok = _res("sensitivity", -103.0)
+    apply_targets([dbfs, uncal, ok], targets)
+    assert dbfs.passed is None and "Birim" in dbfs.extra[VERDICT_NOTE_KEY]
+    assert uncal.passed is None and "Kalibrasyonsuz" in uncal.extra[VERDICT_NOTE_KEY]
+    assert ok.passed is True and VERDICT_NOTE_KEY not in ok.extra

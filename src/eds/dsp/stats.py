@@ -289,7 +289,12 @@ def os_cfar_scale(n_avg: float, n_train: int, k: int) -> float:
     m = _check_cells(n_train)
     if not (1 <= int(k) <= m):
         raise ConfigError(f"OS-CFAR sırası 1..{m} aralığında olmalı, {k!r} geldi")
-    return gamma_quantile((int(k) - 0.5) / m, n) / n
+    return _os_cfar_scale_cached(round(float(n), 9), int(m), int(k))
+
+
+@lru_cache(maxsize=1024)
+def _os_cfar_scale_cached(n: float, m: int, k: int) -> float:
+    return gamma_quantile((k - 0.5) / m, n) / n
 
 
 def _log_grid(y_lo: float, y_hi: float) -> tuple[np.ndarray, np.ndarray]:

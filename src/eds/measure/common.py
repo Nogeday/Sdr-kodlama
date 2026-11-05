@@ -70,10 +70,15 @@ def tone(ctx: MeasurementContext, f_hz: float, power: float) -> Iterator[Any]:
     src.set_frequency(f_hz)
     src.set_power(power)
     src.set_enabled(True)
+    # samples already queued in the driver/kernel buffers predate the switch
+    for d in ctx.devices:
+        d.mark_settling()
     try:
         yield src
     finally:
         src.set_enabled(False)
+        for d in ctx.devices:
+            d.mark_settling()
 
 
 @dataclass
@@ -87,30 +92,23 @@ class LevelRef:
 def level_reference(ctx: MeasurementContext, dev, f_hz: float, gain_db: float, *,
                     nfft: int = 4096, averages: int = 8, probe_offset_hz: float | None = None,
                     probe_dbfs: float = -25.0) -> LevelRef:
-    """Find the dBFS→dBm offset at (f_hz, gain_db). See module docstring for the order."""
+    """Find the dBFS→dBm offset at (f_hz, gain_db). See module docstring for the order.
+
+    The in-situ case delegates to :func:`eds.measure.stimulus.reference_level`, which
+    *searches* the probe tone within the TCXO tolerance (±25 ppm = ±23 kHz at 915 MHz —
+    far more than a few bins at narrow RBW) and subtracts the noise contribution.
+    """
     cal = ctx.cal
     power = getattr(cal, "power", None) if cal is not None else None
     if power is not None:
         return LevelRef(float(power.offset_db(f_hz, gain_db)), "kalibrasyon tablosu", True, "dBm")
     src = ctx.source
     if src is not None and getattr(src, "absolute_power", False):
-        fs = dev.fs
-        off = probe_offset_hz if probe_offset_hz is not None else 0.125 * fs
-        f_probe = dev.fc + off
-        # first guess: nominal AD936x level model (dBFS ≈ dBm + G − 5); refine once
-        p_in = probe_dbfs - gain_db + 5.0
-        p_in = float(np.clip(p_in, *getattr(src, "power_range_db", (-140.0, 0.0))))
-        for _ in range(2):
-            with ctx.isolated_source(), tone(ctx, f_probe, p_in):
-                spec = capture_spectrum(dev, nfft, averages)
-            p_meas = tone_power_db(spec, f_probe)
-            offset = p_in - p_meas
-            if p_meas > -6.0 or p_meas < spec.noise_floor_db + 30.0:   # clipped / too weak: retarget
-                p_in = float(np.clip(probe_dbfs + offset, *getattr(src, "power_range_db", (-140.0, 0.0))))
-                continue
-            return LevelRef(float(offset), "kaynak referanslı (in-situ, "
-                            f"{p_in:.1f} dBm @ {fmt_hz(f_probe)})", True, "dBm")
-        return LevelRef(float(offset), "kaynak referanslı (in-situ, düşük güven)", True, "dBm")
+        from .stimulus import reference_level
+
+        frac = (probe_offset_hz / dev.fs) if (probe_offset_hz is not None and dev.fs) else 0.125
+        return reference_level(ctx, dev, f_hz, nfft=nfft, averages=averages, window=ctx.app.dsp.window,
+                               overlap=ctx.app.dsp.overlap, probe_frac=frac, probe_dbfs=probe_dbfs)
     return LevelRef(0.0, "kalibrasyonsuz (dBFS)", False, "dBFS")
 
 

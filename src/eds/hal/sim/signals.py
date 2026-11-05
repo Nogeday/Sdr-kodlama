@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 import zlib
 from fractions import Fraction
+from functools import lru_cache
 
 import numpy as np
 
@@ -82,10 +83,45 @@ def butterworth_mag(f_hz, corner_hz: float, order: int = LPF_ORDER):
     """|H(f)| of an ``order``-th order Butterworth low-pass with -3 dB corner ``corner_hz``.
 
     Magnitude only (zero phase): a real, even response that commutes with the IQ
-    imbalance model, matching identical I and Q analog filters.
+    imbalance model, matching identical I and Q analog filters. A scalar ``f_hz`` returns a
+    Python ``float`` (fast path, no numpy overhead), an array returns ``float64`` array.
     """
+    if np.ndim(f_hz) == 0:
+        r = abs(float(f_hz)) / float(corner_hz)
+        return 1.0 / math.sqrt(1.0 + r ** (2 * order))
     r = np.asarray(f_hz, dtype=np.float64) / float(corner_hz)
     return 1.0 / np.sqrt(1.0 + r ** (2 * order))
+
+
+#: Defaults of the AD9363 RX digital decimation chain model (fractions of the output rate).
+DIG_PASS_FRAC: float = 0.40
+DIG_STOP_FRAC: float = 0.60
+DIG_STOP_DB: float = -80.0
+
+
+def digital_filter_db(f_hz, fs: float, pass_frac: float = DIG_PASS_FRAC, stop_frac: float = DIG_STOP_FRAC,
+                      stop_db: float = DIG_STOP_DB):
+    """Gain (dB) of the RX digital decimation chain at PRE-ALIAS baseband frequency ``f_hz``.
+
+    Model of the AD9363 half-band decimators + programmable FIR: flat (0 dB) for
+    ``|f| <= pass_frac * fs``, ``stop_db`` for ``|f| >= stop_frac * fs`` and a cosine taper
+    *in dB* in between: ``stop_db * (1 - cos(pi x)) / 2`` with
+    ``x = (|f| - pass_frac fs) / ((stop_frac - pass_frac) fs)``. ``fs`` is the OUTPUT
+    sample rate. Even in ``f`` (real coefficients). Scalar in -> ``float``, array in ->
+    ``float64`` array.
+    """
+    fs = float(fs)
+    lo, hi = pass_frac * fs, stop_frac * fs
+    if np.ndim(f_hz) == 0:
+        a = abs(float(f_hz))
+        if a <= lo:
+            return 0.0
+        if a >= hi:
+            return float(stop_db)
+        return float(stop_db) * 0.5 * (1.0 - math.cos(math.pi * (a - lo) / (hi - lo)))
+    a = np.abs(np.asarray(f_hz, dtype=np.float64))
+    x = np.clip((a - lo) / (hi - lo), 0.0, 1.0)
+    return float(stop_db) * 0.5 * (1.0 - np.cos(np.pi * x))
 
 
 # --------------------------------------------------------------------------- IQ imbalance
@@ -217,12 +253,24 @@ def bessel_jn(beta: float, n_max: int) -> np.ndarray:
 
 
 def fm_sidebands(beta: float, tol: float = 1e-7) -> tuple[np.ndarray, np.ndarray]:
-    """Significant Jacobi-Anger terms of sine FM: ``(n, J_n(beta))`` with ``|J_n| > tol``."""
+    """Significant Jacobi-Anger terms of sine FM: ``(n, J_n(beta))`` with ``|J_n| > tol``.
+
+    Results are cached per ``(beta, tol)`` (pure function; the simulator evaluates it for
+    every synthesized piece); the returned arrays are read-only.
+    """
+    return _fm_sidebands_cached(float(beta), float(tol))
+
+
+@lru_cache(maxsize=128)
+def _fm_sidebands_cached(beta: float, tol: float) -> tuple[np.ndarray, np.ndarray]:
     n_max = int(math.ceil(abs(beta) + 12.0 + 4.0 * abs(beta) ** (1.0 / 3.0)))
     j = bessel_jn(beta, n_max)
     n = np.arange(-n_max, n_max + 1)
     keep = np.abs(j) > tol
-    return n[keep], j[keep]
+    n_out, j_out = n[keep], j[keep]
+    n_out.flags.writeable = False
+    j_out.flags.writeable = False
+    return n_out, j_out
 
 
 # --------------------------------------------------------------------------- ADC

@@ -190,7 +190,9 @@ def test_stitched_spectrum_shows_emitters_with_correct_frequency_and_power():
     # noise-like emitters: channel power over their bandwidth
     p_ch = r.band_power_db(f_noise - 1e6, f_noise + 1e6)
     assert abs(p_ch - dev.level_dbfs(-75.0, 50.0)) <= 0.5
-    assert abs(r.band_power_db(f_gsm - 75e3, f_gsm + 75e3) - dev.level_dbfs(-80.0, 50.0)) <= 0.5
+    # 150 kHz of Gaussian noise in one 256 us burst: B*T ~ 38 -> sigma ~ 0.6 dB (24 seeds:
+    # std 0.62 dB, max 1.5 dB), so the bound is 3 sigma
+    assert abs(r.band_power_db(f_gsm - 75e3, f_gsm + 75e3) - dev.level_dbfs(-80.0, 50.0)) <= 2.0
     gsm = [d for d in r.detections if d.f_lo_hz <= f_gsm <= d.f_hi_hz]
     assert len(gsm) == 1 and 0.6 * 150e3 <= gsm[0].bw_hz <= 1.5 * 150e3
     assert abs(gsm[0].band_power_db - dev.level_dbfs(-80.0, 50.0)) <= 1.0

@@ -518,8 +518,10 @@ def test_thin_uri_derivation(monkeypatch, no_iio):
     assert make_dev(args={"driver": "plutosdr", "hostname": "192.168.2.1"}, control_uri="").thin_uri() == IP
     assert make_dev(args={"driver": "plutosdr", "uri": "usb:1.5.5"}, control_uri=IP).thin_uri() == IP
     assert make_dev(args={"driver": "plutosdr", "uri": "usb:1.5.5"}, control_uri="none").thin_uri() == ""
-    # neither given: libiio context URI reported by the driver (hardware info)
-    assert make_dev(args={"driver": "plutosdr"}, control_uri="").thin_uri() == "usb:1.5.5"
+    # neither given: libiio context URI reported by the driver (hardware info) of the device it
+    # actually opened (SoapyPlutoSDR takes the first context found: here the ip one)
+    dev = make_dev(args={"driver": "plutosdr"}, control_uri="")
+    assert dev.thin_uri() == dev._dev.entry["uri"] == IP
 
 
 def test_thin_layer_usb_conflict_falls_back(monkeypatch, sdr):
@@ -579,3 +581,126 @@ def test_describe(sdr):
     d = dev.describe()
     assert d["stream_format"] == "CS16" and d["info"]["driver"] == "PlutoSDR"
     assert d["fc_hz"] == 915e6 and d["fs_hz"] == FS and d["num_channels"] == 1
+
+
+# ----------------------------------------------------------------------------- serial selection
+SER_A = "104473dc5993000917000e00c83b2e5e35"
+SER_B = "1044734c9605000f12003300af7c5b6a8e"
+TWO_PLUTOS = [
+    {"device": "PlutoSDR", "driver": "plutosdr", "label": "PlutoSDR #0 usb:1.5.5", "uri": "usb:1.5.5",
+     "serial": SER_A},
+    {"device": "PlutoSDR", "driver": "plutosdr", "label": "PlutoSDR #1 usb:1.6.5", "uri": "usb:1.6.5",
+     "serial": SER_B},
+]
+
+
+def _count_enumerate(sdr) -> list[dict]:
+    calls: list[dict] = []
+    orig = sdr.Device.enumerate
+
+    def spy(args=None):
+        calls.append(dict(fake_soapy._parse_args(args)))
+        return orig(args)
+
+    sdr.Device.enumerate = staticmethod(spy)
+    return calls
+
+
+def _live_devices() -> int:
+    """Devices currently made (not unmade) in the installed fake."""
+    import sys
+    return len(sys.modules["SoapySDR"].state.live)
+
+
+def test_soapy_pluto_ignores_serial_so_the_backend_resolves_it(monkeypatch, no_iio):
+    sdr = fake_soapy.install(monkeypatch, devices=[dict(e) for e in TWO_PLUTOS])
+    # the driver alone opens the FIRST Pluto whatever serial is asked for (SoapyPlutoSDR)
+    raw = sdr.Device({"driver": "plutosdr", "serial": SER_B})
+    assert raw.entry["uri"] == "usb:1.5.5"
+    del raw
+    calls = _count_enumerate(sdr)
+    dev = make_dev(args={"driver": "plutosdr", "serial": SER_B})
+    assert calls == [{"driver": "plutosdr"}]                  # driver filter only
+    fk = dev._dev
+    assert fk.entry["uri"] == "usb:1.6.5" and fk.args["uri"] == "usb:1.6.5"
+    assert dev.device_args == {"driver": "plutosdr", "serial": SER_B, "uri": "usb:1.6.5"}
+    assert dev.info.serial == SER_B and dev.info.uri == "usb:1.6.5"
+    dev.close()
+
+
+@pytest.mark.parametrize("asked,uri", [
+    (SER_A[:12], "usb:1.5.5"),                                # unique prefix
+    (SER_B[:10].upper(), "usb:1.6.5"),                        # case-insensitive prefix
+    (SER_A, "usb:1.5.5"),                                     # exact
+])
+def test_serial_prefix_and_case_insensitive_match(monkeypatch, no_iio, asked, uri):
+    fake_soapy.install(monkeypatch, devices=[dict(e) for e in TWO_PLUTOS])
+    dev = make_dev(args={"driver": "plutosdr", "serial": asked})
+    assert dev._dev.entry["uri"] == uri
+    assert dev.device_args["serial"] == (SER_A if uri == "usb:1.5.5" else SER_B)   # full serial recorded
+    dev.close()
+
+
+def test_serial_from_libiio_label_when_entry_has_no_serial_key(monkeypatch, no_iio):
+    devices = [
+        {"device": "PlutoSDR", "driver": "plutosdr", "uri": "usb:3.4.5",
+         "label": f"0456:b673 (Analog Devices Inc. PlutoSDR (ADALM-PLUTO)), serial={SER_A}"},
+        {"device": "PlutoSDR", "driver": "plutosdr", "uri": "usb:3.7.5",
+         "label": f"0456:b673 (Analog Devices Inc. PlutoSDR (ADALM-PLUTO)), serial={SER_B}"},
+    ]
+    fake_soapy.install(monkeypatch, devices=devices)
+    dev = make_dev(args={"driver": "plutosdr", "serial": SER_B[:8]})
+    assert dev._dev.entry["uri"] == "usb:3.7.5" and dev.info.serial == SER_B
+    dev.close()
+
+
+def test_ambiguous_serial_prefix_lists_candidates(monkeypatch, no_iio):
+    fake_soapy.install(monkeypatch, devices=[dict(e) for e in TWO_PLUTOS])
+    with pytest.raises(DeviceNotFound) as ei:
+        make_dev(args={"driver": "plutosdr", "serial": "10447"})        # prefix of both
+    msg = str(ei.value)
+    assert "birden çok" in msg and SER_A in msg and SER_B in msg and "usb:1.5.5" in msg and "usb:1.6.5" in msg
+    assert _live_devices() == 0                                       # nothing was opened
+
+
+def test_unknown_serial_lists_candidates(monkeypatch, no_iio):
+    fake_soapy.install(monkeypatch, devices=[dict(e) for e in TWO_PLUTOS])
+    with pytest.raises(DeviceNotFound) as ei:
+        make_dev(args={"driver": "plutosdr", "serial": "deadbeef"})
+    msg = str(ei.value)
+    assert "deadbeef" in msg and "eşleşen" in msg and SER_A in msg and SER_B in msg and "SoapySDRUtil" in msg
+    assert _live_devices() == 0
+    with pytest.raises(ConfigError):
+        make_dev(args={"driver": "plutosdr", "serial": "  "})
+
+
+def test_uri_or_hostname_given_skips_serial_resolution(monkeypatch, no_iio):
+    sdr = fake_soapy.install(monkeypatch, devices=[dict(e) for e in TWO_PLUTOS])
+    calls = _count_enumerate(sdr)
+    dev = make_dev(args={"driver": "plutosdr", "uri": "usb:1.6.5", "serial": SER_B})
+    assert calls == [] and dev._dev.entry["uri"] == "usb:1.6.5"
+    assert dev.device_args == {"driver": "plutosdr", "uri": "usb:1.6.5", "serial": SER_B}
+    dev.close()
+
+
+def test_same_device_listed_twice_is_not_ambiguous(monkeypatch, no_iio):
+    dup = [dict(TWO_PLUTOS[0]), dict(TWO_PLUTOS[0]), dict(TWO_PLUTOS[1])]
+    fake_soapy.install(monkeypatch, devices=dup)
+    dev = make_dev(args={"driver": "plutosdr", "serial": SER_A[:9]})
+    assert dev._dev.entry["uri"] == "usb:1.5.5"
+    dev.close()
+
+
+def test_serial_for_driver_without_uri_keeps_native_filtering(monkeypatch, no_iio):
+    """UHD-like drivers filter by serial themselves and enumerate no 'uri': the prefix is
+    expanded to the full serial and passed on."""
+    fake_soapy.install(
+        monkeypatch, filters_serial=True, num_channels=2, driver_key="UHD", hardware_key="B210",
+        devices=[{"driver": "uhd", "label": "B210 31415A", "serial": "31415A"},
+                 {"driver": "uhd", "label": "B210 27182B", "serial": "27182B"}],
+        hardware_info={"serial": "x"}, native_full_scale=32768.0, cs16_full_scale=32768.0,
+    )
+    dev = make_dev(args={"driver": "uhd", "serial": "2718"}, profile=load_profile("usrp_b210"), channels=[0, 1])
+    assert dev.device_args == {"driver": "uhd", "serial": "27182B"} and "uri" not in dev._dev.args
+    assert dev._dev.entry["serial"] == "27182B"
+    dev.close()

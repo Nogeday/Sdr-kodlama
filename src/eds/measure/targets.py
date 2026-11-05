@@ -35,6 +35,7 @@ else:  # pragma: no cover
 DEFAULT_TARGETS_FILE = "ktr_targets.toml"
 VALID_OPS: tuple[str, ...] = ("<=", ">=")
 TARGET_NOTE_KEY = "target_note"           # MeasurementResult.extra key carrying Target.note
+VERDICT_NOTE_KEY = "verdict_note"         # why no pass/fail verdict was given (unit / calibration)
 _ALLOWED_KEYS = frozenset({"target", "op", "note"})
 
 
@@ -153,3 +154,26 @@ def apply_targets(results: Iterable[MeasurementResult], targets: Mapping[str, Ta
             r.extra[TARGET_NOTE_KEY] = t.note
         else:
             r.extra.pop(TARGET_NOTE_KEY, None)
+        reason = _verdict_blocker(r)
+        if reason:
+            r.passed = None
+            r.extra[VERDICT_NOTE_KEY] = reason
+        else:
+            r.extra.pop(VERDICT_NOTE_KEY, None)
+
+
+def _verdict_blocker(r: MeasurementResult) -> str:
+    """Why a value must NOT be compared with its KTR target (empty string = comparable).
+
+    A target is stated in the spec's canonical unit (e.g. sensitivity in dBm). An
+    uncalibrated result (``extra['calibrated'] is False`` or a different unit such as dBFS)
+    would otherwise be compared numerically with a dBm target — a meaningless verdict.
+    """
+    from .base import MEASUREMENTS
+
+    cls = MEASUREMENTS.get(r.spec_id)
+    if cls is not None and r.unit and cls.unit and r.unit != cls.unit:
+        return f"Birim uyuşmuyor ({r.unit} ≠ hedef birimi {cls.unit}); hedefle karşılaştırılmadı"
+    if r.extra.get("calibrated") is False and cls is not None and cls.unit in ("dBm",):
+        return "Kalibrasyonsuz ölçüm; mutlak (dBm) hedefle karşılaştırılmadı"
+    return ""

@@ -56,10 +56,11 @@ def test_training_cells_match_naive_layout(n: int, g: int, t: int) -> None:
 @pytest.mark.parametrize("method", ["os_cfar", "ca_cfar"])
 @pytest.mark.parametrize("n_avg", [1, 8])
 def test_false_alarm_rate_iid_gamma_bins(method: str, n_avg: int) -> None:
-    """Pure-noise spectra synthesized as Gamma(n, 1/n) bins: measured Pfa ~= design Pfa."""
+    """Pure-noise spectra synthesized as Gamma(n, 1/n) bins: measured Pfa ~= design Pfa
+    (single native pass; the multi-resolution budget is tested in test_detect_multires)."""
     rng = np.random.default_rng(100 + n_avg)
     pfa = 1e-3
-    cfg = DetectConfig(method=method, pfa=pfa, min_snr_db=0.0, exclude_dc=False)
+    cfg = DetectConfig(method=method, pfa=pfa, min_snr_db=0.0, exclude_dc=False, resolutions=[1])
     hits = total = 0
     for _ in range(4):
         n = 2 ** 18
@@ -79,7 +80,7 @@ def test_false_alarm_rate_end_to_end_welch(method: str, window: str, averages: i
     """Complex white noise -> Welch (overlap, correlated bins) -> CFAR with default n_avg."""
     rng = np.random.default_rng(7)
     nfft, pfa = 4096, 1e-3
-    cfg = DetectConfig(method=method, pfa=pfa, min_snr_db=0.0, exclude_dc=False)
+    cfg = DetectConfig(method=method, pfa=pfa, min_snr_db=0.0, exclude_dc=False, resolutions=[1])
     hits = total = 0
     for _ in range(48):
         x = cnoise(rng, nfft + nfft // 2 * (averages - 1), 1e-4).astype(np.complex64)
@@ -223,15 +224,16 @@ def test_short_spectrum_and_bad_config() -> None:
 
 
 @pytest.mark.realtime
-def test_os_cfar_speed_2_16_bins() -> None:
+@pytest.mark.parametrize("resolutions,limit_s", [([1], 0.060), ([1, 16, 128], 0.150)])
+def test_os_cfar_speed_2_16_bins(resolutions: list[int], limit_s: float) -> None:
     rng = np.random.default_rng(0)
     spec = synthetic_spectrum(rng.gamma(16, 1 / 16, 2 ** 16), window="blackmanharris", enbw_bins=2.0044,
                               averages=16, overlap=0.5)
-    cfg = DetectConfig()
+    cfg = DetectConfig(resolutions=resolutions)
     detect(spec, cfg)                               # warm-up: multiplier cache
     best = np.inf
     for _ in range(5):
         t0 = time.perf_counter()
         detect(spec, cfg)
         best = min(best, time.perf_counter() - t0)
-    assert best < 0.060
+    assert best < limit_s

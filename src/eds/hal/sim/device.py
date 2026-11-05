@@ -13,10 +13,28 @@ Signal chain per sample (in this order)
    to the input, scaled by the same level equation (per-sample variance = density·fs).
    Generated in the frequency domain in frames of :data:`~eds.hal.sim.signals.FRAME`
    samples aligned to absolute sample indices (independent of read sizes).
-3. **Analog LPF.** 3rd-order Butterworth magnitude, -3 dB corner at ``bw/2``, applied to
-   every emitter (gain at its *unaliased* baseband offset, per frequency bin for noise-like
-   emitters) and to the thermal noise (per-frame frequency-domain shaping). Emitters
-   outside ``±fs/2`` alias (baseband frequency mod fs) after that attenuation.
+3. **RX filters (analog LPF x digital decimation chain).** Both are applied to every
+   emitter contribution at its *pre-alias* baseband offset ``f = f_RF - f_LO`` (per
+   frequency bin for noise-like emitters, per Jacobi-Anger sideband for FM), i.e. BEFORE
+   the contribution folds into ``±fs/2`` (baseband frequency mod fs), and to the thermal
+   noise within ``±fs/2`` (per-frame frequency-domain shaping, which gives the band-edge
+   roll-off of real Pluto spectra):
+
+   * analog: 3rd-order Butterworth magnitude, -3 dB corner at ``bw/2``;
+   * digital (``digital_filter`` = true): the AD9363 half-band decimators + programmable
+     FIR, flat to ``±dig_pass_frac·fs`` (0.40) and ``dig_stop_db`` (-80 dB) beyond
+     ``±dig_stop_frac·fs`` (0.60) with a cosine taper in dB in between
+     (:func:`~eds.hal.sim.signals.digital_filter_db`). An emitter at ``k·fs + δ``
+     (``k != 0``) therefore folds onto ``δ`` at least 80 dB down (plus the analog
+     attenuation), as on the real chip, where alias images are rejected by > 50 dB.
+
+   Ground truth: :meth:`SimRxDevice.response_db` ``(f_bb_hz)`` = ``20 log10(|H_analog(f)|
+   |H_digital(f)|)`` for the commanded ``fs``/``bw``; a tone at pre-alias offset ``f`` reads
+   ``level_dbfs(P) + response_db(f)`` at its aliased frequency. Emitter contributions whose
+   level after both filters is more than 60 dB below the ADC noise floor
+   (:attr:`adc_noise_dbfs`; the 12-bit quantization noise when ``adc_noise_lsb_rms`` = 0;
+   :attr:`skip_level_dbfs`) are not synthesized at all — emitters GHz away from the LO cost
+   nothing, which keeps a full-band sweep fast.
 4. **TCXO.** ``e = ppm·1e-6``; with hardware correction ``e_hw`` (``set_ppm_correction``,
    Pluto ``xo_correction``) the residual is ``e_res = (1+e)/(1+e_hw) - 1``. Actual LO =
    ``fc·(1+e_res)``, actual sample clock = ``fs·(1+e_res)``; an emitter at ``f_true`` is
@@ -124,7 +142,7 @@ _sleep = time.sleep
 _time_ns = time.time_ns
 
 _TWO_PI = 2.0 * math.pi
-_NEGLIGIBLE_DBFS = -200.0          # contributions below this are skipped (far below 12-bit floor)
+_SKIP_MARGIN_DB = 60.0             # emitter contributions this far below the ADC floor are skipped
 _SHAPE_FLOOR = 1e-7                # thermal-noise bins with |H| below this (-140 dB) are not drawn
 _FRAME_CACHE_SIZE = 24
 _AGC_TARGET_DBFS = -12.0
@@ -161,12 +179,17 @@ SIM_PARAM_DEFAULTS: dict[str, Any] = {
     "hw_xo_correction": True,
     "xo_correction_step_hz": 0.0,   # 1.0 emulates Pluto's integer-Hz xo_correction
     "seed": None,                   # world seed + stable hash(name)
+    "digital_filter": True,         # AD9363 RX digital decimation chain (half-bands + FIR)
+    "dig_pass_frac": sg.DIG_PASS_FRAC,   # flat up to +-0.40 fs
+    "dig_stop_frac": sg.DIG_STOP_FRAC,   # dig_stop_db from +-0.60 fs on
+    "dig_stop_db": sg.DIG_STOP_DB,       # stop-band gain (dB)
 }
 
 _FLOAT_KEYS = ("ppm", "noise_figure_db", "gain_offset_db", "dc_offset_dbfs", "dc_residual_dbfs",
                "iq_gain_db", "iq_phase_deg", "iq_residual_gain_db", "iq_residual_phase_deg",
-               "usb_bytes_per_s", "xo_correction_step_hz", "adc_noise_lsb_rms")
-_BOOL_KEYS = ("realtime", "lo_phase_random", "hw_xo_correction")
+               "usb_bytes_per_s", "xo_correction_step_hz", "adc_noise_lsb_rms", "dig_pass_frac",
+               "dig_stop_frac", "dig_stop_db")
+_BOOL_KEYS = ("realtime", "lo_phase_random", "hw_xo_correction", "digital_filter")
 
 
 def _parse_sim_params(name: str, raw: dict[str, Any]) -> dict[str, Any]:
@@ -224,6 +247,12 @@ def _parse_sim_params(name: str, raw: dict[str, Any]) -> dict[str, Any]:
         raise ConfigError(f"{where}.adc_noise_lsb_rms negatif olamaz")
     if p["xo_correction_step_hz"] < 0:
         raise ConfigError(f"{where}.xo_correction_step_hz negatif olamaz")
+    if not (0.0 < p["dig_pass_frac"] < p["dig_stop_frac"]) or p["dig_pass_frac"] > 0.5:
+        raise ConfigError(
+            f"{where}: 0 < dig_pass_frac < dig_stop_frac ve dig_pass_frac <= 0.5 olmalı "
+            f"(geldi: {p['dig_pass_frac']}, {p['dig_stop_frac']})")
+    if p["dig_stop_db"] > 0.0:
+        raise ConfigError(f"{where}.dig_stop_db pozitif olamaz (zayıflatma, dB ≤ 0)")
     return p
 
 
@@ -293,6 +322,11 @@ class SimRxDevice(RxDevice):
         self._p["serial"] = serial
         self._pos = np.array(p["position_m"], dtype=np.float64)
         self._fs_counts = float(profile.full_scale_counts)
+        # Emitter contributions whose level after the analog + digital filters is more than
+        # _SKIP_MARGIN_DB below the output noise floor at minimum gain (ADC transition noise;
+        # the 12-bit quantization noise bounds it when adc_noise_lsb_rms = 0) are not synthesized.
+        quant_dbfs = 10.0 * math.log10(2.0 / (12.0 * self._fs_counts ** 2))
+        self._skip_dbfs = max(self.adc_noise_dbfs, quant_dbfs) - _SKIP_MARGIN_DB
         self._ctl_rng = np.random.default_rng(np.random.SeedSequence([self._seed, 7]))
         self._dc_phase = float(self._ctl_rng.uniform(0.0, _TWO_PI))
         self._spur_phase = [float(self._ctl_rng.uniform(0.0, 1.0)) for _ in p["spurs"]]
@@ -372,6 +406,36 @@ class SimRxDevice(RxDevice):
         """Total power (dBFS, complex) of the white ADC transition noise."""
         s = self._p["adc_noise_lsb_rms"] / self._fs_counts
         return 10.0 * math.log10(max(2.0 * s * s, 1e-30))
+
+    @property
+    def skip_level_dbfs(self) -> float:
+        """Emitter contributions below this level (after the filters) are not synthesized."""
+        return self._skip_dbfs
+
+    def response_db(self, f_bb_hz: Any) -> Any:
+        """Ground-truth RX amplitude response (dB) at PRE-ALIAS baseband offset ``f_bb_hz``.
+
+        ``f_bb_hz = f_RF - f_LO`` (Hz) before folding into ``+-fs/2``; the result is
+        ``20 log10(|H_analog(f)| |H_digital(f)|)`` for the commanded ``fs`` / ``bw`` (analog
+        3rd-order Butterworth with corner ``bw/2`` times the digital decimation chain, see
+        the module docstring). A tone at ``f`` then reads ``level_dbfs(P) + response_db(f)``
+        at its aliased frequency. Scalar in -> ``float``; array in -> ``float64`` array.
+        """
+        h = self._hmag(f_bb_hz, self._segments[-1].state)
+        if np.ndim(h) == 0:
+            return 20.0 * math.log10(max(float(h), 1e-300))
+        return 20.0 * np.log10(np.maximum(h, 1e-300))
+
+    def _hmag(self, f: Any, st: _RxState) -> Any:
+        """Combined ``|H|`` (analog LPF x digital chain) at pre-alias baseband ``f`` (Hz)."""
+        h = sg.butterworth_mag(f, st.bw / 2.0)
+        p = self._p
+        if not p["digital_filter"]:
+            return h
+        g_db = sg.digital_filter_db(f, st.fs, p["dig_pass_frac"], p["dig_stop_frac"], p["dig_stop_db"])
+        if np.ndim(g_db) == 0:
+            return h * 10.0 ** (g_db / 20.0)
+        return h * np.power(10.0, g_db / 20.0)
 
     def image_rejection_db(self) -> float:
         """Image rejection of the commanded quadrature-tracking state."""
@@ -828,9 +892,10 @@ class SimRxDevice(RxDevice):
 
     def _thermal(self, p_a: int, p_b: int, st: _RxState, lvl: float) -> np.ndarray:
         """Receiver noise for ``[p_a, p_b)``: input-referred thermal noise (``kT + NF``, level
-        equation, shaped by the analog LPF) plus white, gain-independent ADC transition
-        noise (``adc_noise_lsb_rms`` per I/Q component). Both are independent Gaussians, so
-        they are drawn together with the summed per-bin variance."""
+        equation, shaped by the analog LPF and the digital decimation chain within
+        ``+-fs/2``) plus white, gain-independent ADC transition noise (``adc_noise_lsb_rms``
+        per I/Q component). Both are independent Gaussians, so they are drawn together with
+        the summed per-bin variance."""
         n0_dbfs_hz = KT_DBM_HZ + self._p["noise_figure_db"] + lvl
         var_th = 10.0 ** (n0_dbfs_hz / 10.0) * st.fs                 # complex variance (unfiltered)
         sig_adc = self._p["adc_noise_lsb_rms"] / self._fs_counts      # per-component std (full scale = 1)
@@ -838,7 +903,7 @@ class SimRxDevice(RxDevice):
 
         def make() -> tuple[list[tuple[int, int]], np.ndarray]:
             f = np.fft.fftfreq(sg.FRAME, d=1.0 / st.fs)
-            h2 = sg.butterworth_mag(f, st.bw / 2.0) ** 2
+            h2 = self._hmag(f, st) ** 2
             per_bin = sg.FRAME / 2.0 * (var_th * h2 + var_adc)        # E|X_k|^2 / 2 per component
             idx = np.nonzero(per_bin >= (_SHAPE_FLOOR ** 2) * sg.FRAME / 2.0 * var_th)[0]
             return sg.bins_to_slices(idx), np.sqrt(per_bin[idx]).astype(np.float32)
@@ -854,14 +919,15 @@ class SimRxDevice(RxDevice):
     def _envelope(self, e: Emitter, seg: _Segment, q_a: int, q_b: int, df: float, p_lin: float) -> np.ndarray:
         """Band-limited Gaussian envelope (unit carrier) of a noise-like emitter for device
         samples ``[q_a, q_b)``, drawn on the WORLD grid so devices share the realization;
-        includes the analog LPF at ``f_bin + df`` and total power ``p_lin``."""
+        includes the analog LPF and the digital chain at the pre-alias frequency
+        ``f_bin + df`` and total power ``p_lin``."""
         st = seg.state
         bw = e.bw_hz
 
         def make() -> tuple[list[tuple[int, int]], np.ndarray]:
             idx, m_eff = sg.noise_bins(st.fs, sg.FRAME, bw)
             f = np.fft.fftfreq(sg.FRAME, d=1.0 / st.fs)[idx]
-            h = sg.butterworth_mag(f + df, st.bw / 2.0)
+            h = self._hmag(f + df, st)
             return sg.bins_to_slices(idx), (h * math.sqrt(sg.FRAME * sg.FRAME / m_eff / 2.0)).astype(np.float32)
 
         slices, hs = self._shape(("env", e.name, bw, st.fs, st.bw, df), make)
@@ -880,24 +946,35 @@ class SimRxDevice(RxDevice):
     def _add_emitters(self, buf: np.ndarray, q_a: int, seg: _Segment, lvl: float, scene: Scene) -> None:
         st = seg.state
         k = buf.size
-        corner = st.bw / 2.0
         t_a = seg.t_of(q_a)
         dn = q_a - seg.start
-        cw_amp: list[complex] = []
-        cw_c0: list[float] = []
-        cw_nu: list[float] = []
+        skip_amp = 10.0 ** (self._skip_dbfs / 20.0)
+        cw_amp: list[np.ndarray] = []
+        cw_c0: list[np.ndarray] = []
+        cw_nu: list[np.ndarray] = []
         wseed = self.world.seed
         for e in scene.emitters:
             if not e.enabled:
                 continue
             df = e.freq_hz - st.f_lo                          # actual-Hz baseband offset (unaliased)
             nu = df / st.fs_act
-            p_db = e.power_dbm + lvl
+            amp = 10.0 ** ((e.power_dbm + lvl) / 20.0)
+            # Strongest filtered contribution of this emitter: analog LPF x digital chain at the
+            # pre-alias frequency closest to DC (both responses fall monotonically with |f|).
             if e.kind in ("noise", "gsm_fcch"):
-                h_max = float(sg.butterworth_mag(max(abs(df) - e.bw_hz / 2.0, 0.0), corner))
+                h_max = self._hmag(max(abs(df) - e.bw_hz / 2.0, 0.0), st)
+            elif e.kind == "fm":
+                n_sb, j_sb = sg.fm_sidebands(e.params["dev_hz"] / e.params["mod_hz"])
+                if n_sb.size <= _FM_MAX_SIDEBANDS:
+                    h_sb = self._hmag(df + n_sb * e.params["mod_hz"], st)
+                    sb_amp = amp * np.abs(j_sb) * h_sb
+                    h_max = float(np.max(sb_amp)) / amp
+                else:
+                    reach = e.params["dev_hz"] + e.params["mod_hz"]
+                    h_max = self._hmag(max(abs(df) - reach, 0.0), st)
             else:
-                h_max = float(sg.butterworth_mag(df, corner))
-            if p_db + 20.0 * math.log10(max(h_max, 1e-300)) < _NEGLIGIBLE_DBFS:
+                h_max = self._hmag(df, st)
+            if amp * h_max < skip_amp:
                 continue
             phi0 = math.radians(e.params["phase_deg"]) if "phase_deg" in e.params else \
                 _TWO_PI * sg.unit_from_hash(f"{wseed}/phase/{e.name}")
@@ -907,40 +984,38 @@ class SimRxDevice(RxDevice):
             phi0 -= st.lo_phase
             rot = complex(math.cos(phi0), math.sin(phi0))
             c0 = sg.exact_frac_cycles(df, seg.t_start, dn, st.fs_act)
-            amp = 10.0 ** (p_db / 20.0)
             if e.kind == "cw":
-                cw_amp.append(amp * float(sg.butterworth_mag(df, corner)) * rot)
-                cw_c0.append(c0)
-                cw_nu.append(nu)
+                cw_amp.append(np.array([amp * self._hmag(df, st) * rot]))
+                cw_c0.append(np.array([c0]))
+                cw_nu.append(np.array([nu]))
             elif e.kind == "fm":
                 dev, fmod = e.params["dev_hz"], e.params["mod_hz"]
                 u0 = sg.exact_frac_cycles(fmod, t_a, 0, st.fs_act)
                 beta = dev / fmod
-                n_sb, j_sb = sg.fm_sidebands(beta)
                 if n_sb.size <= _FM_MAX_SIDEBANDS:
                     # Jacobi-Anger: sine FM == sum of tones J_n(beta) at df + n*fmod, each
-                    # attenuated by the analog LPF at its own frequency.
-                    for nn, jn in zip(n_sb.tolist(), j_sb.tolist()):
-                        f_n = df + nn * fmod
-                        ph_n = _TWO_PI * ((nn * u0) % 1.0)
-                        cw_amp.append(amp * jn * float(sg.butterworth_mag(f_n, corner)) * rot
-                                      * complex(math.cos(ph_n), math.sin(ph_n)))
-                        cw_c0.append(c0)
-                        cw_nu.append(f_n / st.fs_act)
+                    # attenuated by the analog LPF and the digital chain at its own frequency;
+                    # sidebands below the skip level are dropped.
+                    keep = sb_amp >= skip_amp
+                    n_k = n_sb[keep]
+                    ph_n = _TWO_PI * np.mod(n_k * u0, 1.0)
+                    cw_amp.append(amp * j_sb[keep] * h_sb[keep] * rot * np.exp(1j * ph_n))
+                    cw_c0.append(np.full(n_k.size, c0))
+                    cw_nu.append((df + n_k * fmod) / st.fs_act)
                 else:                         # very wide FM: direct per-sample phase
                     ph = sg.tone_bank(k, np.array([1.0]), np.array([u0]), np.array([fmod / st.fs_act])).imag
                     ph *= np.float32(beta)
                     mod = np.empty(k, dtype=np.complex64)
                     np.cos(ph, out=mod.real)
                     np.sin(ph, out=mod.imag)
-                    a_c = amp * float(sg.butterworth_mag(df, corner)) * rot
+                    a_c = amp * self._hmag(df, st) * rot
                     mod *= sg.tone_bank(k, np.array([a_c]), np.array([c0]), np.array([nu]))
                     buf += mod
             elif e.kind == "pulse":
                 pri, pw, t0 = e.params["pri_s"], e.params["pw_s"], e.params["t0_s"]
                 u0 = sg.exact_frac_cycles(1.0 / pri, t_a - t0, 0, st.fs_act)
                 starts, stops = sg.gate_intervals(u0, 1.0 / (pri * st.fs_act), k, pw / pri)
-                a_c = amp * float(sg.butterworth_mag(df, corner)) * rot
+                a_c = amp * self._hmag(df, st) * rot
                 if pw / pri < 0.25:
                     on = sg.interval_indices(starts, stops)
                     buf[on] += sg.tone_at(on, a_c, c0, nu)
@@ -962,7 +1037,7 @@ class SimRxDevice(RxDevice):
                     f_off = sg.GSM_FCCH_OFFSET_HZ
                     nb = sg.interval_indices(starts, stops)
                     cf = sg.exact_frac_cycles(f_off, t_a, 0, st.fs_act)
-                    a_t = amp * float(sg.butterworth_mag(df + f_off, corner))
+                    a_t = amp * self._hmag(df + f_off, st)
                     env[nb] = sg.tone_at(nb, a_t, cf, f_off / st.fs_act)
                 car = sg.tone_bank(k, np.array([rot]), np.array([c0]), np.array([nu]))
                 car *= env
@@ -970,4 +1045,4 @@ class SimRxDevice(RxDevice):
             else:  # pragma: no cover - Emitter validates kind
                 raise ConfigError(f"{self.name}: desteklenmeyen emitter türü {e.kind!r}")
         if cw_amp:
-            buf += sg.tone_bank(k, np.array(cw_amp), np.array(cw_c0), np.array(cw_nu))
+            buf += sg.tone_bank(k, np.concatenate(cw_amp), np.concatenate(cw_c0), np.concatenate(cw_nu))

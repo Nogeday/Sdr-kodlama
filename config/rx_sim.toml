@@ -49,6 +49,8 @@ usable_fraction = 0.8             # fs'nin düz ve alias'sız kabul edilen merke
 dc_notch_bins = 3                 # sıfır-IF DC çivisi: ±3 bin geçersiz
 
 [detect]
+# çoklu çözünürlük CFAR: 1 = doğal bin; D > 1 = D komşu bin ortalaması (geniş bant LTE/Wi-Fi için)
+resolutions = [1, 16, 128]
 method = "os_cfar"
 pfa = 1e-6
 guard_bins = 4

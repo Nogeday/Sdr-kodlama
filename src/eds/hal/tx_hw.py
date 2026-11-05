@@ -137,6 +137,9 @@ class SoapyTxSource(SignalSource):
         self.gain_db = 0.0
         self.enabled = False
 
+        from .soapy_backend import resolve_serial_args
+
+        self.args = resolve_serial_args(self.args, name=self.name)
         try:
             self._dev: Any = self._sdr.Device(dict(self.args))
         except Exception as e:

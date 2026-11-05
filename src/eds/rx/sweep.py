@@ -75,10 +75,10 @@ frequency (``dc_avoid = False``) and are then excluded from detection.
 
 Detection runs :func:`eds.dsp.detect.detect` once on the stitched spectrum with
 ``n_avg`` = effective Welch averages (``cfg.averages`` segments at ``dsp.overlap``) and the
-validity mask (DC-notch / uncovered bins excluded). The CFAR is narrowband: a flat signal
-much wider than its training window (``2 · train_bins`` bins, ~0.6 MHz at the default
-9.8 kHz bins) masks itself, so wideband channels (LTE, Wi-Fi) are quantified with
-:meth:`SweepResult.band_power_db` rather than relied upon as detections.
+validity mask (DC-notch / uncovered bins excluded). The detector is the multi-resolution
+CFAR (``DetectConfig.resolutions``, default ``[1, 16, 128]``): wideband channels (LTE
+10 MHz, Wi-Fi 20 MHz) are reported as detections with their −3 dB band edges, and
+narrowband carriers inside them separately when ≥ 10 dB above the in-band level.
 
 Scan speed
 ----------
@@ -147,6 +147,8 @@ VALUE_DECIMALS: int = 2
 DECIMATE_MODES: tuple[str, ...] = ("max", "mean", "min")
 
 _GAIN_TOL_DB = 1e-6
+#: clip fraction above which a one-shot auto-gain reading is useless (jump to minimum gain)
+AUTO_GAIN_OVERLOAD_CLIP: float = 1e-2
 _EPS_BINS = 1e-9
 
 
@@ -716,7 +718,13 @@ class Sweeper:
                 lv = iq_levels(x, blk.clip_level)
                 g = float(blk.gain_db[0])
                 if self._auto and iters < AUTO_GAIN_MAX_ITER:
-                    new = self._gc.propose(lv, g, one_shot=True)
+                    if lv.clip_fraction >= AUTO_GAIN_OVERLOAD_CLIP:
+                        # heavily clipped: the reading says nothing about the true level ->
+                        # jump to the band minimum; the next (unclipped) capture lands on target
+                        gr = dev.gain_range(fc)
+                        new = float(gr.min_db) if g > gr.min_db + _GAIN_TOL_DB else None
+                    else:
+                        new = self._gc.propose(lv, g, one_shot=True)
                     if new is not None:
                         ts = mono()
                         dev.set_gain(new)
@@ -731,7 +739,8 @@ class Sweeper:
             spec.gain_db = (g,)
             spec.overflow = bool(blk.overflow)
             spec.meta.update({"usable_fraction": float(self._cfg.usable_fraction), "dc_notch_bins": self._notch,
-                              "seq": int(blk.seq), "index": int(blk.index), "sweep_step": i})
+                              "seq": int(blk.seq), "index": int(blk.index), "sweep_step": i,
+                              "block_meta": dict(blk.meta)})
             spec = self._apply_calibration(spec)
             cal = spec.unit == "dBm"
             if calibrated is None:

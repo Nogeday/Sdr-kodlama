@@ -138,7 +138,7 @@ def apply_ppm_to_device(device: Any, cal: DeviceCalibration | None, ppm_mode: st
     if ppm_mode == "off":
         return "off"
     if cal is None or cal.ppm is None:
-        log.warning("%s: PPM kalibrasyonu yok — frekanslar düzeltilmeyecek (önce `eds calib ppm`).",
+        log.warning("%s: PPM kalibrasyonu yok — frekanslar düzeltilmeyecek (önce `eds cal ppm`).",
                     getattr(device, "name", "?"))
         return "off"
     if ppm_mode == "software":

@@ -236,6 +236,21 @@ class DeviceGroup(RxDevice):
         if errs:
             raise StreamError(f"{self.name}: üye akışları durdurulamadı: " + "; ".join(errs))
 
+    def detach(self) -> None:
+        """Stop the group stream and its worker threads WITHOUT closing the members.
+
+        Use when the members are owned elsewhere (e.g. a measurement session builds a
+        temporary group over its devices). The group is unusable afterwards.
+        """
+        if self._closed:
+            return
+        try:
+            self.stop_stream()
+        finally:
+            for pool in self._pools:
+                pool.shutdown(wait=True, cancel_futures=True)
+            self._closed = True
+
     def _close(self) -> None:
         errs: list[str] = []
         for m in self._members:

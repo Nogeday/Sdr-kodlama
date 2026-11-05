@@ -30,6 +30,16 @@ SoapyPlutoSDR specifics relied upon — verify on the target machine with
 * **Pass-through device args** (untouched, see SoapyPlutoSDR docs of your build):
   ``uri`` (``usb:1.5.5`` / ``ip:192.168.2.1``), ``hostname``, ``usb_direct=1`` (libusb
   direct streaming), ``timestamp_every=<n>``, ``loopback=<n>``.
+* **Selecting a Pluto by serial.** SoapyPlutoSDR does *not* filter by the ``serial`` device
+  arg: without ``uri``/``hostname`` it opens the first context it finds, so with 2x Pluto
+  ``serial=...`` alone would silently open the wrong radio. When ``args`` has ``serial`` and
+  neither ``uri`` nor ``hostname``, :func:`resolve_serial_args` enumerates (driver filter
+  only) and picks the entry whose ``serial`` key — or the ``serial=...`` field that libiio
+  puts into the USB context description (``label``) — matches the requested serial
+  (case-insensitive; exact, else a unique prefix), then opens it by that entry's ``uri``
+  and records the full serial. No match or an ambiguous prefix -> :class:`DeviceNotFound`
+  listing the candidates. Entries without ``uri`` (drivers that filter natively, e.g. UHD)
+  keep their args with the full serial.
 * **AGC:** ``setGainMode(RX, ch, true)`` selects AD9361 ``slow_attack``; ``fast_attack`` and
   ``hybrid`` need the thin layer, as do RF-DC tracking, ``xo_correction`` (hardware PPM
   correction) and the AD9361 temperature sensor.
@@ -45,6 +55,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from collections.abc import Callable, Iterable, Mapping
 from types import ModuleType
 from typing import Any
@@ -76,6 +87,8 @@ STREAM_ARG_PREFIX = "stream:"
 AD936X_GAIN_MODES: dict[str, str] = {
     "manual": "manual", "hw_slow": "slow_attack", "hw_fast": "fast_attack", "hw_hybrid": "hybrid",
 }
+
+_LABEL_SERIAL_RE = re.compile(r"serial=([0-9A-Za-z]+)")
 
 SOAPY_INSTALL_HINT = (
     "SoapySDR Python modülü bulunamadı. Kurulum: sudo apt install python3-soapysdr soapysdr-tools; "
@@ -132,6 +145,73 @@ def enumerate_soapy(args: Mapping[str, str] | None = None) -> list[dict[str, str
     return [kwargs_to_dict(k) for k in found]
 
 
+def entry_serial(entry: Mapping[str, str]) -> str:
+    """Serial of an enumeration entry: its ``serial`` key, else ``serial=...`` in ``label``
+    (libiio USB context description); ``""`` if neither is present."""
+    ser = str(entry.get("serial", "")).strip()
+    if ser:
+        return ser
+    m = _LABEL_SERIAL_RE.search(str(entry.get("label", "")))
+    return m.group(1) if m else ""
+
+
+def _describe_entries(entries: Iterable[Mapping[str, str]]) -> str:
+    parts = []
+    for e in entries:
+        label = str(e.get("label", "")).strip()
+        parts.append(f"serial={entry_serial(e) or '?'} uri={e.get('uri', '') or '?'}" + (f" ({label})" if label else ""))
+    return "; ".join(parts) or "yok"
+
+
+def select_by_serial(found: list[dict[str, str]], serial: str, *, name: str = "") -> dict[str, str]:
+    """The enumeration entry whose serial matches ``serial`` (see module docstring).
+
+    Case-insensitive; an exact match wins, otherwise ``serial`` may be a prefix that matches
+    exactly one device (entries with the same ``uri`` count once). No match / ambiguous ->
+    :class:`DeviceNotFound` listing the candidates (Turkish).
+    """
+    who = f"{name}: " if name else ""
+    want = str(serial).strip().lower()
+    if not want:
+        raise ConfigError(f"{who}args.serial boş olamaz")
+    keyed = [(entry_serial(e).lower(), e) for e in found]
+    pool = [e for s, e in keyed if s and s == want] or [e for s, e in keyed if s and s.startswith(want)]
+    distinct: dict[str, dict[str, str]] = {}
+    for e in pool:
+        distinct.setdefault(e.get("uri", "") or entry_serial(e).lower(), e)
+    if not distinct:
+        raise DeviceNotFound(
+            f"{who}seri numarası '{serial}' ile eşleşen SoapySDR cihazı yok. "
+            f"Bulunan cihazlar: {_describe_entries(found)}. Kontrol: SoapySDRUtil --find")
+    if len(distinct) > 1:
+        raise DeviceNotFound(
+            f"{who}seri numarası '{serial}' birden çok cihazla eşleşiyor: {_describe_entries(distinct.values())}. "
+            "Daha uzun bir seri numarası ya da args.uri verin.")
+    return dict(next(iter(distinct.values())))
+
+
+def resolve_serial_args(args: Mapping[str, str], *, name: str = "") -> dict[str, str]:
+    """Device args with ``serial`` resolved to the matching entry's ``uri`` (see module doc).
+
+    Unchanged copy when ``serial`` is absent or ``uri``/``hostname`` already address the
+    device. Otherwise enumerates with the ``driver`` filter only, selects the entry with
+    :func:`select_by_serial`, sets ``uri`` (if the entry has one) and replaces ``serial`` by
+    the entry's full serial.
+    """
+    out = {str(k): str(v) for k, v in args.items()}
+    if "serial" not in out or "uri" in out or "hostname" in out:
+        return out
+    filt = {"driver": out["driver"]} if "driver" in out else {}
+    entry = select_by_serial(enumerate_soapy(filt), out["serial"], name=name)
+    full = entry_serial(entry)
+    if full:
+        out["serial"] = full
+    if entry.get("uri"):
+        out["uri"] = entry["uri"]
+    log.info("%sseri %s -> uri %s", f"{name}: " if name else "", out["serial"], out.get("uri", "(sürücü seçer)"))
+    return out
+
+
 def _range_tuple(value: Any) -> tuple[float, float] | None:
     """``Range`` or iterable of ``Range`` (RangeList) → ``(min, max)``; None if empty."""
     if value is None:
@@ -166,7 +246,9 @@ class SoapyRxDevice(RxDevice):
 
     ``stream_format`` ("CS16" default | "CF32") is the host stream format
     (``RxConfig.stream_format``); ``detect_ts_gaps`` flags forward jumps of hardware
-    timestamps as overflow (only when the driver sets ``SOAPY_SDR_HAS_TIME``).
+    timestamps as overflow (only when the driver sets ``SOAPY_SDR_HAS_TIME``). A ``serial``
+    device arg without ``uri``/``hostname`` is resolved to the matching device's ``uri``
+    (:func:`resolve_serial_args`; SoapyPlutoSDR itself ignores ``serial``).
     """
 
     backend_name = "soapy"
@@ -192,6 +274,7 @@ class SoapyRxDevice(RxDevice):
         }
         if "driver" not in self.device_args and profile.soapy_driver:
             self.device_args["driver"] = profile.soapy_driver
+        self.device_args = resolve_serial_args(self.device_args, name=self.name)
 
         # stream / runtime state
         self._stream: Any = None
