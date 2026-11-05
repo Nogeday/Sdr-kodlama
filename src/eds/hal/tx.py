@@ -45,6 +45,15 @@ class SignalSource(ABC):
         """Multi-tone output (e.g. two-tone IMD). Optional."""
         raise NotSupported(f"{self.name}: çoklu ton desteklenmiyor")
 
+    def set_lo_offset(self, hz: float) -> float:
+        """Place the source's own LO ``hz`` away from the tone (optional).
+
+        Sources that synthesize the tone digitally around an LO (Pluto/HackRF TX) carry an LO
+        leakage line and a TX IQ image at ``LO − (f − LO)``. Measurements choose the offset so
+        these artifacts never land on the bins they measure. Returns the offset in effect.
+        """
+        raise NotSupported(f"{self.name}: LO ofseti ayarlanamaz (dahili LO'su olmayan kaynak)")
+
     def describe(self) -> dict[str, Any]:
         return {"name": self.name, "absolute_power": self.absolute_power}
 

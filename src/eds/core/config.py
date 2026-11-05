@@ -46,6 +46,10 @@ class DeviceConfig:
     control_uri: str = ""                   # libiio URI for Pluto thin layer; "" = auto, "none" = off
     channels: list[int] = field(default_factory=lambda: [0])
     sim: dict[str, Any] = field(default_factory=dict)    # per-device simulator params
+    # "auto": run the device in its own worker process when this process would otherwise
+    # hold more than one Pluto (SoapyPlutoSDR keeps ONE libiio context per process);
+    # "inproc" / "subprocess" force the choice.
+    isolation: str = "auto"
 
 
 @dataclass
@@ -283,6 +287,9 @@ def config_from_dict(raw: dict[str, Any], source: str = "<dict>") -> AppConfig:
         if len(set(names)) != len(names):
             raise ConfigError(f"{source}: cihaz adları benzersiz olmalı: {names}")
     for d in kw["devices"]:
+        if d.isolation not in ("auto", "inproc", "subprocess"):
+            raise ConfigError(f"device '{d.name}': isolation 'auto' | 'inproc' | 'subprocess' olmalı "
+                              f"(geldi: {d.isolation!r})")
         if d.backend not in ("soapy", "sim"):
             raise ConfigError(f"device '{d.name}': backend 'soapy' ya da 'sim' olmalı (geldi: {d.backend!r})")
     cfg = AppConfig(**kw)
