@@ -10,17 +10,22 @@ from ..core.errors import ConfigError
 from ..core.profile import load_profile
 from .base import RxDevice
 
-_WORLDS: dict[int, Any] = {}
+_WORLD_ATTR = "_eds_sim_world"
 
 
-def get_sim_world(app: AppConfig):
-    """One shared simulated RF world per AppConfig (all sim devices see the same scene)."""
+def get_sim_world(app: AppConfig) -> Any:
+    """One shared simulated RF world per AppConfig (all sim devices see the same scene).
+
+    The world is stored *on* the AppConfig instance (not in an id()-keyed cache, whose
+    keys CPython reuses after garbage collection), so its lifetime equals the config's.
+    """
     from .sim.world import SimWorld
 
-    key = id(app)
-    if key not in _WORLDS:
-        _WORLDS[key] = SimWorld.from_config(app.sim)
-    return _WORLDS[key]
+    world = app.__dict__.get(_WORLD_ATTR)
+    if world is None:
+        world = SimWorld.from_config(app.sim)
+        app.__dict__[_WORLD_ATTR] = world
+    return world
 
 
 def open_device(dev: DeviceConfig, app: AppConfig | None = None) -> RxDevice:
@@ -33,7 +38,8 @@ def open_device(dev: DeviceConfig, app: AppConfig | None = None) -> RxDevice:
     if dev.backend == "soapy":
         from .soapy_backend import SoapyRxDevice
 
-        return SoapyRxDevice(dev, profile)
+        fmt = app.rx.stream_format if app is not None else "CS16"
+        return SoapyRxDevice(dev, profile, stream_format=fmt)
     raise ConfigError(f"Bilinmeyen backend: {dev.backend}")
 
 

@@ -24,7 +24,7 @@ bw_max_hz = 20e6
 # AD9363 temel bant hızı 25e6/48 (≈520.8 kS/s) .. 61.44 MS/s; SoapyPlutoSDR FPGA x8
 # desimasyonu ile 25e6/384 (≈65.1 kS/s)'e iner. ÜST sınır çipin; SÜRDÜRÜLEBİLİR sınır
 # USB 2.0 ile belirlenir ve `eds measure max_rate` ile ÖLÇÜLÜR.
-sample_rate_min_hz = 65104.17
+sample_rate_min_hz = 65104.16
 sample_rate_max_hz = 61.44e6
 
 ref_clock_hz = 40e6

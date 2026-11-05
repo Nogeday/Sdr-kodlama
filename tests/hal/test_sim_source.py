@@ -136,7 +136,7 @@ def test_context_manager_and_factory():
         src.set_enabled(True)
         assert w.get("s2").enabled
     assert w.get("s2") is None                                     # __exit__: RF off + close
-    with pytest.raises(ValueError):
+    with pytest.raises(ConfigError):
         open_source("sim", {})
 
 

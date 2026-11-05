@@ -325,6 +325,9 @@ class RxDevice(ABC):
         )
         if hw_first is not None:
             block.meta["hw_time_ns"] = hw_first
+        members = getattr(self, "ppm_hw_members", None)
+        if members is not None:
+            block.meta["ppm_hw_members"] = list(members)
         self._seq += 1
         st = self.stats
         st.blocks += 1

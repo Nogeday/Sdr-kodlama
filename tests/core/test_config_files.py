@@ -479,8 +479,6 @@ def test_official_ad9363_limits():
     assert ext.freq_min_hz < p.freq_min_hz and ext.freq_max_hz > p.freq_max_hz   # out-of-spec, opt-in
 
 
-@pytest.mark.xfail(reason="profile data: sample_rate_min_hz = 65104.17 is above 25e6/384 = 65104.1667, so the "
-                          "documented SoapyPlutoSDR minimum is rejected (see requested_changes)")
 def test_ad9363_accepts_documented_minimum_rate():
     assert load_profile("ad9363_pluto").check_rx(sample_rate_hz=25e6 / 384)[0] == []
 

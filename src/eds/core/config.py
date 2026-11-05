@@ -19,6 +19,7 @@ Layout of a config file (see ``config/*.toml`` for complete examples)::
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import sys
 import types
@@ -269,6 +270,11 @@ def config_from_dict(raw: dict[str, Any], source: str = "<dict>") -> AppConfig:
         if isinstance(devs, dict):
             devs = [devs]
         kw["devices"] = [_build(DeviceConfig, d, f"device[{i}]") for i, d in enumerate(devs)]
+        if not kw["devices"]:
+            raise ConfigError(f"{source}: en az bir [[device]] gerekli")
+        for d in kw["devices"]:
+            if not d.channels:
+                raise ConfigError(f"{source}: device '{d.name}': channels boş olamaz")
         names = [d.name for d in kw["devices"]]
         if len(set(names)) != len(names):
             raise ConfigError(f"{source}: cihaz adları benzersiz olmalı: {names}")
@@ -307,7 +313,7 @@ def apply_overrides(raw: dict[str, Any], overrides: dict[str, Any] | None) -> di
     """Apply dotted-key overrides to a raw TOML dict. ``device.X`` targets device[0]."""
     if not overrides:
         return raw
-    raw = {k: (dict(v) if isinstance(v, dict) else v) for k, v in raw.items()}
+    raw = copy.deepcopy(raw)
     for key, value in overrides.items():
         parts = key.split(".")
         if parts[0] == "device":
@@ -318,12 +324,16 @@ def apply_overrides(raw: dict[str, Any], overrides: dict[str, Any] | None) -> di
             node = devs[0]
             for p in parts[1:-1]:
                 node = node.setdefault(p, {})
+                if not isinstance(node, dict):
+                    raise ConfigError(f"override {key}: '{p}' bir tablo değil")
             node[parts[-1]] = value
             raw["device"] = devs
             continue
         node = raw
         for p in parts[:-1]:
             node = node.setdefault(p, {})
+            if not isinstance(node, dict):
+                raise ConfigError(f"override {key}: '{p}' bir tablo değil")
         node[parts[-1]] = value
     return raw
 
@@ -335,7 +345,10 @@ def load_config(path: str | Path | None = None, overrides: dict[str, Any] | None
         p = Path(path)
         if not p.is_file():
             raise ConfigError(f"Konfigürasyon dosyası yok: {p}")
-        with p.open("rb") as f:
-            raw = tomllib.load(f)
+        try:
+            with p.open("rb") as f:
+                raw = tomllib.load(f)
+        except tomllib.TOMLDecodeError as e:
+            raise ConfigError(f"{p}: TOML sözdizimi hatası: {e}") from e
         source = str(p)
     return config_from_dict(apply_overrides(raw, overrides), source=source)

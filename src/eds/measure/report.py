@@ -45,7 +45,8 @@ from ..core.errors import BackendUnavailable
 from ..core.paths import repo_root
 from ..core.timeutil import iso_utc, now_ns, stamp
 from ..core.units import fmt_hz
-from .base import MeasurementResult, _jsonable
+from .base import MeasurementResult
+from .base import jsonable as _jsonable
 from .targets import TARGET_NOTE_KEY, resolve_targets_path
 
 log = logging.getLogger(__name__)

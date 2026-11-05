@@ -148,6 +148,9 @@ def _jsonable(o: Any) -> Any:
     return o
 
 
+jsonable = _jsonable  # public alias (report/bus serialisation)
+
+
 @dataclass
 class MeasurementContext:
     """Everything a measurement may use. Unused fields may be None.

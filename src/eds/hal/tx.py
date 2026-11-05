@@ -19,7 +19,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
-from ..core.errors import NotSupported
+from ..core.errors import ConfigError, NotSupported
 
 
 class SignalSource(ABC):
@@ -73,7 +73,7 @@ def open_source(kind: str, args: dict[str, Any] | None = None, *, world: Any = N
         from .sim.source import SimSignalSource
 
         if world is None:
-            raise ValueError("sim source requires the SimWorld")
+            raise ConfigError("sim kaynağı için SimWorld gerekli (measure.source = sim yalnızca sim backend ile)")
         return SimSignalSource(world, **args)
     if kind == "pluto_tx":
         from .tx_hw import SoapyTxSource
@@ -87,4 +87,4 @@ def open_source(kind: str, args: dict[str, Any] | None = None, *, world: Any = N
         from .tx_hw import ManualSource
 
         return ManualSource(**args)
-    raise ValueError(f"unknown source kind {kind!r}")
+    raise ConfigError(f"Bilinmeyen sinyal kaynağı türü: {kind!r} (sim | pluto_tx | scpi | manual | none)")

@@ -25,15 +25,11 @@ from typing import Any
 
 import numpy as np
 
-from ..core.errors import EDSError
+from ..core.errors import BusError, EDSError  # noqa: F401 (re-exported)
 from ..core.timeutil import now_ns
 
 ENVELOPE_VERSION = 1
 ENVELOPE_KEYS: tuple[str, ...] = ("topic", "v", "src", "seq", "t_ns", "data")
-
-
-class BusError(EDSError):
-    """Bus transport / contract error (socket setup, malformed message, unknown topic)."""
 
 
 class MessageEncodeError(BusError):

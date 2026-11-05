@@ -48,6 +48,10 @@ class NotSupported(EDSError):
     """The device/backend cannot perform the requested operation."""
 
 
+class BusError(EDSError):
+    """Message bus transport / contract error (ZMQ endpoint, encode/decode, schema)."""
+
+
 class CalibrationError(EDSError):
     """Calibration could not be computed (e.g. reference tone not found / SNR too low)."""
 

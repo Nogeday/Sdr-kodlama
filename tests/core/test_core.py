@@ -109,8 +109,6 @@ class TestConfigStrictness:
         with pytest.raises(ConfigError):
             load_config(tmp_path)          # a directory is not a config file
 
-    @pytest.mark.xfail(reason="core bug: TOML syntax errors escape as tomllib.TOMLDecodeError, not ConfigError "
-                              "(see requested_changes: wrap in load_config/load_profile)")
     def test_invalid_toml_is_config_error(self, tmp_path):
         p = tmp_path / "broken.toml"
         p.write_text("[rx\ngain_db = 1\n", encoding="utf-8")
@@ -129,8 +127,6 @@ class TestConfigStrictness:
         with pytest.raises(ConfigError, match="backend"):
             config_from_dict({"device": {"name": "rx0", "backend": "uhd"}})
 
-    @pytest.mark.xfail(reason="core bug: an empty [[device]] list is accepted and AppConfig.device() then "
-                              "raises IndexError (see requested_changes)")
     def test_empty_device_list_rejected(self):
         with pytest.raises(ConfigError):
             config_from_dict({"device": []})
@@ -327,8 +323,6 @@ baseline_m = 0.15
         out = apply_overrides(raw, {"rx.gain_db": 9.0})
         assert out["rx"]["gain_db"] == 9.0 and raw == before
 
-    @pytest.mark.xfail(reason="core bug: apply_overrides copies only one level; nested tables of the input "
-                              "(device[i].sim, measure.params.<id>) are mutated (see requested_changes)")
     def test_apply_overrides_does_not_mutate_nested_input(self):
         raw = {"measure": {"params": {"df_rms": {"baseline_m": 0.15}}},
                "device": [{"name": "rx0", "sim": {"ppm": 1.0}}]}
@@ -481,8 +475,6 @@ class TestProfileLoading:
         assert p.gain_bands == (GainBand(0, 1e9, 0, 10, 1.0),)
         assert p.candidate_sample_rates_hz == (1e6, 2e6) and p.notes == ("n",)
 
-    @pytest.mark.xfail(reason="core bug: malformed gain_bands / non-numeric fields raise TypeError/ValueError "
-                              "instead of ConfigError (see requested_changes)")
     def test_profile_from_dict_bad_band_is_config_error(self):
         with pytest.raises(ConfigError):
             profile_from_dict({"name": "x", "chip": "y",
@@ -536,8 +528,6 @@ class TestGainRangeClamp:
             assert abs(k - round(k)) < 1e-6, "result must lie on the step grid"
             assert abs(r - min(max(g, lo), hi)) <= step / 2 + 1e-9, "must be the nearest grid point"
 
-    @pytest.mark.xfail(reason="core quirk: when max_db - min_db is not a multiple of step_db, clamp() can return "
-                              "the off-grid max (see requested_changes)")
     def test_off_grid_max_is_floored_to_grid(self):
         assert GainRange(0.0, 5.5, 2.0).clamp(5.5) == 4.0
 

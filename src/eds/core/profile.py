@@ -126,7 +126,8 @@ class DeviceProfile:
                 )
             elif wire > self.interface_practical_bytes_per_s:
                 warn.append(
-                    f"{sample_rate_hz / 1e6:.4g} MS/s = {wire / 1e6:.1f} MB/s; {self.interface} pratik sınırının "
+                    f"{sample_rate_hz / 1e6:.4g} MS/s × {n_channels} kanal = {wire / 1e6:.1f} MB/s; "
+                    f"{self.interface} pratik sınırının "
                     f"(~{self.interface_practical_bytes_per_s / 1e6:.0f} MB/s) üstünde → overflow beklenir. "
                     "`eds measure max_rate` ile doğrulayın."
                 )
@@ -172,14 +173,24 @@ def profile_from_dict(d: dict[str, Any], source: str = "<dict>") -> DeviceProfil
         raise ConfigError(f"{source}: bilinmeyen profil anahtar(lar)ı: {sorted(unknown)}")
     if "name" not in d or "chip" not in d:
         raise ConfigError(f"{source}: profil 'name' ve 'chip' içermeli")
-    bands = tuple(GainBand(**b) for b in d.pop("gain_bands", []))
-    rates = tuple(float(r) for r in d.pop("candidate_sample_rates_hz", []))
+    band_keys = {"f_min_hz", "f_max_hz", "gain_min_db", "gain_max_db", "step_db"}
+    bands_raw = d.pop("gain_bands", [])
+    bands: list[GainBand] = []
+    try:
+        for i, b in enumerate(bands_raw):
+            if not isinstance(b, dict) or not {"f_min_hz", "f_max_hz", "gain_min_db", "gain_max_db"} <= set(b) \
+                    or set(b) - band_keys:
+                raise ConfigError(f"{source}: gain_bands[{i}] anahtarları {sorted(band_keys)} olmalı (geldi: {b!r})")
+            bands.append(GainBand(**{k: float(v) for k, v in b.items()}))
+        rates = tuple(float(r) for r in d.pop("candidate_sample_rates_hz", []))
+        float_fields = {k for k in _SCALAR_FIELDS if k.endswith(("_hz", "_s", "_ppm", "_counts"))}
+        for k in float_fields & set(d):
+            d[k] = float(d[k])
+    except (TypeError, ValueError) as e:
+        raise ConfigError(f"{source}: profilde sayısal olmayan değer: {e}") from e
     notes = tuple(d.pop("notes", []))
     extra = dict(d.pop("extra", {}))
-    float_fields = {k for k in _SCALAR_FIELDS if k.endswith(("_hz", "_s", "_ppm", "_counts"))}
-    for k in float_fields & set(d):
-        d[k] = float(d[k])
-    return DeviceProfile(gain_bands=bands, candidate_sample_rates_hz=rates, notes=notes, extra=extra, **d)
+    return DeviceProfile(gain_bands=tuple(bands), candidate_sample_rates_hz=rates, notes=notes, extra=extra, **d)
 
 
 def load_profile(name_or_path: str | Path) -> DeviceProfile:
@@ -190,8 +201,12 @@ def load_profile(name_or_path: str | Path) -> DeviceProfile:
     if not p.is_file():
         avail = sorted(x.stem for x in profiles_dir().glob("*.toml"))
         raise ConfigError(f"Cihaz profili bulunamadı: {name_or_path} (mevcut: {avail})")
-    with p.open("rb") as f:
-        return profile_from_dict(tomllib.load(f), source=str(p))
+    try:
+        with p.open("rb") as f:
+            raw = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        raise ConfigError(f"{p}: TOML sözdizimi hatası: {e}") from e
+    return profile_from_dict(raw, source=str(p))
 
 
 def list_profiles() -> list[str]:

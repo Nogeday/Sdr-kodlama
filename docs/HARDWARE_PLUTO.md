@@ -107,8 +107,10 @@ Donanım düzeltmesi    xo_correction = ref_clock_hz · (1 + e)
 1. **Kestirim** (`eds.calib`): bilinen bir CW referansı (`estimate_ppm_cw`; üreteç
    GPSDO/10 MHz'e kilitli olmalı) ya da bölgedeki bir **GSM BCCH**'nin FCCH tonu
    (`estimate_ppm_gsm_fcch`; ton `fc + 1625/24 kHz = +67.708 kHz`; baz istasyonu frekansı
-   ±0.05 ppm doğrulukta). Kestirim her zaman **nominal referansa göre** yapılır: önce
-   donanım düzeltmesi sıfırlanır (`set_ppm_correction(0)`).
+   ±0.05 ppm doğrulukta). Sonuç her zaman **nominal referansa göre TOPLAM ppm**'dir:
+   kestirim donanım düzeltmesi açıkken de yapılabilir; ölçülen artık ile uygulanan
+   düzeltme birleştirilip `(1+e_toplam) = (1+e_hw)(1+e_artık)` saklanır (aynı değeri
+   tekrar uygulamak artığı ~0 yapar — işlem idempotenttir).
    > 2. Pluto'nun TX'i PPM referansı **değildir** — onun TCXO'su da ±25 ppm'dir.
 2. **Saklama:** `cal/<seri_no>.json` (`CalibrationStore`), sıcaklıkla birlikte.
 3. **Uygulama** (`[cal] ppm_mode = "auto"`): sırayla

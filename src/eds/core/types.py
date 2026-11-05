@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -117,7 +118,11 @@ class GainRange:
     step_db: float = 1.0
 
     def clamp(self, g: float) -> float:
+        """Clamp to [min, max] and quantize to the step grid anchored at ``min_db``
+        (round half up; the result is always on the grid and never above ``max_db``)."""
         g = min(max(float(g), self.min_db), self.max_db)
         if self.step_db > 0:
-            g = self.min_db + round((g - self.min_db) / self.step_db) * self.step_db
-        return float(min(max(g, self.min_db), self.max_db))
+            k = math.floor((g - self.min_db) / self.step_db + 0.5)
+            k_max = math.floor((self.max_db - self.min_db) / self.step_db + 1e-9)
+            g = self.min_db + min(max(k, 0), k_max) * self.step_db
+        return float(g)
