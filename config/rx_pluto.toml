@@ -1,0 +1,158 @@
+# =============================================================================
+# EDS RX — TEK ADALM-PLUTO (AD9363) DONANIM KONFİGÜRASYONU  (Faz-0)
+# =============================================================================
+# Akış ve cihaz soyutlaması: SoapySDR + SoapyPlutoSDR (driver = "plutosdr").
+# Pluto'ya özgü alçak seviye kontroller (xo_correction, RF-DC tracking, hızlı AGC,
+# AD9361 sıcaklığı): ince libiio katmanı (eds.hal.pluto_iio) → control_uri.
+#
+# Kurulum ve doğrulama:  scripts/install_ubuntu.sh   ·   docs/HARDWARE_PLUTO.md
+# Ölçüm prosedürleri:     docs/MEASUREMENTS.md
+#
+#   eds measure max_rate --config config/rx_pluto.toml
+#   eds measure all      --config config/rx_pluto.toml
+#
+# BİLİNMEYEN ANAHTAR = HATA. Birimler: Hz, s, dB, dBm.
+# =============================================================================
+
+[[device]]
+name = "rx0"                      # "Pluto A" — ölçülen cihaz (DUT)
+backend = "soapy"
+profile = "ad9363_pluto"          # resmî sınırlar; jüri raporu YALNIZCA bu profille üretilir
+channels = [0]
+# --- Cihaz seçimi (SoapySDR device args) ------------------------------------
+# uri = "usb:" → libiio "ilk USB IIO cihazı"nı seçer; YALNIZCA tek Pluto takılıyken
+# çalışır. İki Pluto USB'deyken libiio "usb:" isteğini REDDEDER (EMLINK / "Too many
+# links") — bu durumda tam URI yazın:
+#   iio_info -s                          → "usb:1.5.5 [... serial=104473...]" satırları
+#   SoapySDRUtil --find="driver=plutosdr" → uri=usb:1.5.5, label=... (seri no dahil)
+# USB adresi (usb:BUS.DEV.IF) port/yeniden takma ile DEĞİŞEBİLİR; seri numarası sabittir.
+# Hangi URI'nin hangi Pluto olduğunu her oturumda seri numarasından doğrulayın
+# (kalibrasyon dosyaları cal/<seri>.json seri numarasıyla anahtarlanır).
+# Ek isteğe bağlı SoapyPlutoSDR argümanları: usb_direct = "1" (libusb doğrudan akış,
+# sürücü HAS_LIBUSB1 ile derlendiyse), "stream:bufflen" = "131072" (akış tamponu).
+args = { driver = "plutosdr", uri = "usb:" }
+# --- İnce libiio katmanı -----------------------------------------------------
+# SoapyPlutoSDR USB üzerinden akış yaparken ikinci bir libiio USB bağlamı genellikle
+# açılamaz → kontrol için Pluto'nun USB-Ethernet arayüzü (iiod) kullanılır.
+# Varsayılan Pluto IP'si 192.168.2.1. İKİ Pluto aynı anda bağlıysa IP'ler FARKLI olmalı:
+# Pluto'nun yığın-bellek sürücüsündeki config.txt → [NETWORK] ipaddr = 192.168.3.1,
+# ipaddr_host = 192.168.3.10 (2. Pluto), kaydet + sürücüyü "çıkar" (eject) → kalıcı.
+# "" = otomatik (args.uri), "none" = ince katman kapalı (xo_correction kullanılamaz).
+control_uri = "ip:192.168.2.1"
+
+[rx]
+center_freq_hz = 935e6
+# 4 MS/s × 4 B (CS16 I+Q) = 16 MB/s. USB 2.0 teorik bulk sınırı 53.2 MB/s, libiio+Pluto
+# pratik sürdürülebilir sınır ~20–24 MB/s (makineye/kabloya/hub'a bağlı). GERÇEK sınır
+# "eds measure max_rate" ile ölçülür (sıfır overflow + sıfır örnek kaybı, T saniye).
+sample_rate_hz = 4e6
+bandwidth_hz = 4e6
+gain_mode = "manual"              # güç ölçümü için HW AGC kapalı (örnekle senkron kazanç bilgisi yok)
+gain_db = 50.0                    # <1.3 GHz: −1..73 dB, 1.3–4 GHz: −3..71 dB (banda bağlı, otomatik kırpılır)
+buffer_size = 65536               # libiio tampon uzunluğu (büyük tampon = daha verimli USB)
+block_size = 65536
+settle_buffers = -1               # −1 = kernel_buffers (4) + 1 → retune sonrası 5×65536 örnek atılır
+stream_format = "CS16"            # SoapyPlutoSDR doğal formatı (tam ölçek 2048)
+dc_tracking = true
+rf_dc_tracking = true             # ince katman gerekir (control_uri)
+quad_tracking = true
+read_timeout_s = 2.0
+queue_blocks = 32
+
+[dsp]
+nfft = 4096                       # RBW ≈ 1.96 kHz @ 4 MS/s (blackmanharris, ENBW 2.004 bin)
+window = "blackmanharris"
+overlap = 0.5
+averages = 16
+avg_mode = "mean"
+usable_fraction = 0.8
+dc_notch_bins = 3
+
+[detect]
+method = "os_cfar"
+pfa = 1e-6
+guard_bins = 4
+train_bins = 32
+os_rank = 0.75
+min_snr_db = 6.0
+merge_gap_bins = 2
+min_bw_bins = 1
+fixed_threshold = -80.0
+exclude_dc = true
+
+[agc]
+target_peak_dbfs = -10.0
+high_peak_dbfs = -3.0
+low_peak_dbfs = -35.0
+max_clip_fraction = 1e-5
+attack_step_db = 10.0
+decay_step_db = 3.0
+hold_blocks = 4
+
+[sweep]
+start_hz = 325e6
+stop_hz = 3.8e9
+# 20 MS/s × 4 B = 80 MB/s USB2'yi AŞAR — bilinçli: tarama BURST yakalar. Her adımda
+# retune → settle tamponları atılır → kısa yakalama; adımlar arası overflow sonucu
+# etkilemez (her adım kendi içinde bitişik ve settled). Profil uyarısı beklenen davranıştır.
+sample_rate_hz = 20e6
+bandwidth_hz = 20e6
+nfft = 2048
+rbw_hz = 0.0
+averages = 4
+window = "blackmanharris"
+gain_mode = "fixed"
+gain_db = 50.0
+usable_fraction = 0.8
+dc_avoid = true
+settle_buffers = -1
+publish_max_points = 8192
+
+[bus]
+mode = "direct"
+pub_endpoint = "tcp://*:5555"
+sub_endpoint = "tcp://127.0.0.1:5555"
+proxy_frontend = "tcp://127.0.0.1:5550"
+proxy_backend = "tcp://127.0.0.1:5551"
+ctl_endpoints = []
+validate = false
+status_period_s = 1.0
+spectrum_rate_hz = 10.0
+spectrum_max_bins = 4096
+hwm = 200
+
+[cal]
+dir = ""
+ppm_mode = "auto"                 # xo_correction (donanım) → setFrequencyCorrection (soapy) → yazılım
+use_power_cal = true
+temp_warn_delta_c = 5.0           # kalibrasyon sıcaklığından > 5 °C sapma → uyarı (TCXO kayması)
+
+[measure]
+out_dir = ""
+targets_file = "ktr_targets.toml"
+# -----------------------------------------------------------------------------
+# Uyaran: 2. Pluto'nun ("Pluto B") TX çıkışı. BAĞLANTI (ASLA doğrudan TX→RX!):
+#
+#   Pluto B TX ──[≥30 dB sabit zayıflatıcı]──[0–60 dB kademeli zayıflatıcı]──► Pluto A RX (rx0)
+#
+# AD9363 RX güvenli giriş seviyesi düşüktür; Pluto TX ≈ +7 dBm'e çıkabilir. ≥30 dB sabit
+# zayıflatıcı her zaman hatta kalır. Duyarlılık (≈ −110…−125 dBm) için toplam ≥60–90 dB
+# zayıflatma ve Pluto'ları ayrı/ekranlı tutmak gerekir (kutu sızıntısı kablolu sinyali
+# bastırabilir: TX kablosunu sonlandırıp tonun kaybolduğunu doğrulayın).
+#
+# Pluto B'yi IP ile seçmek (config.txt ile 192.168.3.1) USB adres karmaşasını önler; TX
+# akışı ağ üzerinden düşük hızda (1 MS/s = 4 MB/s) güvenle beslenir. Pluto A'nın 'uri'si
+# bu durumda tam USB URI olmalıdır (iki Pluto USB'de → "usb:" reddedilir, yukarıya bakın).
+#
+# Pluto TX gücü BAĞILDIR (0 dB = en yüksek). anchor_dbm verilirse (bağıl 0 dB'de DUT
+# girişinde ölçülen güç, kablo/zayıflatıcı dahil) kaynak MUTLAK olur:
+#   P_dut = anchor_dbm − path_loss_db + P_bağıl
+# anchor_dbm'yi kalibre güç ölçer / spektrum analizörü ile ölçün; yoksa ölçümler seviyeyi
+# kalibrasyon tablosundan (cal/) ya da dBFS olarak raporlar (calibrated = false).
+# -----------------------------------------------------------------------------
+source = "pluto_tx"
+source_args = { args = { driver = "plutosdr", uri = "ip:192.168.3.1" }, fs = 1e6, tone_offset_hz = 200e3, path_loss_db = 0.0, buffer_len = 8192 }
+# Mutlak güç için örnek (ölçülen değerle değiştirin):
+# source_args = { args = { driver = "plutosdr", uri = "ip:192.168.3.1" }, fs = 1e6, tone_offset_hz = 200e3, path_loss_db = 0.0, anchor_dbm = -37.5 }
+
+[measure.params]

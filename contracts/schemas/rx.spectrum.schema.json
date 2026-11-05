@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eds.invalid/contracts/schemas/rx.spectrum.schema.json",
+  "title": "rx.spectrum",
+  "description": "Anlık bant güç spektrumu karesi (<= bus.spectrum_rate_hz). Ölçekleme: güç spektrumu P[k] = |Σ w x e^{-j..}|² / (Σw)² (bin merkezindeki tonun gücünü okur; gürültü RBW = ENBW·fs/N bandındaki gücü okur). values[i] frekansı = f_start_hz + i·f_step_hz; her nokta 'decimation' adet FFT bininin max-hold'udur.",
+  "allOf": [{"$ref": "envelope.schema.json"}],
+  "properties": {
+    "topic": {"const": "rx.spectrum"},
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "device", "block_seq", "t_acq_ns", "t_acq_end_ns", "t_proc_ns", "fc_hz", "fs_hz",
+        "rbw_hz", "nfft", "averages", "window", "f_start_hz", "f_step_hz", "n_bins",
+        "decimation", "unit", "calibrated", "ppm_corrected", "gain_db", "noise_floor",
+        "values", "overflow"
+      ],
+      "properties": {
+        "device": {"type": "string", "minLength": 1},
+        "block_seq": {"$ref": "common.schema.json#/$defs/count", "description": "Kaynak IQBlock.seq."},
+        "t_acq_ns": {"$ref": "common.schema.json#/$defs/time_ns", "description": "İlk örneğin tahmini host zamanı."},
+        "t_acq_end_ns": {"$ref": "common.schema.json#/$defs/time_ns", "description": "Son örnekten sonraki örneğin tahmini host zamanı."},
+        "t_proc_ns": {"$ref": "common.schema.json#/$defs/time_ns", "description": "DSP işleminin bittiği an."},
+        "fc_hz": {"$ref": "common.schema.json#/$defs/hz"},
+        "fs_hz": {"$ref": "common.schema.json#/$defs/hz_pos"},
+        "rbw_hz": {"$ref": "common.schema.json#/$defs/hz_pos", "description": "RBW = ENBW·fs/nfft [Hz]."},
+        "nfft": {"type": "integer", "minimum": 1},
+        "averages": {"type": "integer", "minimum": 1},
+        "window": {"type": "string", "minLength": 1},
+        "f_start_hz": {"type": "number", "description": "values[0] frekansı [Hz]."},
+        "f_step_hz": {"type": "number", "exclusiveMinimum": 0, "description": "Yayınlanan noktalar arası adım [Hz] (= decimation·fs/nfft)."},
+        "n_bins": {"type": "integer", "minimum": 1, "description": "Yayınlanan banttaki, desimasyondan önceki FFT bin sayısı; len(values) = ceil(n_bins / decimation)."},
+        "decimation": {"type": "integer", "minimum": 1, "description": "Yayınlanan nokta başına bin (max-hold)."},
+        "unit": {"$ref": "common.schema.json#/$defs/spectrum_unit"},
+        "calibrated": {"type": "boolean", "description": "Güç kalibrasyonu uygulandı mı (unit = dBm)."},
+        "ppm_corrected": {"type": "boolean", "description": "Frekans ekseni ppm düzeltmeli mi."},
+        "gain_db": {"$ref": "common.schema.json#/$defs/gain_list"},
+        "noise_floor": {"type": "number", "description": "Medyan gürültü tabanı (spektrum biriminde, RBW bandında)."},
+        "values": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "number"},
+          "description": "Güç [unit], ceil(n_bins/decimation) nokta."
+        },
+        "overflow": {"type": "boolean", "description": "Kaynak blokta overflow (örnek kaybı) var mı."}
+      }
+    }
+  }
+}

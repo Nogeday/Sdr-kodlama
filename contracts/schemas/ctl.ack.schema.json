@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eds.invalid/contracts/schemas/ctl.ack.schema.json",
+  "title": "ctl.ack",
+  "description": "ctl.* komutunun sonucu (komut başına). cmd serbest metindir ki bilinmeyen/bozuk komutlar da ok=false ile yanıtlanabilsin; ok=false ise error boş olmayan bir metin olmalıdır.",
+  "allOf": [{"$ref": "envelope.schema.json"}],
+  "properties": {
+    "topic": {"const": "ctl.ack"},
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["req_id", "ok"],
+      "properties": {
+        "req_id": {"type": "string", "description": "Yanıtlanan komutun req_id'si."},
+        "target": {"type": "string", "description": "Yanıtlayan cihaz adı."},
+        "cmd": {"type": "string"},
+        "ok": {"type": "boolean"},
+        "error": {"type": ["string", "null"], "description": "Hata (Türkçe), ok=true ise null."},
+        "result": {"type": ["object", "null"], "description": "Komuta özgü sonuç (ör. {fc_hz: ...})."}
+      },
+      "if": {"properties": {"ok": {"const": false}}, "required": ["ok"]},
+      "then": {
+        "required": ["error"],
+        "properties": {"error": {"type": "string", "minLength": 1}}
+      }
+    }
+  }
+}

@@ -1,0 +1,14 @@
+# ADALM-Pluto (Analog Devices, USB vendor 0456) — kök olmayan erişim + ModemManager muafiyeti
+# Kurulum: scripts/install_ubuntu.sh  (elle: sudo install -m 0644 bu-dosya /etc/udev/rules.d/ &&
+#          sudo udevadm control --reload-rules && sudo udevadm trigger)
+# Kullanıcı 'plugdev' grubunda olmalı (oturumu kapatıp açın).
+
+# PlutoSDR normal çalışma modu (IIO + USB-Ethernet + yığın bellek)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0456", ATTRS{idProduct}=="b673", MODE="0664", GROUP="plugdev", TAG+="uaccess"
+# PlutoSDR DFU (firmware güncelleme / kurtarma) modu
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0456", ATTRS{idProduct}=="b674", MODE="0664", GROUP="plugdev", TAG+="uaccess"
+
+# ModemManager Pluto'nun seri arayüzlerine AT komutu göndermesin (aksi halde açılış gecikir/akış bozulur)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0456", ATTRS{idProduct}=="b673", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0456", ATTRS{idProduct}=="b674", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0456", ATTRS{idProduct}=="b673", ENV{ID_MM_DEVICE_IGNORE}="1"

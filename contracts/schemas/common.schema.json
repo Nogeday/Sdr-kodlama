@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eds.invalid/contracts/schemas/common.schema.json",
+  "title": "EDS ortak şema tanımları",
+  "description": "Birden çok topic şemasının $ref ile kullandığı ortak tanımlar (tek başına bir mesaj şeması değildir). Birimler: frekans Hz, süre s, güç dB (spektrumun birimiyle: dBm ya da dBFS), açı derece.",
+  "$defs": {
+    "time_ns": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix epoch nanosaniye (time.time_ns, duvar saati). 2**53'ü aşar: JavaScript'te BigInt olarak ayrıştırın ya da /1e9 ile saniyeye çevirin."
+    },
+    "hz": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Frekans / hız [Hz], >= 0."
+    },
+    "hz_pos": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "description": "Frekans / hız [Hz], > 0."
+    },
+    "seconds": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Süre [s], >= 0."
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Sayaç, >= 0."
+    },
+    "gain_list": {
+      "type": "array",
+      "items": {"type": "number"},
+      "description": "Kanal başına donanım kazancı [dB] (AD936x 'hardwaregain'), kanal sırasıyla."
+    },
+    "spectrum_unit": {
+      "enum": ["dBm", "dBFS"],
+      "description": "dBFS: 0 dBFS = tam ölçek genlikli kompleks üstelin gücü (mean |x|^2 = 1). dBm yalnızca güç kalibrasyonu uygulanmışsa (calibrated = true)."
+    },
+    "angle_deg": {
+      "type": "number",
+      "minimum": -180,
+      "maximum": 180,
+      "description": "Açı [derece], wrap_deg aralığında (-180, 180]."
+    },
+    "unit_interval": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "0..1 aralığında oran/kalite ölçüsü."
+    },
+    "detection": {
+      "type": "object",
+      "title": "Tespit (eds.dsp.detect.Detection.to_dict())",
+      "description": "CFAR ile bulunmuş bir sinyal. Güç alanları içinde bulunduğu mesajın birimindedir (unit: dBm / dBFS / dBFS@<g>dB); frekanslar, mesaj ppm düzeltmeli ise düzeltilmiş frekanslardır.",
+      "additionalProperties": false,
+      "required": [
+        "f_center_hz", "f_peak_hz", "f_lo_hz", "f_hi_hz", "bw_hz",
+        "peak_db", "band_power_db", "snr_db", "noise_db", "n_bins"
+      ],
+      "properties": {
+        "f_center_hz": {"type": "number", "description": "Kapladığı bandın merkezi [Hz]."},
+        "f_peak_hz": {"type": "number", "description": "En güçlü binin (enterpolasyonlu) frekansı [Hz]."},
+        "f_lo_hz": {"type": "number", "description": "Kapladığı bandın alt kenarı [Hz]."},
+        "f_hi_hz": {"type": "number", "description": "Kapladığı bandın üst kenarı [Hz]."},
+        "bw_hz": {"type": "number", "minimum": 0, "description": "Kapladığı bant genişliği [Hz]."},
+        "peak_db": {"type": "number", "description": "Tepe bin gücü (güç spektrumu ölçeklemesi, RBW bandında)."},
+        "band_power_db": {"type": "number", "description": "Bant gücü = Σ P[k] / ENBW_bins (scalloping'den bağımsız; ton/kanal gücü)."},
+        "snr_db": {"type": "number", "description": "Sinyal/gürültü oranı [dB]."},
+        "noise_db": {"type": "number", "description": "Yerel gürültü tabanı (RBW bandında)."},
+        "n_bins": {"type": "integer", "minimum": 1, "description": "Tespitin kapladığı FFT bin sayısı."}
+      }
+    }
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eds.invalid/contracts/schemas/meas.result.schema.json",
+  "title": "meas.result",
+  "description": "KTR nicel spec ölçüm sonucu (ölçüm başına) = eds.measure.base.MeasurementResult.bus_payload().",
+  "allOf": [{"$ref": "envelope.schema.json"}],
+  "properties": {
+    "topic": {"const": "meas.result"},
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["spec_id", "title", "value", "unit", "status"],
+      "properties": {
+        "spec_id": {
+          "enum": [
+            "sensitivity", "dynamic_range", "inst_bw", "scan_speed", "freq_resolution",
+            "df_rms", "image_rejection", "max_rate", "latency"
+          ]
+        },
+        "title": {"type": "string", "minLength": 1, "description": "Türkçe ölçüm adı."},
+        "value": {"type": ["number", "null"], "description": "Başlık değeri (atlandı/başarısız ise null)."},
+        "unit": {"type": "string"},
+        "summary": {"type": "string", "description": "Türkçe tek satır özet."},
+        "status": {"enum": ["ok", "skipped", "failed"]},
+        "passed": {"type": ["boolean", "null"], "description": "Hedefe göre geçti/kaldı (hedef yoksa null)."},
+        "target": {"type": ["number", "null"]},
+        "target_op": {"enum": ["", "<=", ">="]},
+        "uncertainty": {"type": ["number", "null"], "minimum": 0},
+        "conditions": {"type": "object", "description": "Ölçüm koşulları (fc, fs, RBW, kazanç, nfft, ortalama, kaynak, sıcaklık...)."},
+        "extra": {"type": "object", "description": "İkincil metrikler."},
+        "t_start_ns": {"$ref": "common.schema.json#/$defs/time_ns"},
+        "duration_s": {"$ref": "common.schema.json#/$defs/seconds"},
+        "device": {"type": "string", "description": "Ölçülen cihaz adı (bilinmiyorsa boş)."}
+      }
+    }
+  }
+}

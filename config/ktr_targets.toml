@@ -1,0 +1,59 @@
+# =============================================================================
+# KTR NİCEL HEDEFLERİ — eds measure raporundaki "Hedef" ve "Geçti/Kaldı" sütunları
+# =============================================================================
+# !!! BURADAKİ SAYILAR ÖRNEKTİR !!!  Takımın Kritik Tasarım Raporu'nda (KTR) taahhüt
+# edilen değerlerle değiştirin. Her tablo bir ölçüm kimliğidir (eds.measure.base.SPEC_IDS)
+# ve tam olarak şu anahtarları taşır:
+#
+#   target = <sayı>          ölçüm biriminde (birim = ölçümün 'unit' alanı, aşağıda yazılı)
+#   op     = "<=" | ">="     geçme koşulu:  ölçülen <op> target
+#   note   = "..."           rapora düşen açıklama (koşullar, kaynak, KTR maddesi)
+#
+# Bir hedefin "koşulları" (RBW, Pfa, frekans, kazanç...) ölçüm raporunda ayrıca yazılır;
+# hedefi KTR'de hangi koşulla taahhüt ettiyseniz ölçümü o koşulla çalıştırın.
+# =============================================================================
+
+[sensitivity]                     # birim: dBm  (daha negatif = daha iyi)
+target = -100.0
+op = "<="
+note = "ÖRNEK — KTR değeriyle değiştirin. Pd = 0.9 @ CFAR Pfa = 1e-6, belirtilen RBW'de giriş gücü."
+
+[dynamic_range]                   # birim: dB
+target = 60.0
+op = ">="
+note = "ÖRNEK — KTR değeriyle değiştirin. Anlık dinamik alan: kırpmasız en büyük ton − RBW'deki gürültü tabanı."
+
+[inst_bw]                         # birim: MHz
+target = 18.0
+op = ">="
+note = "ÖRNEK — KTR değeriyle değiştirin. Ölçülen geçiş bandının −3 dB genişliği (AD9363 analog BW ≤ 20 MHz)."
+
+[scan_speed]                      # birim: GHz/s
+target = 5.0
+op = ">="
+note = "ÖRNEK — KTR değeriyle değiştirin. 325 MHz–3.8 GHz taranan açıklık / duvar saati süresi."
+
+[freq_resolution]                 # birim: Hz  (küçük = daha iyi)
+target = 10000.0
+op = "<="
+note = "ÖRNEK — KTR değeriyle değiştirin. RBW (ENBW·fs/N) ve ölçülen en küçük ayrıştırılabilir iki-ton aralığı."
+
+[df_rms]                          # birim: ° (derece)
+target = 5.0
+op = "<="
+note = "ÖRNEK — KTR değeriyle değiştirin. Faz kalibrasyonu sonrası açılar üzerinden RMS yön hatası."
+
+[image_rejection]                 # birim: dB
+target = 40.0
+op = ">="
+note = "ÖRNEK — KTR değeriyle değiştirin. P(+δ) − P(−δ), bant boyunca en kötü değer, quadrature tracking açık."
+
+[max_rate]                        # birim: MS/s
+target = 4.0
+op = ">="
+note = "ÖRNEK — KTR değeriyle değiştirin. T saniye sürekli akışta sıfır overflow + sıfır örnek kaybı (USB 2.0)."
+
+[latency]                         # birim: ms  (p95 önerilir)
+target = 100.0
+op = "<="
+note = "ÖRNEK — KTR değeriyle değiştirin. RF olayı → ZMQ tespit mesajı teslimi."

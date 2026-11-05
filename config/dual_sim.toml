@@ -1,0 +1,152 @@
+# =============================================================================
+# EDS RX — İKİ SİMÜLE PLUTO — FAZ-0 DF DOĞRULAMA (donanımsız)
+# =============================================================================
+# config/dual_pluto.toml'un simülatör ikizi. İki cihaz AYNI SimWorld'ü görür (aynı
+# emitter dalga biçimleri); her cihazın kendi LO fazı (her retune'da rastgele), DC/IQ
+# kusurları ve konumu vardır. Ortak 40 MHz referans "shared_clock" ile modellenir:
+# iki cihaz aynı ppm'i kullanır, faz farkı yalnızca retune'da değişir. shared_clock'u
+# kaldırırsanız bağımsız TCXO'lar → faz farkı Δf ≈ f·Δppm ile sürekli döner (DF imkânsız).
+#
+#   eds measure df_rms --config config/dual_sim.toml
+#
+# Geometri (SimWorld): emitter azimutu +y'den +x'e doğru ölçülür; dizi ekseni +x
+# (rx0 → rx1). Broadside (+y) = 0°, rx1 yönü pozitif — DF açı konvansiyonu ile aynı.
+# =============================================================================
+
+[[device]]
+name = "rx0"                      # referans eleman, orijinde
+backend = "sim"
+profile = "ad9363_pluto"
+channels = [0]
+# realtime = false: deterministik, CPU'dan bağımsız (DF doğrulaması/CI). Gerçek zamanlı
+# USB modeli için true yapın (iki cihaz × 4 MS/s sentezi hızlı bir CPU gerektirir).
+sim = { ppm = 11.7, shared_clock = "ref40", position_m = [0.0, 0.0], realtime = false, serial = "SIM-A" }
+
+[[device]]
+name = "rx1"                      # 2. eleman, +x yönünde d = 0.15 m (λ/2 @ 1 GHz)
+backend = "sim"
+profile = "ad9363_pluto"
+channels = [0]
+# shared_clock grubunda ppm grubun ilk üyesinden gelir (farklı ppm vermek hatadır).
+# time_offset_samples: iki USB akışının başlangıç kayması (örnek). 0 dışı bir değer,
+# çapraz korelasyonla örnek hizalama kodunu sınamak için kullanılır (ör. 37).
+sim = { shared_clock = "ref40", position_m = [0.15, 0.0], realtime = false, serial = "SIM-B", time_offset_samples = 0 }
+
+[rx]
+center_freq_hz = 999.5e6          # hedef 1.000 GHz → taban bantta +500 kHz (DC'de/imajda değil)
+sample_rate_hz = 4e6
+bandwidth_hz = 4e6
+gain_mode = "manual"
+gain_db = 40.0                    # −55 dBm pilot → −20 dBFS: iki kanal da kırpılmadan
+buffer_size = 65536
+block_size = 65536
+settle_buffers = -1
+stream_format = "CS16"
+dc_tracking = true
+rf_dc_tracking = true
+quad_tracking = true
+read_timeout_s = 2.0
+queue_blocks = 32
+
+[dsp]
+nfft = 4096
+window = "blackmanharris"
+overlap = 0.5
+averages = 16
+avg_mode = "mean"
+usable_fraction = 0.8
+dc_notch_bins = 3
+
+[detect]
+method = "os_cfar"
+pfa = 1e-6
+guard_bins = 4
+train_bins = 32
+os_rank = 0.75
+min_snr_db = 6.0
+merge_gap_bins = 2
+min_bw_bins = 1
+fixed_threshold = -80.0
+exclude_dc = true
+
+[agc]
+target_peak_dbfs = -10.0
+high_peak_dbfs = -3.0
+low_peak_dbfs = -35.0
+max_clip_fraction = 1e-5
+attack_step_db = 10.0
+decay_step_db = 3.0
+hold_blocks = 4
+
+[sweep]
+start_hz = 325e6
+stop_hz = 3.8e9
+sample_rate_hz = 20e6
+bandwidth_hz = 20e6
+nfft = 2048
+rbw_hz = 0.0
+averages = 4
+window = "blackmanharris"
+gain_mode = "fixed"
+gain_db = 50.0
+usable_fraction = 0.8
+dc_avoid = true
+settle_buffers = -1
+publish_max_points = 8192
+
+[bus]
+mode = "direct"
+pub_endpoint = "tcp://*:5555"
+sub_endpoint = "tcp://127.0.0.1:5555"
+proxy_frontend = "tcp://127.0.0.1:5550"
+proxy_backend = "tcp://127.0.0.1:5551"
+ctl_endpoints = []
+validate = false
+status_period_s = 1.0
+spectrum_rate_hz = 10.0
+spectrum_max_bins = 4096
+hwm = 200
+
+[cal]
+dir = ""
+ppm_mode = "auto"
+use_power_cal = true
+temp_warn_delta_c = 5.0
+
+[measure]
+out_dir = ""
+targets_file = "ktr_targets.toml"
+source = "sim"
+# Açı taraması için uyaran HAVADAN gelir (cabled = false; aoa_deg ölçüm sırasında değişir).
+source_args = { cabled = false, aoa_deg = 0.0, path_loss_db = 0.0 }
+
+[measure.params.df_rms]
+baseline_m = 0.15                 # rx0 → rx1 (m) — sim.position_m farkıyla AYNI olmalı
+
+# -----------------------------------------------------------------------------
+# Sahne: kablolu kalibrasyon pilotu + havadan gelen hedef.
+# Pilot, güç bölücü ile iki RX'e eşit boylu kablolarla giden sinyali modeller (cabled:
+# geometrik faz yok) → ölçülen faz farkı = yalnızca cihazlar arası LO/kablo farkı.
+# Hedefle aynı taban bant bölgesinde ama farklı frekansta: her ikisi aynı anda açık
+# kalabilir, kalibrasyon pilot bininde, DF hedef bininde yapılır.
+# -----------------------------------------------------------------------------
+[sim]
+temperature_c = 35.0
+seed = 4242
+
+[[sim.emitters]]
+name = "cal_pilot"
+kind = "cw"
+freq_hz = 998.9e6                 # taban bantta −600 kHz (hedefin imajı −500 kHz'den ayrık)
+power_dbm = -55.0
+cabled = true
+enabled = true
+
+[[sim.emitters]]
+name = "ota_target"
+kind = "cw"
+freq_hz = 1.0e9
+power_dbm = -60.0
+aoa_deg = 25.0                    # gerçek azimut (broadside'dan rx1 yönüne +25°)
+cabled = false
+enabled = true

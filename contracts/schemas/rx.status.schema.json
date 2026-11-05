@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eds.invalid/contracts/schemas/rx.status.schema.json",
+  "title": "rx.status",
+  "description": "RX düğümü sağlık/durum mesajı (~1 Hz, bus.status_period_s): frekans, örnekleme hızı, kazanç, PPM, akış sayaçları (overflow/drop), seviye (headroom) ve sensörler.",
+  "allOf": [{"$ref": "envelope.schema.json"}],
+  "properties": {
+    "topic": {"const": "rx.status"},
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["device", "state", "fc_hz", "fs_hz", "gain_db", "stream"],
+      "properties": {
+        "device": {
+          "type": "object",
+          "description": "Cihaz kimliği (eds.core.types.DeviceInfo alt kümesi).",
+          "additionalProperties": false,
+          "required": ["name", "backend"],
+          "properties": {
+            "name": {"type": "string", "minLength": 1, "description": "Konfigürasyondaki mantıksal ad (= zarf src)."},
+            "backend": {"type": "string", "minLength": 1, "description": "'soapy' | 'sim' | ..."},
+            "driver": {"type": "string", "description": "Soapy sürücü anahtarı, ör. 'plutosdr'."},
+            "serial": {"type": "string", "description": "Seri numarası (kalibrasyon dosyaları bununla eşlenir)."},
+            "profile": {"type": "string", "description": "Cihaz profili, ör. 'ad9363_pluto'."}
+          }
+        },
+        "state": {
+          "enum": ["idle", "streaming", "sweeping", "error"],
+          "description": "Düğüm durumu."
+        },
+        "fc_hz": {"$ref": "common.schema.json#/$defs/hz", "description": "Komut edilen (nominal) merkez frekansı [Hz]."},
+        "fs_hz": {"$ref": "common.schema.json#/$defs/hz", "description": "Örnekleme hızı [S/s] (henüz ayarlanmadıysa 0)."},
+        "bw_hz": {"$ref": "common.schema.json#/$defs/hz", "description": "Analog RF bant genişliği [Hz]."},
+        "gain_db": {
+          "allOf": [{"$ref": "common.schema.json#/$defs/gain_list"}],
+          "minItems": 1
+        },
+        "gain_mode": {"type": "string", "description": "manual | soft_agc | hw_slow | hw_fast | hw_hybrid."},
+        "ppm": {
+          "type": "object",
+          "description": "Referans saat (TCXO) hatası. İşaret: ppm = (f_ref_gerçek - f_ref_nominal)/f_ref_nominal·1e6 (pozitif = TCXO hızlı).",
+          "additionalProperties": false,
+          "properties": {
+            "value": {"type": ["number", "null"], "description": "Uygulanan ppm (bilinmiyorsa null)."},
+            "via": {"enum": ["hardware", "soapy", "software", "none"], "description": "Düzeltmenin uygulandığı yer."},
+            "age_s": {"type": ["number", "null"], "minimum": 0, "description": "Kalibrasyonun yaşı [s] (bilinmiyorsa null)."}
+          }
+        },
+        "stream": {
+          "type": "object",
+          "description": "Akış sayaçları (eds.core.types.StreamStats; host_drops RX streamer kuyruğundan).",
+          "additionalProperties": false,
+          "required": [
+            "blocks", "samples", "overflows", "timeouts", "host_drops", "discarded_samples",
+            "throughput_sps", "elapsed_s"
+          ],
+          "properties": {
+            "blocks": {"$ref": "common.schema.json#/$defs/count"},
+            "samples": {"$ref": "common.schema.json#/$defs/count", "description": "Kanal başına teslim edilen örnek."},
+            "overflows": {"$ref": "common.schema.json#/$defs/count", "description": "Sürücü/donanım overflow olayı (USB darboğazı)."},
+            "timeouts": {"$ref": "common.schema.json#/$defs/count"},
+            "host_drops": {"$ref": "common.schema.json#/$defs/count", "description": "Host kuyruğunda atılan blok (tüketici yavaş)."},
+            "discarded_samples": {"$ref": "common.schema.json#/$defs/count"},
+            "throughput_sps": {"type": "number", "minimum": 0, "description": "Ölçülen sürdürülebilir hız [S/s]."},
+            "elapsed_s": {"$ref": "common.schema.json#/$defs/seconds"}
+          }
+        },
+        "levels": {
+          "type": "object",
+          "description": "Son bloğun seviyeleri (headroom / kırpma). Blok yoksa null.",
+          "additionalProperties": false,
+          "properties": {
+            "peak_dbfs": {"type": ["number", "null"]},
+            "rms_dbfs": {"type": ["number", "null"]},
+            "clip_fraction": {"type": ["number", "null"], "minimum": 0, "maximum": 1}
+          }
+        },
+        "sensors": {
+          "type": "object",
+          "description": "Sensör okumaları (temperature_c, rssi_db, ...).",
+          "additionalProperties": {"type": ["number", "string", "null"]}
+        },
+        "warnings": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Operatör uyarıları (Türkçe)."
+        }
+      }
+    }
+  }
+}

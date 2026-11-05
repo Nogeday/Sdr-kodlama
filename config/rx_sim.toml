@@ -1,0 +1,182 @@
+# =============================================================================
+# EDS RX — TEK CİHAZ SİMÜLATÖR KONFİGÜRASYONU (CI, demo, ölçüm prosedürü doğrulama)
+# =============================================================================
+# Donanım gerekmez. Fizik tabanlı AD9363/Pluto modeli (eds.hal.sim) gerçek kusurları
+# üretir: TCXO ppm hatası, DC ofset, IQ dengesizliği (imaj), 12-bit niceleme + sert
+# kırpma, analog LPF, retune sonrası bayat tamponlar, gerçek zamanlı USB 2.0 darboğazı.
+#
+#   eds measure all --config config/rx_sim.toml --quick     (make demo)
+#   eds measure sensitivity --config config/rx_sim.toml
+#
+# Tüm anahtarlar eds.core.config içinde tanımlıdır; BİLİNMEYEN ANAHTAR = HATA
+# (ölçüm tezgahında yazım hatası sessizce varsayılana düşmemeli).
+# Birimler: frekans Hz, zaman s, güç dBm (alıcı giriş konnektöründe), kazanç dB.
+# =============================================================================
+
+[[device]]
+name = "rx0"                      # bus mesajlarında 'src', kalibrasyon dosyası seri no ile
+backend = "sim"
+profile = "ad9363_pluto"          # resmî AD9363 sınırları (325 MHz–3.8 GHz, ≤20 MHz BW)
+channels = [0]
+# ppm = +11.7: "tipik kötü TCXO" (pozitif = TCXO hızlı; bkz. ARCHITECTURE §2 PPM işareti).
+# realtime = true: cihaz fs·(1+e) örnek/s üretir, USB modeli (24 MB/s) ve FIFO taşması
+# (overflow) gerçek donanımdaki gibi davranır → max_rate / latency ölçümleri anlamlıdır.
+sim = { ppm = 11.7, realtime = true }
+
+[rx]
+center_freq_hz = 935e6            # GSM900 downlink (BCCH 935.2 MHz bandın içinde, DC'de değil)
+sample_rate_hz = 4e6              # 4 MS/s × 4 B = 16 MB/s  (USB2 pratik eşiği 24 MB/s'nin altında)
+bandwidth_hz = 4e6                # analog LPF (AD9363 RF BW)
+gain_mode = "manual"              # ölçüm kalitesinde güç için HW AGC kapalı
+gain_db = 50.0                    # 935 MHz bandında izinli aralık −1..73 dB
+buffer_size = 65536               # sürücü tamponu (Soapy 'bufflen')
+block_size = 65536                # tüketicilere giden IQBlock uzunluğu
+settle_buffers = -1               # −1 = profile.kernel_buffers + 1 (retune sonrası atılan tampon)
+stream_format = "CS16"
+dc_tracking = true                # AD936x BB DC tracking
+rf_dc_tracking = true             # AD936x RF DC tracking
+quad_tracking = true              # AD936x quadrature (IQ dengesizliği) tracking
+read_timeout_s = 2.0
+queue_blocks = 32
+
+[dsp]
+nfft = 4096                       # RBW = ENBW·fs/N = 2.004 × 4e6/4096 ≈ 1.96 kHz (blackmanharris)
+window = "blackmanharris"         # −92 dB yan lob; ton/gürültü gücü için band_power kullanılır
+overlap = 0.5
+averages = 16
+avg_mode = "mean"
+usable_fraction = 0.8             # fs'nin düz ve alias'sız kabul edilen merkez kısmı
+dc_notch_bins = 3                 # sıfır-IF DC çivisi: ±3 bin geçersiz
+
+[detect]
+method = "os_cfar"
+pfa = 1e-6
+guard_bins = 4
+train_bins = 32
+os_rank = 0.75
+min_snr_db = 6.0
+merge_gap_bins = 2
+min_bw_bins = 1
+fixed_threshold = -80.0
+exclude_dc = true
+
+[agc]                             # yazılım AGC (eds.rx.agc) — gain_mode = "soft_agc" iken
+target_peak_dbfs = -10.0
+high_peak_dbfs = -3.0
+low_peak_dbfs = -35.0
+max_clip_fraction = 1e-5
+attack_step_db = 10.0
+decay_step_db = 3.0
+hold_blocks = 4
+
+[sweep]                           # 325 MHz – 3.8 GHz geniş bant tarama
+start_hz = 325e6
+stop_hz = 3.8e9
+sample_rate_hz = 20e6             # burst yakalama: adımlar arası USB sınırı geçerli değildir
+bandwidth_hz = 20e6               # AD9363 üst sınırı
+nfft = 2048                       # RBW ≈ 2.004 × 20e6/2048 ≈ 19.6 kHz
+rbw_hz = 0.0                      # > 0 ise nfft'yi bu RBW'ye göre seçer
+averages = 4
+window = "blackmanharris"
+gain_mode = "fixed"
+gain_db = 50.0
+usable_fraction = 0.8             # adım = 0.8 × 20 MHz = 16 MHz
+dc_avoid = true                   # adımlar örtüşür, DC hiçbir zaman sonuçta yer almaz
+settle_buffers = -1
+publish_max_points = 8192
+
+[bus]
+mode = "direct"
+pub_endpoint = "tcp://*:5555"
+sub_endpoint = "tcp://127.0.0.1:5555"
+proxy_frontend = "tcp://127.0.0.1:5550"
+proxy_backend = "tcp://127.0.0.1:5551"
+ctl_endpoints = []
+validate = false                  # true: her mesaj JSON şemasına karşı doğrulanır (jsonschema gerekir;
+                                  # gecikme ölçümüne ek yük bindirir → ölçümde kapalı tutun)
+status_period_s = 1.0
+spectrum_rate_hz = 10.0
+spectrum_max_bins = 4096
+hwm = 200
+
+[cal]
+dir = ""                          # "" = <repo>/cal
+ppm_mode = "auto"                 # auto: donanım (xo_correction) → soapy → yazılım
+use_power_cal = true
+temp_warn_delta_c = 5.0
+# ppm_override = 11.7             # sonlu değer verilirse kalibrasyon deposunu atlar
+
+[measure]
+out_dir = ""                      # "" = <repo>/reports
+targets_file = "ktr_targets.toml" # config/ klasörüne göre
+source = "sim"                    # simüle sinyal üreteci (SimSignalSource), mutlak güç
+# Üreteç kablo ile bağlı (geometrik faz yok); path_loss_db = kablo/zayıflatıcı kaybı.
+source_args = { cabled = true, path_loss_db = 0.0 }
+
+[measure.params]                  # ölçüm başına parametre geçersiz kılma (spec_id = { ... })
+
+# -----------------------------------------------------------------------------
+# Simüle RF sahnesi (325 MHz–3.8 GHz içinde gerçekçi bir yarışma ortamı).
+# power_dbm = ALICI GİRİŞİNDEKİ güç (yol kaybı/anten kazancı dahil).
+# Seviye modeli: dBFS = dBm + G − 5  ⇒ G = 50 dB'de tam ölçek ≈ −45 dBm.
+# -----------------------------------------------------------------------------
+[sim]
+temperature_c = 35.0
+seed = 1234
+
+[[sim.emitters]]                  # GSM900 BCCH (ARFCN 1): FCCH tonu fc + 67.708 kHz → PPM kalibrasyonu
+name = "gsm900_bcch"
+kind = "gsm_fcch"
+freq_hz = 935.2e6
+power_dbm = -60.0
+bw_hz = 200e3
+aoa_deg = 40.0
+
+[[sim.emitters]]                  # LTE Band 3 downlink, 10 MHz taşıyıcı (gürültü benzeri OFDM)
+name = "lte_b3_dl"
+kind = "noise"
+freq_hz = 1842.5e6
+power_dbm = -65.0
+bw_hz = 10e6
+aoa_deg = -70.0
+
+[[sim.emitters]]                  # PMR446 kanal 1 (12.5 kHz, ±2.5 kHz sapma) telsiz
+name = "pmr446_ch1"
+kind = "fm"
+freq_hz = 446.00625e6
+power_dbm = -70.0
+bw_hz = 12.5e3
+aoa_deg = 15.0
+params = { dev_hz = 2.5e3, mod_hz = 1e3 }
+
+[[sim.emitters]]                  # 433.92 MHz ISM: İHA telemetri / kumanda bağı
+name = "ism433_uav_link"
+kind = "fm"
+freq_hz = 433.92e6
+power_dbm = -55.0
+bw_hz = 60e3
+aoa_deg = -25.0
+params = { dev_hz = 25e3, mod_hz = 4.8e3 }
+
+[[sim.emitters]]                  # S-bant arama radarı: PRI 1 ms, PW 10 µs (sim'in çözebildiği en kısa pratik darbe)
+name = "s_band_radar"
+kind = "pulse"
+freq_hz = 2.8e9
+power_dbm = -50.0
+aoa_deg = 120.0
+params = { pri_s = 1e-3, pw_s = 1e-5 }
+
+[[sim.emitters]]                  # WiFi 2.4 GHz kanal 6, 20 MHz (gürültü benzeri OFDM)
+name = "wifi_ch6"
+kind = "noise"
+freq_hz = 2.437e9
+power_dbm = -62.0
+bw_hz = 20e6
+aoa_deg = 80.0
+
+[[sim.emitters]]                  # Zayıf L-bant CW işaretçi — duyarlılık/tespit demosu
+name = "lband_beacon"
+kind = "cw"
+freq_hz = 1.2e9
+power_dbm = -110.0
+aoa_deg = -5.0

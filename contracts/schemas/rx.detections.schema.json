@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eds.invalid/contracts/schemas/rx.detections.schema.json",
+  "title": "rx.detections",
+  "description": "Bir spektrum karesinde CFAR ile bulunan sinyaller (her kare için; boş liste dahil). block_seq / t_acq_ns ilgili rx.spectrum karesiyle eşleşir.",
+  "allOf": [{"$ref": "envelope.schema.json"}],
+  "properties": {
+    "topic": {"const": "rx.detections"},
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "device", "block_seq", "t_acq_ns", "t_acq_end_ns", "t_proc_ns", "fc_hz", "rbw_hz",
+        "unit", "method", "pfa", "detections"
+      ],
+      "properties": {
+        "device": {"type": "string", "minLength": 1},
+        "block_seq": {"$ref": "common.schema.json#/$defs/count"},
+        "t_acq_ns": {"$ref": "common.schema.json#/$defs/time_ns"},
+        "t_acq_end_ns": {"$ref": "common.schema.json#/$defs/time_ns"},
+        "t_proc_ns": {"$ref": "common.schema.json#/$defs/time_ns"},
+        "fc_hz": {"$ref": "common.schema.json#/$defs/hz"},
+        "rbw_hz": {"$ref": "common.schema.json#/$defs/hz_pos"},
+        "unit": {"$ref": "common.schema.json#/$defs/spectrum_unit"},
+        "method": {"type": "string", "minLength": 1, "description": "os_cfar | ca_cfar | fixed."},
+        "pfa": {"type": "number", "exclusiveMinimum": 0, "maximum": 1, "description": "Hedef yanlış alarm olasılığı."},
+        "detections": {
+          "type": "array",
+          "items": {"$ref": "common.schema.json#/$defs/detection"}
+        }
+      }
+    }
+  }
+}

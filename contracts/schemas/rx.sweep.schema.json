@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eds.invalid/contracts/schemas/rx.sweep.schema.json",
+  "title": "rx.sweep",
+  "description": "Geniş bant tarama sonucu (tarama başına 1; ör. 325 MHz – 3.8 GHz): birleştirilmiş, max-hold desimasyonlu spektrum + tespitler + tarama hızı ve zaman bütçesi. values[i] frekansı = f_point_start_hz + i·f_point_step_hz.",
+  "allOf": [{"$ref": "envelope.schema.json"}],
+  "properties": {
+    "topic": {"const": "rx.sweep"},
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "device", "sweep_id", "t_start_ns", "t_end_ns", "f_start_hz", "f_stop_hz", "rbw_hz",
+        "n_steps", "step_hz", "duration_s", "rate_hz_per_s", "unit", "calibrated",
+        "decimation", "f_point_start_hz", "f_point_step_hz", "values", "detections", "timing"
+      ],
+      "properties": {
+        "device": {"type": "string", "minLength": 1},
+        "sweep_id": {"$ref": "common.schema.json#/$defs/count"},
+        "t_start_ns": {"$ref": "common.schema.json#/$defs/time_ns"},
+        "t_end_ns": {"$ref": "common.schema.json#/$defs/time_ns"},
+        "f_start_hz": {"$ref": "common.schema.json#/$defs/hz", "description": "Taranan bandın alt sınırı [Hz]."},
+        "f_stop_hz": {"$ref": "common.schema.json#/$defs/hz", "description": "Taranan bandın üst sınırı [Hz]."},
+        "rbw_hz": {"$ref": "common.schema.json#/$defs/hz_pos"},
+        "n_steps": {"type": "integer", "minimum": 1, "description": "Ayarlanan merkez frekansı sayısı."},
+        "step_hz": {"$ref": "common.schema.json#/$defs/hz", "description": "Adımlar arası merkez frekansı farkı [Hz]."},
+        "duration_s": {"$ref": "common.schema.json#/$defs/seconds"},
+        "rate_hz_per_s": {"type": "number", "minimum": 0, "description": "Tarama hızı (f_stop − f_start)/duration [Hz/s]."},
+        "unit": {
+          "type": "string",
+          "pattern": "^(dBm|dBFS|dBFS@[+-]?[0-9]+(\\.[0-9]+)?dB)$",
+          "description": "'dBm' (kalibreli), 'dBFS' ya da kazanca göre referanslı 'dBFS@<g>dB' (ör. 'dBFS@50dB')."
+        },
+        "calibrated": {"type": "boolean"},
+        "decimation": {"type": "integer", "minimum": 1, "description": "Yayınlanan nokta başına bin (max-hold)."},
+        "f_point_start_hz": {"type": "number", "description": "values[0] frekansı [Hz]."},
+        "f_point_step_hz": {"type": "number", "exclusiveMinimum": 0, "description": "Yayınlanan noktalar arası adım [Hz]."},
+        "values": {"type": "array", "minItems": 1, "items": {"type": "number"}},
+        "detections": {
+          "type": "array",
+          "items": {"$ref": "common.schema.json#/$defs/detection"}
+        },
+        "timing": {
+          "type": "object",
+          "description": "Toplam süre bütçesi [s] (tüm adımlar).",
+          "additionalProperties": false,
+          "required": ["tune_s", "settle_s", "capture_s", "dsp_s"],
+          "properties": {
+            "tune_s": {"$ref": "common.schema.json#/$defs/seconds", "description": "LO ayarı / PLL kilidi."},
+            "settle_s": {"$ref": "common.schema.json#/$defs/seconds", "description": "Bayat çekirdek tamponlarının atılması."},
+            "capture_s": {"$ref": "common.schema.json#/$defs/seconds"},
+            "dsp_s": {"$ref": "common.schema.json#/$defs/seconds"}
+          }
+        }
+      }
+    }
+  }
+}

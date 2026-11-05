@@ -1,0 +1,157 @@
+# =============================================================================
+# EDS RX — İKİ ADALM-PLUTO (2 × 1R1T) — FAZ-0 YÖN BULMA (DF) KONFİGÜRASYONU
+# =============================================================================
+# AD9363 cihaz başına TEK RX kanalıdır; 2 kanal = 2 Pluto. eds.hal.factory.open_group()
+# iki cihazı tek bir DeviceGroup (num_channels = 2, coherent = False) olarak açar.
+#
+# İKİ AYRI PLUTO KOHERENT DEĞİLDİR. DF'den önce (docs/HARDWARE_PLUTO.md §5):
+#   1. Ortak 40 MHz referans: Rev C/D CLK_IN girişlerine tek kaynaktan (bölücü/clock buffer)
+#      → iki cihazın ppm'i eşitlenir (bağımsız TCXO'larla faz sürekli kayar).
+#   2. HER RETUNE'DAN SONRA faz kalibrasyonu: LO fazı her ayarda rastgeledir. Gürültü
+#      kaynağı / sinyal üreteci → eşit boylu kablolar → 2'li güç bölücü → iki RX girişi.
+#   3. Örnek hizalaması: iki USB akışı farklı anlarda başlar; ortak geniş bantlı sinyalin
+#      çapraz korelasyonu ile gecikme (tam + kesirli örnek) kestirilir. Herhangi bir
+#      overflow'da hizalama kaybolur (grup bloğu overflow=True) → yeniden kalibrasyon.
+#   4. Koherens kontrolü (eds.df.coherence.check_coherence): faz kayması °/s ve koherens
+#      eşiği sağlanmadan DF sonucu yayımlanmaz.
+#
+#   eds measure df_rms --config config/dual_pluto.toml
+#
+# BİLİNMEYEN ANAHTAR = HATA. Birimler: Hz, s, dB, dBm, m, °.
+# =============================================================================
+
+# --- Cihaz seçimi ------------------------------------------------------------
+# İki Pluto USB'deyken "usb:" (otomatik) libiio tarafından reddedilir: her cihaz için
+# TAM URI yazılmalıdır. Eşleme SERİ NUMARASI ile yapılır (USB adresi değişebilir):
+#
+#   $ iio_info -s
+#   Available contexts:
+#     0: 0456:b673 (Analog Devices Inc. PlutoSDR (ADALM-PLUTO)), serial=1044730a1997000b1500... [usb:1.5.5]
+#     1: 0456:b673 (Analog Devices Inc. PlutoSDR (ADALM-PLUTO)), serial=104473dc5993001d0f00... [usb:1.6.5]
+#
+#   $ SoapySDRUtil --find="driver=plutosdr"      → uri=usb:1.5.5, label=... (seri no)
+#
+# Takımın kuralı: seri numarasını Pluto kasasına etiketleyin (A/B) ve aşağıdaki
+# "seri:" yorumlarını güncelleyin; her oturumda URI ↔ seri eşlemesini iio_info -s ile
+# doğrulayın. EDS açılışta okuduğu seri numarasını DeviceInfo.serial / rapora yazar ve
+# kalibrasyonu cal/<seri>.json'dan yükler — yanlış eşleme raporda görünür.
+# NOT: SoapyPlutoSDR "serial" anahtarına göre FİLTRELEMEZ; args içine yalnızca
+# serial = "..." yazmak yanlış cihazı sessizce açabilir. Seçim URI ile yapılır.
+
+[[device]]
+name = "rx0"                      # "Pluto A" — referans eleman (dizi ekseninin başı); seri: <A seri no>
+backend = "soapy"
+profile = "ad9363_pluto"
+channels = [0]
+args = { driver = "plutosdr", uri = "usb:1.5.5" }
+control_uri = "ip:192.168.2.1"    # Pluto A config.txt: ipaddr = 192.168.2.1 (fabrika)
+
+[[device]]
+name = "rx1"                      # "Pluto B" — 2. eleman (+x yönünde, d = 0.15 m); seri: <B seri no>
+backend = "soapy"
+profile = "ad9363_pluto"
+channels = [0]
+args = { driver = "plutosdr", uri = "usb:1.6.5" }
+control_uri = "ip:192.168.3.1"    # Pluto B config.txt: ipaddr = 192.168.3.1, ipaddr_host = 192.168.3.10
+
+[rx]
+# 1 GHz'te λ = 0.2998 m → λ/2 = 0.15 m anten aralığı (belirsizliksiz ±90°).
+# Hedef 1.000 GHz'te, fc 500 kHz aşağıda: hedef DC çivisine ve imajına düşmez.
+center_freq_hz = 999.5e6
+# 2 cihaz × 4 MS/s × 4 B = 32 MB/s TOPLAM. Her Pluto kendi USB bağlantısındadır, ancak
+# ikisi AYNI USB 2.0 host denetleyicisini paylaşıyorsa toplam önemlidir (DeviceGroup
+# uyarır). Farklı kök portlara takın; "eds measure max_rate" ile doğrulayın.
+sample_rate_hz = 4e6
+bandwidth_hz = 4e6
+gain_mode = "manual"              # DF'de iki kanalın kazancı sabit ve eşit olmalı (AGC kapalı)
+gain_db = 50.0
+buffer_size = 65536
+block_size = 65536
+settle_buffers = -1
+stream_format = "CS16"
+dc_tracking = true
+rf_dc_tracking = true
+quad_tracking = true              # tracking güncellemeleri fazı az da olsa oynatır; kalibrasyonu tekrarlayın
+read_timeout_s = 2.0
+queue_blocks = 32
+
+[dsp]
+nfft = 4096
+window = "blackmanharris"
+overlap = 0.5
+averages = 16
+avg_mode = "mean"
+usable_fraction = 0.8
+dc_notch_bins = 3
+
+[detect]
+method = "os_cfar"
+pfa = 1e-6
+guard_bins = 4
+train_bins = 32
+os_rank = 0.75
+min_snr_db = 6.0
+merge_gap_bins = 2
+min_bw_bins = 1
+fixed_threshold = -80.0
+exclude_dc = true
+
+[agc]
+target_peak_dbfs = -10.0
+high_peak_dbfs = -3.0
+low_peak_dbfs = -35.0
+max_clip_fraction = 1e-5
+attack_step_db = 10.0
+decay_step_db = 3.0
+hold_blocks = 4
+
+[sweep]
+start_hz = 325e6
+stop_hz = 3.8e9
+sample_rate_hz = 20e6
+bandwidth_hz = 20e6
+nfft = 2048
+rbw_hz = 0.0
+averages = 4
+window = "blackmanharris"
+gain_mode = "fixed"
+gain_db = 50.0
+usable_fraction = 0.8
+dc_avoid = true
+settle_buffers = -1
+publish_max_points = 8192
+
+[bus]
+mode = "direct"                   # birden çok ayrı süreç yayıncısı için "proxy" (XSUB/XPUB vekil çalışmalı)
+pub_endpoint = "tcp://*:5555"
+sub_endpoint = "tcp://127.0.0.1:5555"
+proxy_frontend = "tcp://127.0.0.1:5550"
+proxy_backend = "tcp://127.0.0.1:5551"
+ctl_endpoints = []
+validate = false
+status_period_s = 1.0
+spectrum_rate_hz = 10.0
+spectrum_max_bins = 4096
+hwm = 200
+
+[cal]
+dir = ""
+# Ortak harici referansta iki cihazın ppm'i aynıdır; ppm bir kez ölçülüp ikisine de
+# uygulanır. Bağımsız TCXO'larda her cihaz kendi seri numaralı kalibrasyonunu kullanır.
+ppm_mode = "auto"
+use_power_cal = true
+temp_warn_delta_c = 5.0
+
+[measure]
+out_dir = ""
+targets_file = "ktr_targets.toml"
+# DF tezgahında iki Pluto da alıcıdır; uyaran harici sinyal üreteci (elle ayarlanır).
+# Faz kalibrasyonu: üreteç → 2'li bölücü (≈3.5 dB ekleme kaybı + kablo) → rx0/rx1.
+# Açı taraması: üreteç + anten, bilinen açılarda (döner tabla / ölçülü konumlar).
+# Laboratuvar üreteciniz LAN üzerinden SCPI destekliyorsa:
+#   source = "scpi" ; source_args = { host = "192.168.1.50", port = 5025, path_loss_db = 3.5 }
+source = "manual"
+source_args = { absolute_power = true, path_loss_db = 3.5 }
+
+[measure.params.df_rms]
+baseline_m = 0.15                 # rx0 → rx1 anten merkezleri arası (m); λ/2 @ 1 GHz

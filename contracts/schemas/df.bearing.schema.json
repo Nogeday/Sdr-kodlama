@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eds.invalid/contracts/schemas/df.bearing.schema.json",
+  "title": "df.bearing",
+  "description": "Yön bulma kestirimi (tespit başına). Faz-0: 2 elemanlı interferometre (2× Pluto); Faz-1: KrakenSDR (MUSIC). Açılar derece, (-180, 180]; azimut: broadside = 0°, dizi ekseni boyunca 2. elemana doğru pozitif.",
+  "allOf": [{"$ref": "envelope.schema.json"}],
+  "properties": {
+    "topic": {"const": "df.bearing"},
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["array", "method", "f_hz", "az_deg", "calibrated"],
+      "properties": {
+        "array": {"type": "string", "minLength": 1, "description": "Anten dizisi kimliği."},
+        "method": {"type": "string", "minLength": 1, "description": "interferometer2 | music | ..."},
+        "f_hz": {"$ref": "common.schema.json#/$defs/hz_pos"},
+        "az_deg": {"$ref": "common.schema.json#/$defs/angle_deg"},
+        "ambiguous_deg": {
+          "type": "array",
+          "items": {"$ref": "common.schema.json#/$defs/angle_deg"},
+          "description": "Diğer olası (grating lobe) azimut adayları (eds.df Bearing.ambiguous)."
+        },
+        "phase_deg": {"$ref": "common.schema.json#/$defs/angle_deg", "description": "Ölçülen (kalibrasyon sonrası) faz farkı."},
+        "coherence": {"$ref": "common.schema.json#/$defs/unit_interval"},
+        "quality": {"$ref": "common.schema.json#/$defs/unit_interval"},
+        "calibrated": {"type": "boolean", "description": "Kanal faz kalibrasyonu uygulandı mı."},
+        "t_acq_ns": {"$ref": "common.schema.json#/$defs/time_ns"}
+      }
+    }
+  }
+}

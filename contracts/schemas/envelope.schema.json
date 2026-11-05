@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eds.invalid/contracts/schemas/envelope.schema.json",
+  "title": "EDS bus zarfı (envelope) v1",
+  "description": "Her ZeroMQ mesajı multipart [topic (utf-8), JSON (utf-8)] çerçevesidir; JSON bu zarftır ve 'data' alanı topic'e özgü şemaya (<topic>.schema.json) uyar. ÖNEMLİ — büyük tamsayılar: '_ns' ile biten tüm alanlar (t_ns, t_acq_ns, t_acq_end_ns, t_proc_ns, t_start_ns, t_end_ns) Unix epoch nanosaniye tamsayılarıdır ve 2**53'ü (Number.MAX_SAFE_INTEGER) AŞAR. JavaScript tüketicileri bunları BigInt olarak ayrıştırmalıdır (ör. json-bigint ya da JSON.parse reviver'ında context.source) veya yalnızca t_ns/1e9 saniye (float, ~µs hassasiyet kaybıyla) kullanmalıdır; düz JSON.parse son hanelerini sessizce bozar. JSON'da NaN/Infinity yoktur: üretici sonlu olmayan değerleri null'a çevirir. $id URI'leri ağdan çözülmez (.invalid alanı, RFC 2606); şemalar yerel bir kayıt (registry) ile birbirine bağlanır.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["topic", "v", "src", "seq", "t_ns", "data"],
+  "properties": {
+    "topic": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$",
+      "description": "Topic adı; ZMQ topic çerçevesiyle birebir aynı olmalı (contracts/topics.json)."
+    },
+    "v": {
+      "type": "integer",
+      "const": 1,
+      "description": "Zarf sürümü."
+    },
+    "src": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "description": "Üretici kimliği (ör. cihaz adı 'rx0', 'measure', 'gui')."
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "(src, topic) başına 0'dan artan sıra numarası. Alıcıda boşluk = düşen mesaj (HWM); geri gitmesi = üretici yeniden başladı."
+    },
+    "t_ns": {
+      "$ref": "common.schema.json#/$defs/time_ns",
+      "description": "Yayın anı, time.time_ns() (duvar saati, Unix epoch ns). Uçtan uca gecikme = alış zamanı − t_ns. 2**53'ü aşar: JS'de BigInt."
+    },
+    "data": {
+      "type": "object",
+      "description": "Topic'e özgü yük; şeması <topic>.schema.json içindedir."
+    }
+  }
+}

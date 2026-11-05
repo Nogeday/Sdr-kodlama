@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eds.invalid/contracts/schemas/ctl.rx.schema.json",
+  "title": "ctl.rx",
+  "description": "RX düğümüne komut (olay). Her komut, aynı req_id ile bir ctl.ack üretir.",
+  "allOf": [{"$ref": "envelope.schema.json"}],
+  "properties": {
+    "topic": {"const": "ctl.rx"},
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["req_id", "target", "cmd"],
+      "properties": {
+        "req_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "İstek kimliği (ctl.ack ile eşleşir)."},
+        "target": {"type": "string", "minLength": 1, "description": "'*' (tüm RX düğümleri) ya da cihaz adı."},
+        "cmd": {
+          "enum": [
+            "ping", "set_center_freq", "set_gain", "set_gain_mode", "set_sample_rate",
+            "set_bandwidth", "sweep", "stop"
+          ]
+        },
+        "args": {"type": "object", "description": "Komut argümanları (birimler Hz / dB / s)."}
+      }
+    }
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eds.invalid/contracts/schemas/cal.result.schema.json",
+  "title": "cal.result",
+  "description": "Kalibrasyon sonucu (olay): ppm, güç, imaj bastırma, koherens, IQ; değerler ve nasıl uygulandığı.",
+  "allOf": [{"$ref": "envelope.schema.json"}],
+  "properties": {
+    "topic": {"const": "cal.result"},
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["device", "kind", "values", "t_ns"],
+      "properties": {
+        "device": {"type": "string", "minLength": 1},
+        "serial": {"type": "string", "description": "Kalibrasyonun bağlı olduğu cihaz seri numarası."},
+        "kind": {"enum": ["ppm", "power", "image_rejection", "coherence", "iq"]},
+        "values": {
+          "type": "object",
+          "description": "Türe özgü sonuçlar (ör. ppm: {ppm, std_ppm, f_measured_hz, f_ref_hz, snr_db, n, method}; power: {points: [[f_hz, gain_db, offset_db], ...]})."
+        },
+        "applied_via": {"type": "string", "description": "hardware | soapy | software | off | store (yalnızca kaydedildi) ..."},
+        "t_ns": {"$ref": "common.schema.json#/$defs/time_ns", "description": "Kalibrasyonun yapıldığı an."},
+        "temperature_c": {"type": ["number", "null"], "description": "Kalibrasyon sırasındaki cihaz sıcaklığı [°C] (bilinmiyorsa null)."}
+      }
+    }
+  }
+}
