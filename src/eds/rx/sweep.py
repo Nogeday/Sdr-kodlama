@@ -63,12 +63,57 @@ records its gain. Uncalibrated spectra are normalized to the reference gain
 gain stage. A ``calibrate`` callable that returns ``unit == "dBm"`` spectra makes the
 result absolute (no normalization, the calibration already includes the gain).
 
+RF front-end compression (``gain_mode = "auto"``)
+-------------------------------------------------
+Clipping is not the only overload. At low gain the AD936x LNA/mixer compress BEFORE the ADC
+clips (input P1dB ≈ 0 dBm at the band's minimum gain): a too-strong input then reads a
+normal, unclipped peak a few dB below full scale (≈ −5 dBFS at the minimum gain in the
+simulator), the gain loop above accepts it, and the stitched level — and the band power /
+SNR of its detections — is too low by the compression. After the gain loop a step is
+checked when its final capture
+
+* is at a gain within :data:`~eds.rx.agc.PROBE_STEP_DB` (6 dB) of the band's minimum gain,
+* has ``peak >= max(target_peak_dbfs, high_peak_dbfs − COMPRESSION_CHECK_MARGIN_DB)``
+  (−9 dBFS with the default ``[agc]``) and
+* is not clipped (``clip_fraction <= max_clip_fraction``; a clipped reading is useless for
+  the check and already reported by :attr:`SweepResult.clipped_steps`).
+
+Why these limits: higher gains make the ADC clip before the front end compresses (clipping
+is the gain loop's job); deep compression saturates the output near −5 dBFS at the minimum
+gain and closer to full scale 6 dB above it, and a tone compressed by ≥ 2 dB reads within
+≈ 1 dB of that saturation, so −9 dBFS keeps ≈ 3 dB margin. Steps outside the window — almost
+all of them — cost nothing extra. The check is :func:`~eds.rx.agc.gain_slope` (level change
+per dB of gain change between two unclipped captures of the same scene; a linear receiver
+gives 1.0): ``slope < COMPRESSION_SLOPE_MAX`` (0.85) = compressed. The pair is the step's
+own previous capture when the gain loop's last change was conclusive (no extra capture);
+otherwise ONE probe capture (settle + one buffer) is taken
+:data:`~eds.rx.agc.PROBE_STEP_DB` lower — or, closer than
+:data:`~eds.rx.agc.LINEARITY_MIN_STEP_DB` to the minimum, 3–6 dB higher (as far as 1 dB
+headroom of a linear signal allows; a compressed signal cannot reach full scale, a linear
+one that then clips only makes the probe inconclusive) — exactly as
+:meth:`~eds.rx.agc.GainController.settle` does. The gain is restored afterwards; the probe is
+never stitched, the step keeps its measured capture and gain.
+
+Each step records ``compressed`` (bool), ``gain_slope`` (float, or ``None`` when not
+checked / inconclusive) and ``probe_gain_db`` (gain of the probe capture, or ``None``). A
+compressed step's level is NOT corrected (the compression is unknown) — it is a lower
+bound: its bins lose the stitching against any non-compressed step covering the same
+frequency (the strong emitter compresses the whole composite, so weak signals of that step
+are desensitized as well), the bins it still provides are marked in
+:attr:`SweepResult.compressed_mask`, detections touching them are listed by
+:attr:`SweepResult.compressed_detections`, and :attr:`SweepResult.warnings` (Turkish) names
+every compressed step with its slope (and every auto-gain step that still clips). The
+remedy is an external attenuator; the gain is not changed further (it is already within
+6 dB of the minimum). Nothing is added to the published ``rx.sweep`` payload (closed
+contract); fixed-gain sweeps are never checked.
+
 Stitching
 ---------
 For every global bin the contributing step with the largest weight ``U/2 − |f_bb|``
 (distance to the usable edge, i.e. the step whose centre is nearest: flattest part of the
 analog low-pass and of the alias-free band) wins, considering only bins inside the usable
-band and outside the DC notch. The effective notch is ``max(dsp.dc_notch_bins,
+band and outside the DC notch (and, in auto gain, bins of compressed steps only where no
+uncompressed step covers the frequency). The effective notch is ``max(dsp.dc_notch_bins,
 window_terms − 1)``: a DC component leaks into exactly ``±(terms − 1)`` bins of a periodic
 cosine window (Blackman-Harris: ±3). Notch bins are used only where no other step covers the
 frequency (``dc_avoid = False``) and are then excluded from detection.
@@ -119,14 +164,15 @@ import numpy as np
 from ..core.config import AgcConfig, DetectConfig, DspConfig, SweepConfig
 from ..core.errors import ConfigError, MeasurementError, ProfileViolation
 from ..core.timeutil import mono, now_ns
+from ..core.types import GainRange
 from ..core.units import db10, fmt_hz, lin10
 from ..dsp.detect import Detection, detect
-from ..dsp.levels import iq_levels
+from ..dsp.levels import IQLevels, iq_levels
 from ..dsp.psd import NFFT_MAX, NFFT_MIN, Spectrum, nfft_for_rbw, welch
 from ..dsp.stats import effective_averages
 from ..dsp.windows import WINDOW_COEFFS, canonical_window_name, window_info
 from ..hal.base import RxDevice
-from .agc import GainController
+from .agc import COMPRESSION_SLOPE_MAX, LINEARITY_MIN_STEP_DB, PROBE_STEP_DB, GainController, gain_slope
 
 log = logging.getLogger(__name__)
 
@@ -149,6 +195,11 @@ DECIMATE_MODES: tuple[str, ...] = ("max", "mean", "min")
 _GAIN_TOL_DB = 1e-6
 #: clip fraction above which a one-shot auto-gain reading is useless (jump to minimum gain)
 AUTO_GAIN_OVERLOAD_CLIP: float = 1e-2
+#: Auto gain: a step ending within :data:`~eds.rx.agc.PROBE_STEP_DB` of the band's minimum gain
+#: with ``peak >= max(target_peak_dbfs, high_peak_dbfs - this)`` is checked for RF front-end
+#: compression (module docstring).
+COMPRESSION_CHECK_MARGIN_DB: float = 6.0
+_PROBE_HEADROOM_DB = 1.0        # upward probe: linear peak kept this far below FS (as in eds.rx.agc)
 _EPS_BINS = 1e-9
 
 
@@ -162,6 +213,31 @@ def _fmt_gain(g: float) -> str:
 def gain_referred_unit(gain_ref_db: float) -> str:
     """Unit label of a gain-normalized, uncalibrated sweep, e.g. ``"dBFS@50dB"``."""
     return f"dBFS@{_fmt_gain(gain_ref_db)}dB"
+
+
+def _compression_warning(step: dict[str, Any]) -> str:
+    slope = step["gain_slope"]
+    return (f"RF ön uç sıkışması: {fmt_hz(step['fc'], 7)} adımı (kazanç {_fmt_gain(step['gain_db'])} dB, tepe "
+            f"{float(step['peak_dbfs']):.1f} dBFS): seviye/kazanç eğimi {slope:.2f} dB/dB (doğrusal alıcıda 1.00, "
+            f"eşik {COMPRESSION_SLOPE_MAX:.2f}) — giriş çok güçlü, bu adımın seviyeleri gerçek değerin altında "
+            "(alt sınır); harici zayıflatıcı gerekli")
+
+
+def compression_probe_gain_db(gain_db: float, peak_dbfs: float, gr: GainRange) -> float | None:
+    """Gain of the one-capture compression probe of a step measured at ``gain_db`` with peak
+    ``peak_dbfs`` (same rule as :meth:`eds.rx.agc.GainController.settle`):
+    :data:`~eds.rx.agc.PROBE_STEP_DB` lower, or — when the band minimum is closer than
+    :data:`~eds.rx.agc.LINEARITY_MIN_STEP_DB` — higher by ``max(LINEARITY_MIN_STEP_DB,
+    min(PROBE_STEP_DB, -peak - 1 dB))`` rounded up to the gain step. ``None`` if no gain at
+    least ``LINEARITY_MIN_STEP_DB`` away exists in ``gr``."""
+    g = float(gain_db)
+    pg = gr.clamp(g - PROBE_STEP_DB)
+    if g - pg >= LINEARITY_MIN_STEP_DB - _GAIN_TOL_DB:
+        return pg
+    step = gr.step_db if gr.step_db > 0 else 1.0
+    room = max(LINEARITY_MIN_STEP_DB, min(PROBE_STEP_DB, -float(peak_dbfs) - _PROBE_HEADROOM_DB))
+    pg = gr.clamp(g + math.ceil(room / step - 1e-9) * step)
+    return pg if pg - g >= LINEARITY_MIN_STEP_DB - _GAIN_TOL_DB else None
 
 
 # =============================================================================== plan
@@ -237,7 +313,14 @@ class SweepResult:
     clean (non-DC) bin of some step; ``source_step`` the index of the step each bin came
     from (-1 = not covered, filled by interpolation). ``steps`` holds one record per step:
     ``fc, gain_db, t_tune, t_settle, t_capture, t_dsp, overflow`` (+ ``index, peak_dbfs,
-    clip_fraction, gain_iters, t_ns, bins_used``).
+    clip_fraction, gain_iters, t_ns, bins_used, compressed, gain_slope, probe_gain_db``).
+
+    RF front-end compression (auto gain, module docstring): ``compressed_mask`` marks the
+    bins that came from a compressed step (their level is a lower bound), and
+    :attr:`compressed_steps` / :attr:`compressed_detections` index the affected steps /
+    detections. ``warnings`` are Turkish, user-facing messages (compressed steps with their
+    slope, auto-gain steps that still clip). None of these is part of the published
+    ``rx.sweep`` payload.
     """
 
     f_hz: np.ndarray
@@ -268,6 +351,8 @@ class SweepResult:
     valid: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
     source_step: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
     threshold_db: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    compressed_mask: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def n_bins(self) -> int:
@@ -283,6 +368,30 @@ class SweepResult:
     def clipped_steps(self) -> list[int]:
         """Indices of steps whose final burst had clipped samples."""
         return [int(s["index"]) for s in self.steps if float(s.get("clip_fraction", 0.0)) > 0.0]
+
+    @property
+    def compressed_steps(self) -> list[int]:
+        """Indices of steps flagged as RF front-end compressed (auto gain only)."""
+        return [int(s["index"]) for s in self.steps if s.get("compressed")]
+
+    @property
+    def compressed_detections(self) -> list[int]:
+        """Indices into :attr:`detections` of detections that touch a compressed bin
+        (:attr:`compressed_mask` within ``[f_lo_hz, f_hi_hz]`` or at the peak): their peak,
+        band power and SNR are lower bounds."""
+        mask = self.compressed_mask
+        n = self.f_hz.size
+        if mask.size != n or n == 0 or not np.any(mask) or self.df_hz <= 0:
+            return []
+        f0, df = float(self.f_hz[0]), float(self.df_hz)
+        out = []
+        for k, d in enumerate(self.detections):
+            j0 = min(max(math.ceil((d.f_lo_hz - f0) / df - 1e-6), 0), n - 1)
+            j1 = min(max(math.floor((d.f_hi_hz - f0) / df + 1e-6), 0), n - 1)
+            jp = min(max(round((d.f_peak_hz - f0) / df), 0), n - 1)
+            if mask[jp] or (j1 >= j0 and np.any(mask[j0:j1 + 1])):
+                out.append(k)
+        return out
 
     def band_power_db(self, f_lo: float, f_hi: float) -> float:
         """``10 log10(sum P[k] / ENBW_bins)`` over grid bins in ``[f_lo, f_hi]`` (tone/channel
@@ -393,7 +502,7 @@ class _Stitcher:
         self.src = np.full(self.n, -1, dtype=np.int64)
         self.dc = np.zeros(self.n, dtype=bool)
 
-    def add(self, step: int, spec: Spectrum, offset_db: float) -> None:
+    def add(self, step: int, spec: Spectrum, offset_db: float, compressed: bool = False) -> None:
         a = np.abs(spec.dc_offset_bins)
         j = np.rint((spec.f_hz - self.start) / self.df).astype(np.int64)
         use = (a <= self.k_u) & (j >= 0) & (j < self.n)
@@ -404,6 +513,10 @@ class _Stitcher:
         w = (self.k_u - a).astype(np.float64)
         in_notch = a <= self.notch
         w[in_notch] -= 2.0 * (self.k_u + 1)          # notch bins lose against any clean bin
+        if compressed:
+            # weights of a compressed step's clean bins drop to [-(k_u+1), -1]: below every clean
+            # bin of an uncompressed step, still above every notch bin
+            w -= float(self.k_u + 1)
         better = w > self.w[j]
         jb = j[better]
         self.w[jb] = w[better]
@@ -434,8 +547,10 @@ class Sweeper:
 
     ``calibrate(spec) -> spec`` is applied to every step spectrum (default: identity, unit
     ``dBFS``); a result in ``dBm`` makes the sweep calibrated. ``agc`` configures the control
-    law of ``gain_mode = "auto"`` (default :class:`~eds.core.config.AgcConfig`). ``timeout_s``
-    is the read timeout of every flush/capture. Multi-channel devices are swept on channel 0.
+    law of ``gain_mode = "auto"`` (default :class:`~eds.core.config.AgcConfig`; its
+    ``target_peak_dbfs`` / ``high_peak_dbfs`` / ``max_clip_fraction`` also set the RF
+    compression check — module docstring). ``timeout_s`` is the read timeout of every
+    flush/capture. Multi-channel devices are swept on channel 0.
     """
 
     def __init__(self, device: RxDevice, cfg: SweepConfig, dsp: DspConfig, detect: DetectConfig,
@@ -549,6 +664,8 @@ class Sweeper:
         self._n_eff = effective_averages(self._averages, overlap, window, nfft)
         self._gain_ref = float(cfg.gain_db)
         self._auto = cfg.gain_mode == "auto"
+        a = self._agc_cfg
+        self._comp_peak_dbfs = max(float(a.target_peak_dbfs), float(a.high_peak_dbfs) - COMPRESSION_CHECK_MARGIN_DB)
 
     def _gain_span(self, start: float, stop: float) -> tuple[float, float]:
         prof = self._dev.profile
@@ -609,6 +726,13 @@ class Sweeper:
     @property
     def effective_averages(self) -> float:
         return self._n_eff
+
+    @property
+    def compression_check_peak_dbfs(self) -> float:
+        """Auto gain: peak (dBFS) from which a step near the minimum gain is checked for RF
+        front-end compression (``max(target_peak_dbfs, high_peak_dbfs -
+        COMPRESSION_CHECK_MARGIN_DB)``)."""
+        return self._comp_peak_dbfs
 
     def plan(self) -> list[float]:
         """Step centre frequencies (Hz), ascending, all within the profile's official range."""
@@ -693,6 +817,62 @@ class Sweeper:
             raise ConfigError(f"calibrate birimi 'dBm' ya da 'dBFS' olmalı, {out.unit!r} döndürdü")
         return out
 
+    # ------------------------------------------------------------------ RF compression (auto gain)
+    def _needs_compression_check(self, lv: IQLevels, g: float, gr: GainRange) -> bool:
+        """Final capture near the top of the input range: within PROBE_STEP_DB of the band's
+        minimum gain, peak >= :attr:`compression_check_peak_dbfs`, not clipped."""
+        return (g <= gr.min_db + PROBE_STEP_DB + _GAIN_TOL_DB
+                and lv.peak_dbfs >= self._comp_peak_dbfs
+                and lv.clip_fraction <= float(self._agc_cfg.max_clip_fraction))
+
+    def _compression_slope(self, lv: IQLevels, g: float, gr: GainRange, prev: tuple[IQLevels, float] | None,
+                           ) -> tuple[float | None, float | None, float, float]:
+        """``(slope, probe_gain_db, t_settle, t_capture)`` of the compression check of a step
+        measured at ``g`` with levels ``lv``: the gain loop's own last pair ``prev`` when it is
+        conclusive, else one probe capture (:func:`compression_probe_gain_db`) after which the
+        gain is restored to ``g``. ``slope`` is None when inconclusive."""
+        if prev is not None:
+            slope = gain_slope(prev[0], prev[1], lv, g, self._agc_cfg)
+            if slope is not None:
+                return slope, None, 0.0, 0.0
+        pg = compression_probe_gain_db(g, lv.peak_dbfs, gr)
+        if pg is None:
+            return None, None, 0.0, 0.0
+        dev, to = self._dev, self._timeout_s
+        ts = mono()
+        t_capture = 0.0
+        try:
+            dev.set_gain(pg)
+            dev.flush(to)
+            tc = mono()
+            blk = dev.capture(self._buffer_size, to)        # one aligned buffer, never stitched
+            t_capture = mono() - tc
+        finally:
+            dev.set_gain(g)                                 # the step keeps its measured gain
+        t_settle = mono() - ts - t_capture
+        plv = iq_levels(blk.samples[0, :self._n_cap], blk.clip_level)
+        probe_g = float(blk.gain_db[0])
+        return gain_slope(lv, g, plv, probe_g, self._agc_cfg), probe_g, t_settle, t_capture
+
+    def _warnings(self, steps: list[dict[str, Any]]) -> list[str]:
+        """User-facing (Turkish) warnings: ADC clipping in every mode (a clipped capture spreads
+        clipping harmonics over the spectrum and the CFAR reports them as false detections);
+        in auto-gain mode also the RF-compressed steps."""
+        lim = float(self._agc_cfg.max_clip_fraction)
+        if not self._auto:
+            return [f"ADC kırpması: {fmt_hz(s['fc'], 7)} adımı sabit kazançla kırpıyor (kazanç "
+                    f"{_fmt_gain(s['gain_db'])} dB, kırpılan örnek oranı {float(s['clip_fraction']):.1e}) — "
+                    "bu adımın seviyeleri geçersiz ve kırpma harmonikleri sahte tespit üretir; "
+                    'sweep.gain_mode = "auto" kullanın ya da sweep.gain_db\'yi düşürün'
+                    for s in steps if float(s["clip_fraction"]) > lim]
+        out = [_compression_warning(s) for s in steps if s["compressed"]]
+        for s in steps:
+            if float(s["clip_fraction"]) > lim:
+                out.append(f"ADC kırpması: {fmt_hz(s['fc'], 7)} adımı otomatik kazançla da kırpıyor (kazanç "
+                           f"{_fmt_gain(s['gain_db'])} dB, kırpılan örnek oranı {float(s['clip_fraction']):.1e}) — "
+                           "giriş çok güçlü, bu adımın seviyeleri geçersiz; harici zayıflatıcı gerekli")
+        return out
+
     def _sweep(self, centers: list[float], on_step: OnStep | None) -> SweepResult:
         dev = self._dev
         to = self._timeout_s
@@ -715,6 +895,7 @@ class Sweeper:
             dev.flush(to)
             t_tune, t_settle, t_capture = tb - ta, mono() - tb, 0.0
             iters = 0
+            prev: tuple[IQLevels, float] | None = None          # capture before the last gain change
             while True:
                 tc = mono()
                 blk = dev.capture(self._buffer_size, to)        # exactly one (aligned) buffer
@@ -736,9 +917,18 @@ class Sweeper:
                         dev.flush(to)
                         t_settle += mono() - ts
                         iters += 1
+                        prev = (lv, g)
                         continue
                 break
             gain = g
+            compressed, slope, probe_g = False, None, None
+            if self._auto:
+                gr = dev.gain_range(fc)
+                if self._needs_compression_check(lv, g, gr):
+                    slope, probe_g, dts, dtc = self._compression_slope(lv, g, gr, prev)
+                    t_settle += dts
+                    t_capture += dtc
+                    compressed = slope is not None and slope < COMPRESSION_SLOPE_MAX
             td = mono()
             spec = welch(x, blk.fs, self._nfft, self._window, self._overlap, "mean", fc=blk.fc, t_ns=blk.t_ns)
             spec.gain_db = (g,)
@@ -752,13 +942,16 @@ class Sweeper:
                 calibrated = cal
             elif calibrated != cal:
                 raise MeasurementError("calibrate tutarsız: bazı adımlar dBm, bazıları dBFS döndürdü")
-            stitch.add(i, spec, 0.0 if cal else self._gain_ref - g)
+            stitch.add(i, spec, 0.0 if cal else self._gain_ref - g, compressed=compressed)
             t_dsp = mono() - td
             step = {"index": i, "fc": float(dev.fc), "gain_db": g, "t_tune": t_tune, "t_settle": t_settle,
                     "t_capture": t_capture, "t_dsp": t_dsp, "overflow": bool(blk.overflow),
                     "peak_dbfs": float(lv.peak_dbfs), "clip_fraction": float(lv.clip_fraction),
-                    "gain_iters": iters, "t_ns": int(blk.t_ns)}
+                    "gain_iters": iters, "t_ns": int(blk.t_ns), "compressed": bool(compressed),
+                    "gain_slope": None if slope is None else float(slope), "probe_gain_db": probe_g}
             steps.append(step)
+            if compressed:      # INFO: the user-facing text is SweepResult.warnings (callers print it)
+                log.info("%s: %s", dev.name, _compression_warning(step))
             tot["tune_s"] += t_tune
             tot["settle_s"] += t_settle
             tot["capture_s"] += t_capture
@@ -781,6 +974,9 @@ class Sweeper:
         used = np.bincount(src[src >= 0], minlength=len(centers))
         for s in steps:
             s["bins_used"] = int(used[s["index"]])
+        step_comp = np.array([bool(s["compressed"]) for s in steps], dtype=bool)
+        comp_mask = np.zeros(src.size, dtype=bool)
+        comp_mask[src >= 0] = step_comp[src[src >= 0]]
         timing = dict(tot)
         timing["other_s"] = max(duration - sum(tot.values()), 0.0)
         return SweepResult(
@@ -791,5 +987,5 @@ class Sweeper:
             sweep_id=self._sweep_id, start_hz=self._start, stop_hz=self._stop, df_hz=self._df, fs_hz=self._fs,
             nfft=self._nfft, window=self._window, enbw_bins=self._enbw, averages=self._averages,
             gain_ref_db=self._gain_ref, gain_mode=self._cfg.gain_mode, valid=valid, source_step=src,
-            threshold_db=threshold_db,
+            threshold_db=threshold_db, compressed_mask=comp_mask, warnings=self._warnings(steps),
         )

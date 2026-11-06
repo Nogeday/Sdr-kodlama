@@ -11,11 +11,21 @@ import math
 import numpy as np
 import pytest
 
-from eds.core.config import AppConfig, DetectConfig, DeviceConfig, DspConfig, SimConfig, SweepConfig
+from eds.core.config import (
+    AgcConfig,
+    AppConfig,
+    DetectConfig,
+    DeviceConfig,
+    DspConfig,
+    SimConfig,
+    SweepConfig,
+)
 from eds.core.errors import ConfigError, MeasurementError, ProfileViolation
+from eds.core.types import GainRange
 from eds.hal import open_device
 from eds.rx import Sweeper, SweepResult, gain_referred_unit, plan_coverage, plan_offsets
-from eds.rx.sweep import BUFFER_GRANULE, MIN_BUFFER_SIZE
+from eds.rx.agc import COMPRESSION_SLOPE_MAX, PROBE_STEP_DB
+from eds.rx.sweep import BUFFER_GRANULE, MIN_BUFFER_SIZE, compression_probe_gain_db
 
 # --------------------------------------------------------------------------- helpers
 # eds.hal.factory caches one SimWorld per id(AppConfig); keeping every AppConfig alive for
@@ -334,6 +344,230 @@ def test_auto_gain_handles_a_strong_emitter_without_clipping():
     assert abs(tone_power(r, f_weak) - dev.level_dbfs(-100.0, 50.0)) <= 1.0
     assert detection_near(r, f_big, r.rbw_hz) is not None
     assert detection_near(r, f_weak, r.rbw_hz) is not None
+    assert r.compressed_steps == [] and r.warnings == [] and not r.compressed_mask.any()
+
+
+# --------------------------------------------------------------------------- RF front-end compression
+# 880-940 MHz band (gain -1..73 dB), emitter 2.1 MHz above the centre of step 3; with the 50 %
+# step overlap it lies in the usable band of steps 3 and 4.
+COMP_BAND = {"start_hz": 880e6, "stop_hz": 940e6}
+
+
+def _comp_freq(k: int = 3) -> tuple[float, list[float]]:
+    """Emitter frequency 2.1 MHz above the centre of step ``k`` and the step plan."""
+    plan = Sweeper(make_device(), SweepConfig(**COMP_BAND), DspConfig(), DetectConfig()).plan()
+    return plan[k] + 2.1e6, plan
+
+
+def fmt_mhz(f: float) -> str:
+    return f"{f / 1e6:.7g} MHz"
+
+
+def _count_captures(dev) -> list[tuple[float, float]]:
+    """Record ``(fc, gain)`` of every :meth:`capture` call of ``dev``."""
+    calls: list[tuple[float, float]] = []
+    orig = dev.capture
+
+    def capture(n, *a, **kw):
+        blk = orig(n, *a, **kw)
+        calls.append((float(dev.fc), float(blk.gain_db[0])))
+        return blk
+
+    dev.capture = capture
+    return calls
+
+
+def _expected_captures(r: SweepResult) -> int:
+    return sum(1 + s["gain_iters"] + (s["probe_gain_db"] is not None) for s in r.steps)
+
+
+def test_auto_gain_flags_rf_compression_of_a_too_strong_emitter():
+    f_e, plan = _comp_freq()
+    dev = make_device([cw("near", f_e, 3.0)])                    # +3 dBm at the RX input
+    calls = _count_captures(dev)
+    sw = Sweeper(dev, SweepConfig(**COMP_BAND, gain_mode="auto"), DspConfig(), DetectConfig())
+    r = sw.run()
+    gmin = dev.profile.gain_range(f_e).min_db
+    assert dev.compression_db(3.0, gmin) > 2.0                   # ground truth: compressed even at minimum gain
+    # the steps holding the emitter end at the minimum gain WITHOUT clipping, a few dB below
+    # full scale: by level alone they would pass as a good reading
+    assert r.compressed_steps == [3, 4]
+    for k in (3, 4):
+        s = r.steps[k]
+        assert s["gain_db"] == gmin and s["clip_fraction"] == 0.0 and -8.0 < s["peak_dbfs"] < -3.0
+        assert s["compressed"] is True and s["gain_slope"] < COMPRESSION_SLOPE_MAX
+        assert s["gain_slope"] == pytest.approx(0.80, abs=0.05)
+        assert s["probe_gain_db"] is not None and s["probe_gain_db"] - gmin >= 3.0      # upward probe
+    for s in r.steps:
+        if s["index"] not in (3, 4):
+            assert s["compressed"] is False and s["gain_slope"] is None and s["probe_gain_db"] is None
+    assert len(calls) == _expected_captures(r) == sum(1 + s["gain_iters"] for s in r.steps) + 2
+    # the probe is never stitched and the gain is restored: the device ends at the last step's gain
+    assert dev.gains[0] == r.steps[-1]["gain_db"]
+    # the level is NOT presented as valid: it is ~ the compression too low and flagged
+    lin = dev.level_dbfs(3.0, 50.0)
+    assert tone_power(r, f_e) < lin - 1.5
+    j = int(np.argmin(np.abs(r.f_hz - f_e)))
+    assert r.compressed_mask[j] and r.source_step[j] in (3, 4)
+    d = detection_near(r, f_e, r.rbw_hz)
+    assert d is not None and r.detections.index(d) in r.compressed_detections
+    assert set(np.unique(r.source_step[r.compressed_mask]).tolist()) <= {3, 4}
+    assert not r.compressed_mask[r.source_step == 2].any()
+    # bins that step 3 would win by distance but uncompressed step 2 also covers come from step 2
+    f_mid = plan[3] - 3.0e6                                      # 3 MHz from step 3, 5 MHz from step 2
+    jm = int(np.argmin(np.abs(r.f_hz - f_mid)))
+    assert r.source_step[jm] == 2 and not r.compressed_mask[jm] and r.valid[jm]
+    # Turkish warnings name every compressed step with its slope
+    assert len(r.warnings) == 2
+    for k, w in zip((3, 4), r.warnings):
+        assert w.startswith("RF ön uç sıkışması") and fmt_mhz(r.steps[k]["fc"]) in w
+        assert f"{r.steps[k]['gain_slope']:.2f} dB/dB" in w and "zayıflatıcı" in w
+    # the published payload is unchanged (closed rx.sweep contract)
+    pytest.importorskip("jsonschema")
+    from eds.bus.validate import validate_data
+
+    validate_data("rx.sweep", r.to_bus_payload("rx0", max_points=1000))
+
+
+def test_strong_but_linear_emitter_near_minimum_gain_is_probed_not_flagged():
+    # -2 dBm: minimum gain, peak -8.5 dBFS (inside the check window), < 0.5 dB compression
+    f_e, _ = _comp_freq()
+    dev = make_device([cw("near", f_e, -2.0)])
+    calls = _count_captures(dev)
+    r = Sweeper(dev, SweepConfig(**COMP_BAND, gain_mode="auto"), DspConfig(), DetectConfig()).run()
+    assert r.compressed_steps == [] and r.warnings == [] and r.compressed_detections == []
+    probed = [s for s in r.steps if s["probe_gain_db"] is not None]
+    assert [s["index"] for s in probed] == [3, 4]
+    assert all(s["gain_slope"] > COMPRESSION_SLOPE_MAX for s in probed)
+    assert len(calls) == _expected_captures(r)
+    assert abs(tone_power(r, f_e) - dev.level_dbfs(-2.0, 50.0)) <= 1.0
+
+
+def test_moderate_emitter_is_not_flagged_and_costs_no_extra_capture():
+    # -30 dBm: the gain loop settles 26 dB above the minimum -> no compression check at all
+    f_e, _ = _comp_freq()
+    dev = make_device([cw("mid", f_e, -30.0)])
+    calls = _count_captures(dev)
+    sw = Sweeper(dev, SweepConfig(**COMP_BAND, gain_mode="auto"), DspConfig(), DetectConfig())
+    r = sw.run()
+    assert r.compressed_steps == [] and r.warnings == [] and not r.compressed_mask.any()
+    assert r.compressed_detections == []
+    assert all(s["compressed"] is False and s["gain_slope"] is None and s["probe_gain_db"] is None for s in r.steps)
+    gmin = dev.profile.gain_range(f_e).min_db
+    assert all(s["gain_db"] > gmin + PROBE_STEP_DB for s in r.steps)
+    # overhead: exactly one capture per step plus one per gain change
+    assert len(calls) == sum(1 + s["gain_iters"] for s in r.steps)
+    assert abs(tone_power(r, f_e) - dev.level_dbfs(-30.0, 50.0)) <= 0.5
+    assert detection_near(r, f_e, r.rbw_hz) is not None
+
+
+def test_compression_check_reuses_the_gain_loops_own_pair():
+    # start gain 5 dB: the +3 dBm emitter in step 0 reads -0.9 dBFS (compressed, unclipped) ->
+    # the loop drops to the minimum; that natural 6 dB pair already shows the slope, no probe
+    f_e, _ = _comp_freq(k=0)
+    dev = make_device([cw("near", f_e, 3.0)])
+    calls = _count_captures(dev)
+    r = Sweeper(dev, SweepConfig(**COMP_BAND, gain_mode="auto", gain_db=5.0), DspConfig(), DetectConfig()).run()
+    s0 = r.steps[0]
+    assert s0["compressed"] is True and s0["gain_iters"] == 1 and s0["probe_gain_db"] is None
+    assert s0["gain_slope"] < COMPRESSION_SLOPE_MAX
+    assert [c for c in calls if c[0] == s0["fc"]] == [(s0["fc"], 5.0), (s0["fc"], -1.0)]
+    assert len(calls) == _expected_captures(r)
+    assert 0 in r.compressed_steps and r.unit == "dBFS@5dB"
+
+
+def test_fixed_gain_sweeps_are_never_checked_for_compression():
+    f_e, _ = _comp_freq()
+    for g in (50.0, -1.0):          # 50 dB: the ADC clips; -1 dB: compressed, but fixed gain is not checked
+        dev = make_device([cw("near", f_e, 3.0)])
+        calls = _count_captures(dev)
+        r = Sweeper(dev, SweepConfig(**COMP_BAND, gain_db=g), DspConfig(), DetectConfig()).run()
+        assert len(calls) == r.n_steps                          # one capture per step, as before
+        assert all(s["compressed"] is False and s["gain_slope"] is None and s["probe_gain_db"] is None
+                   for s in r.steps)
+        assert r.compressed_steps == [] and not r.compressed_mask.any()
+        assert r.compressed_detections == []
+        assert all(s["gain_db"] == g for s in r.steps)
+        # no compression warning in fixed mode; clipping (only at 50 dB) is always reported
+        assert not any("SIKIŞMA" in w or "sıkış" in w.lower() for w in r.warnings)
+        if g == -1.0:
+            assert r.warnings == []
+
+
+def test_fixed_gain_sweep_warns_about_adc_clipping():
+    """A strong signal at a fixed high gain clips the ADC; the clipping harmonics show up as
+    many false detections, so every clipped step must be reported (was silent before)."""
+    f_e, _ = _comp_freq()
+    dev = make_device([cw("near", f_e, 3.0)])
+    r = Sweeper(dev, SweepConfig(**COMP_BAND, gain_db=50.0), DspConfig(), DetectConfig()).run()
+    assert r.clipped_steps, "a +3 dBm tone at 50 dB gain must clip"
+    clip_warns = [w for w in r.warnings if w.startswith("ADC kırpması") and "sabit kazanç" in w]
+    lim = AgcConfig().max_clip_fraction
+    assert len(clip_warns) == sum(1 for s in r.steps if s["clip_fraction"] > lim) >= 1
+    assert 'gain_mode = "auto"' in clip_warns[0]
+    # a weak scene at the same gain stays silent
+    quiet = Sweeper(make_device([cw("weak", f_e, -60.0)]), SweepConfig(**COMP_BAND, gain_db=50.0),
+                    DspConfig(), DetectConfig()).run()
+    assert quiet.warnings == [] and quiet.clipped_steps == []
+
+
+def test_auto_gain_warns_about_steps_that_still_clip():
+    # without the front-end compression model +10 dBm clips the ADC even at the minimum gain
+    f_e, _ = _comp_freq()
+    dev = make_device([cw("near", f_e, 10.0)], rf_compression=False)
+    r = Sweeper(dev, SweepConfig(**COMP_BAND, gain_mode="auto"), DspConfig(), DetectConfig()).run()
+    assert 3 in r.clipped_steps and r.compressed_steps == []
+    clip_warns = [w for w in r.warnings if w.startswith("ADC kırpması")]
+    assert len(clip_warns) == len(r.clipped_steps) and fmt_mhz(r.steps[3]["fc"]) in clip_warns[0]
+
+
+def test_compression_probe_gain_follows_the_agc_rule():
+    gr = GainRange(-1.0, 73.0, 1.0)
+    assert compression_probe_gain_db(10.0, -5.0, gr) == 10.0 - PROBE_STEP_DB      # room below: 6 dB down
+    assert compression_probe_gain_db(3.0, -5.0, gr) == -1.0                      # 4 dB down (>= 3 dB)
+    assert compression_probe_gain_db(-1.0, -5.6, gr) == 4.0                     # up: ceil(5.6 - 1) dB
+    assert compression_probe_gain_db(-1.0, -2.0, gr) == 2.0                     # up: at least 3 dB
+    assert compression_probe_gain_db(-1.0, -20.0, gr) == 5.0                    # up: at most 6 dB
+    assert compression_probe_gain_db(0.0, -5.0, GainRange(0.0, 2.0, 1.0)) is None
+
+
+def test_eds_sweep_cli_prints_compression_warnings(tmp_path, capsys):
+    import json
+
+    from eds.cli.main import main
+
+    f_e, _ = _comp_freq()
+    cfg = tmp_path / "eds.toml"
+    cfg.write_text(f"""
+[[device]]
+name = "rx0"
+backend = "sim"
+profile = "ad9363_pluto"
+sim = {{ ppm = 0.0, realtime = false }}
+
+[sweep]
+start_hz = 880e6
+stop_hz = 940e6
+gain_mode = "auto"
+
+[cal]
+dir = "{(tmp_path / 'cal').as_posix()}"
+
+[[sim.emitters]]
+name = "near"
+kind = "cw"
+freq_hz = {f_e!r}
+power_dbm = 3.0
+""", encoding="utf-8")
+    npz = tmp_path / "s.npz"
+    assert main(["-c", str(cfg), "sweep", "--out", str(npz)]) == 0
+    cap = capsys.readouterr()
+    assert "SIKIŞMA" in cap.out and "Not" in cap.out
+    assert cap.err.count("UYARI: RF ön uç sıkışması") == 2 and "işaretli" in cap.err
+    meta = json.loads(str(np.load(npz)["meta"].item()))
+    assert [s["index"] for s in meta["compressed_steps"]] == [3, 4] and len(meta["warnings"]) == 2
+    flagged = [meta["detections"][k] for k in meta["compressed_detections"]]
+    assert any(abs(d["f_peak_hz"] - f_e) <= meta["rbw_hz"] for d in flagged)
 
 
 # --------------------------------------------------------------------------- timing / bookkeeping

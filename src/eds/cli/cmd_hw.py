@@ -277,8 +277,10 @@ def _sweep_figure(res: Any, title: str, serial: str, ppm_via: str) -> Any:
     scale, unit = (1e9, "GHz") if res.stop_hz >= 1e9 and span >= 500e6 else (1e6, "MHz")
     top = float(np.max(p)) if p.size else 0.0
     ref = 10.0 * math.ceil((top + 5.0) / 10.0)
-    dets = sorted(res.detections, key=lambda d: d.peak_db, reverse=True)[:5]
-    markers = [(d.f_peak_hz / scale, d.peak_db, f"SNR {d.snr_db:.1f} dB") for d in dets]
+    comp = set(res.compressed_detections)
+    order = sorted(range(len(res.detections)), key=lambda k: res.detections[k].peak_db, reverse=True)[:5]
+    markers = [(res.detections[k].f_peak_hz / scale, res.detections[k].peak_db,
+                f"SNR {res.detections[k].snr_db:.1f} dB" + (" SIKIŞMA" if k in comp else "")) for k in order]
     info = {
         "Ref": f"{ref:.0f} {res.unit}", "RBW": fmt_hz(res.rbw_hz), "Avg": str(res.averages),
         "Span": fmt_hz(span), "Center": fmt_hz(0.5 * (res.start_hz + res.stop_hz)),
@@ -286,6 +288,9 @@ def _sweep_figure(res: Any, title: str, serial: str, ppm_via: str) -> Any:
         "Start": fmt_hz(res.start_hz, 9), "Stop": fmt_hz(res.stop_hz, 9),
         "version": __version__, "date": iso_utc(now_ns()), "serial": serial,
     }
+    if res.compressed_steps:
+        fcs = ", ".join(f"{res.steps[i]['fc'] / 1e6:.3f}" for i in res.compressed_steps)
+        info["flags"] = f"RF ÖN UÇ SIKIŞMASI ({fcs} MHz adımları): seviyeler alt sınır — harici zayıflatıcı gerekli"
     return FigureSpec(name="sweep", title=f"{title} — {res.window}, ppm {ppm_via}", kind="spectrum",
                       series=[Series(x=(f / scale).tolist(), y=p.tolist(), label=res.unit)],
                       xlabel=f"Frekans [{unit}]", ylabel=f"Seviye [{res.unit}]", markers=markers, info=info,
@@ -301,6 +306,11 @@ def _sweep_meta(res: Any, dev_desc: dict[str, Any], ppm_via: str) -> dict[str, A
         "gain_mode": res.gain_mode, "n_steps": res.n_steps, "step_hz": res.step_hz, "duration_s": res.duration_s,
         "rate_hz_per_s": res.rate_hz_per_s, "timing": res.timing, "ppm_via": ppm_via,
         "detections": [d.to_dict() for d in res.detections], "device": dev_desc,
+        # RF front-end compression (auto gain): indices into "detections" / step centres + slopes
+        "compressed_detections": res.compressed_detections,
+        "compressed_steps": [{"index": int(s["index"]), "fc_hz": s["fc"], "gain_db": s["gain_db"],
+                              "gain_slope": s["gain_slope"]} for s in res.steps if s.get("compressed")],
+        "warnings": list(res.warnings),
     })
 
 
@@ -349,12 +359,26 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     print(f"Tarama süresi {res.duration_s:.3f} s → hız {res.rate_hz_per_s / 1e9:.4g} GHz/s "
           f"({res.n_steps} adım; tune {t['tune_s']:.3f} s, settle {t['settle_s']:.3f} s, yakalama {t['capture_s']:.3f} s, "
           f"DSP {t['dsp_s']:.3f} s); birim {res.unit}, gürültü tabanı {res.noise_floor_db:.1f} {res.unit}")
-    rows = [[i + 1, f"{d.f_peak_hz / 1e6:.6f}", f"{d.bw_hz / 1e3:.1f}", f"{d.peak_db:.1f}", f"{d.band_power_db:.1f}",
-             f"{d.snr_db:.1f}"] for i, d in enumerate(sorted(res.detections, key=lambda d: d.f_peak_hz))]
+    comp = set(res.compressed_detections)
+    order = sorted(range(len(res.detections)), key=lambda k: res.detections[k].f_peak_hz)
+    rows = []
+    for i, k in enumerate(order):
+        d = res.detections[k]
+        rows.append([i + 1, f"{d.f_peak_hz / 1e6:.6f}", f"{d.bw_hz / 1e3:.1f}", f"{d.peak_db:.1f}",
+                     f"{d.band_power_db:.1f}", f"{d.snr_db:.1f}"] + (["SIKIŞMA" if k in comp else ""] if comp else []))
     print(f"{len(rows)} tespit:")
     if rows:
-        print_table(["#", "Tepe [MHz]", "BW [kHz]", f"Tepe [{res.unit}]", f"Bant gücü [{res.unit}]", "SNR [dB]"],
-                    rows, right=range(6))
+        print_table(["#", "Tepe [MHz]", "BW [kHz]", f"Tepe [{res.unit}]", f"Bant gücü [{res.unit}]", "SNR [dB]"]
+                    + (["Not"] if comp else []), rows, right=range(6))
+    if res.warnings:
+        # after the table, on stderr: the last thing the operator sees, also when stdout is redirected
+        print("=" * 78, file=sys.stderr)
+        for w in res.warnings:
+            print(f"UYARI: {w}", file=sys.stderr)
+        if comp:
+            print(f"UYARI: 'SIKIŞMA' işaretli {len(comp)} tespit sıkışmış adımlardan geliyor: tepe / bant gücü / SNR "
+                  "gerçek değerin ALTINDA (alt sınır). Harici zayıflatıcı takıp yeniden tarayın.", file=sys.stderr)
+        print("=" * 78, file=sys.stderr)
     if args.out:
         out = Path(args.out)
         if out.suffix.lower() != ".npz":

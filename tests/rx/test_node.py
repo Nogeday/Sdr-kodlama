@@ -339,6 +339,31 @@ def test_sweep_command_publishes_valid_rx_sweep_and_restores_pipeline(bus, tmp_p
         node.stop()
 
 
+def test_sweep_quality_warnings_reach_ack_and_rx_status(bus, tmp_path):
+    """rx.sweep is a closed contract, so clipping/compression warnings of a ctl sweep must
+    reach the GUI through the ctl.ack result and the rx.status warnings."""
+    strong = [{"name": "jam", "kind": "cw", "freq_hz": F_CW, "power_dbm": -25.0}]   # clips at 50 dB fixed gain
+    node = RxNode(make_app(True, strong, tmp_cal=str(tmp_path)), publisher=bus.pub)
+    node.start()
+    try:
+        assert bus.wait(lambda m: m.topic == T.RX_STATUS) is not None
+        a = node.handle_command({"req_id": "s1", "target": "*", "cmd": "sweep",
+                                 "args": {"start_hz": 900e6, "stop_hz": 930e6, "gain_mode": "fixed",
+                                          "gain_db": 50.0}})
+        assert a["ok"], a
+        r = a["result"]
+        assert r["clipped_steps"] and any(w.startswith("ADC kırpması") for w in r["warnings"])
+        validate_message(T.CTL_ACK, {"topic": T.CTL_ACK, "v": 1, "src": "rx0", "seq": 0, "t_ns": 1,
+                                     "data": {"req_id": "s1", "target": "rx0", "cmd": "sweep", "ok": True,
+                                              "error": None, "result": r}})
+        st = bus.wait(lambda m: m.topic == T.RX_STATUS
+                      and any("ADC kırpması" in w for w in m.data.get("warnings", [])))
+        assert st is not None, "rx.status must carry the sweep clipping warning"
+        validate_message(st.topic, st.env)
+    finally:
+        node.stop()
+
+
 @pytest.mark.realtime
 def test_soft_agc_reduces_gain_on_clipping_emitter(bus, tmp_path):
     strong = [{"name": "jam", "kind": "cw", "freq_hz": F_CW, "power_dbm": -25.0}]   # +20 dBFS at 50 dB: clips

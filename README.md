@@ -37,10 +37,25 @@ Rapor: reports/20261105-201723   (report.html, summary.md/.csv, results.json, ta
 
 ## 1. Hızlı başlangıç (Linux ve Windows)
 
-> 📘 **Adım adım, görsel kurulum rehberi:** [`docs/KURULUM.md`](docs/KURULUM.md) — Linux, Windows,
-> WSL2, Pluto bağlantısı, sorun giderme.
+Takıma yeni katıldıysanız bu iki rehberi **sırayla** izleyin. İkisi de Türkçe, adım adım ve
+ekran görüntülüdür; her adımda ne yaptığınızı, neden yaptığınızı ve başarılı olunca ne
+göreceğinizi anlatır:
 
-Önerilen yol her iki işletim sisteminde de aynıdır: [Miniforge](https://github.com/conda-forge/miniforge)
+| Sıra | Rehber | İçerik | Süre |
+|---|---|---|---|
+| 1 | 📘 **[Kurulum Rehberi — `docs/KURULUM.md`](docs/KURULUM.md)** | Miniforge (conda) kurulumu, depo, `eds` ortamı, doğrulama ve testler; Linux ve Windows ayrı ayrı; Pluto USB izni/sürücüsü; WSL2; sorun giderme; güncelleme ve kaldırma | ~20 dk |
+| 2 | 📗 **[Kullanım Rehberi — `docs/KULLANIM.md`](docs/KULLANIM.md)** | Konfigürasyon dosyası, RX düğümü ve ZeroMQ bus, geniş bant tarama (otomatik kazanç ve RF sıkışma uyarısı dahil), kalibrasyon, 9 KTR ölçümü ve raporu okumak, kendi programından bus'a bağlanmak, kontrol listeleri | okudukça |
+
+Diğer belgeler (ihtiyaç oldukça):
+
+| Belge | Ne zaman okunur |
+|---|---|
+| [`docs/HARDWARE_PLUTO.md`](docs/HARDWARE_PLUTO.md) | Pluto tezgâhı: iki Pluto, seri no ile seçim, harici referans, `xo_correction`, overflow algılama, TX artefaktları, güvenlik |
+| [`docs/MEASUREMENTS.md`](docs/MEASUREMENTS.md) | 9 KTR ölçümünün tanımı, yöntemi, tezgâh kurulumu ve KTR'de nasıl yazılacağı |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Kod yapısı, modül arayüzleri, konvansiyonlar (PSD ölçekleme, dBFS, ppm işareti, birimler) |
+| [`examples/`](examples) | Bus'ı dinleyen ve komut gönderen küçük örnek programlar (KULLANIM.md §8) |
+
+Önerilen kurulum yolu her iki işletim sisteminde de aynıdır: [Miniforge](https://github.com/conda-forge/miniforge)
 ve depodaki [`environment.yml`](environment.yml) (SoapySDR 0.8.1 + SoapyPlutoSDR 0.2.4 + libiio 0.26,
 derleme gerektirmez):
 
@@ -50,9 +65,12 @@ conda env create -f environment.yml      # Windows: "Miniforge Prompt" içinde
 conda activate eds
 pip install -e ".[dev]"
 
-python -m pytest                         # ~1670 test, donanım gerekmez (fizik tabanlı AD9363 simülatörü)
+python -m pytest                         # ~1700 test, donanım gerekmez (fizik tabanlı AD9363 simülatörü)
 eds -c config/rx_sim.toml measure all --quick   # simülatörde 9 KTR ölçümü → reports/<zaman>/report.html
 ```
+
+Ayrıntılar, her adımın beklenen çıktısı ve hata çözümleri: [`docs/KURULUM.md`](docs/KURULUM.md).
+Kurulum bitince: [`docs/KULLANIM.md`](docs/KULLANIM.md).
 
 Ubuntu'da conda yerine sistem paketleriyle: `./scripts/install_ubuntu.sh` (apt + SoapyPlutoSDR
 derlemesi + udev + `.venv`), sonra `source .venv/bin/activate` ve `make test`.
@@ -60,13 +78,15 @@ derlemesi + udev + `.venv`), sonra `source .venv/bin/activate` ve `make test`.
 Donanımla:
 ```bash
 SoapySDRUtil --find="driver=plutosdr"          # Pluto(lar)ı gör (uri, label; seri no GÖSTERMEZ)
-iio_info -s                                    # libiio bağlamları: URI ↔ seri numarası eşlemesi
+python -c "import iio; print(iio.scan_contexts())"   # URI ↔ seri numarası (conda ortamında iio_info yok;
+                                               #   apt yolunda: iio_info -s)
 eds devices --backend soapy --probe            # aç, çalışma zamanı sınırları ve sensörleri yazdır
 eds info -c config/rx_pluto.toml               # konfigürasyonu profile karşı doğrula
 eds cal ppm -c config/rx_pluto.toml --gsm-arfcn 62     # TCXO ppm (GSM FCCH) → cal/<seri>.json
 eds measure max_rate -c config/rx_pluto.toml   # USB 2.0 sürdürülebilir örnekleme hızını ÖLÇ
 eds rx -c config/rx_pluto.toml                 # RX düğümü: ZMQ'ya spektrum/tespit/durum yayınla
 ```
+İlk donanım oturumu adım adım: [`docs/KURULUM.md` §6](docs/KURULUM.md#6-plutoyu-bağlamak-ve-ilk-donanım-testi).
 Ayrıntılar: [`docs/HARDWARE_PLUTO.md`](docs/HARDWARE_PLUTO.md) (tezgâh bağlantıları, iki Pluto,
 süreç başına tek Pluto, seri no ile seçim, harici referans, xo_correction, overflow algılama,
 Pluto TX artefaktları, güvenlik).
@@ -77,7 +97,7 @@ Pluto TX artefaktları, güvenlik).
 |---|---|
 | 325 MHz – 3.8 GHz, ≤ 20 MHz BW | `config/profiles/ad9363_pluto.toml`; her ayar donanıma gitmeden **profile karşı doğrulanır** (`ProfileViolation`, tüm ihlaller Türkçe listelenir). AD9364 "unlock" yalnızca bilinçli seçilen ayrı profil. |
 | 1R1T, 2 cihaz = 2 kanal | `DeviceGroup` iki Pluto'yu tek çok kanallı cihaz gibi okur; `coherent=False` (ortak referans + kalibrasyon olmadan). SoapyPlutoSDR süreç başına tek libiio bağlamı tuttuğundan her fazla Pluto (DF grubu, `pluto_tx` uyaranı) kendi alt sürecinde çalışır (`[[device]] isolation`). |
-| 12-bit ADC | Kırpma tespiti (`iq_levels`), yazılım AGC (`soft_agc`), taramada otomatik kazanç, banda bağlı kazanç tablosu (≤1.3 GHz: −1…73 dB, üstü −3…71 dB). |
+| 12-bit ADC | Kırpma tespiti (`iq_levels`), yazılım AGC (`soft_agc`), taramada otomatik kazanç (`sweep.gain_mode = "auto"`) ve kazanç en düşükteyken **RF ön uç sıkışması** denetimi (seviye/kazanç eğimi < 0.85 → tabloda `SIKIŞMA`, `UYARI:` satırları; [KULLANIM.md §5.4](docs/KULLANIM.md#54-kazanç-fixed-ve-auto-rf-ön-uç-sıkışması)), banda bağlı kazanç tablosu (≤1.3 GHz: −1…73 dB, üstü −3…71 dB). |
 | 40 MHz TCXO ±25 ppm | CW veya **GSM FCCH** ile ppm kestirimi; donanımda `xo_correction` (LO **ve** fs birlikte düzelir), olmazsa yazılım düzeltmesi; sıcaklık farkı uyarısı. |
 | USB 2.0 | Sürdürülebilir hız **ölçülür** (`max_rate`, DSP hattı açıkken); tarama 20 MS/s **burst** kullanır (USB sınırı adımlar arasında geçerli değil); overflow'da blok içi boşluk asla oluşmaz. SoapyPlutoSDR overflow bildirmediği için örnek kaybı ince katmandan RX DMA durum yazmacıyla algılanır. |
 | Sıfır-IF | DC/RF-DC/quadrature tracking; DC çevresi geçersiz bin; taramada `dc_avoid` (%50 örtüşme); imaj bastırma ölçülür. |
@@ -127,7 +147,9 @@ Tek doğruluk kaynağı: [`contracts/topics.json`](contracts/topics.json) + `con
 Topic adları değişecekse yalnızca `contracts/topics.json` ve `src/eds/bus/topics.py`
 değişir; `tests/bus/test_contracts.py` ikisinin birebir eşleştiğini doğrular.
 Araçlar: `eds bus proxy` (XSUB/XPUB), `eds bus echo rx.detections`,
-`eds bus send ctl.rx --cmd set_center_freq --arg hz=2.4e9 --wait-ack 2`.
+`eds bus send ctl.rx --endpoint tcp://127.0.0.1:5556 --cmd set_center_freq --arg hz=2.4e9 --wait-ack 2`
+(direct modda düğüm `--set "bus.ctl_endpoints=['tcp://127.0.0.1:5556']"` ile başlatılmış olmalı;
+hazır konfigürasyonlarda uzaktan kontrol kapalıdır). Adım adım: [KULLANIM.md §4](docs/KULLANIM.md#4-rx-düğümü-ve-zeromq-bus).
 
 ## 5. KTR ölçümleri (`eds measure ...`)
 
@@ -176,7 +198,9 @@ src/eds/
 cal/                cihaz başına kalibrasyon dosyaları (cal/<seri>.json)
 reports/            ölçüm raporları
 scripts/            install_ubuntu.sh, udev kuralı
-docs/               ARCHITECTURE.md, HARDWARE_PLUTO.md, MEASUREMENTS.md
+examples/           bus'a bağlanan örnek programlar (dinleyici, komut gönderici, saf pyzmq)
+docs/               KURULUM.md (kurulum), KULLANIM.md (kullanım), HARDWARE_PLUTO.md,
+                    MEASUREMENTS.md, ARCHITECTURE.md; img/ (rehberlerin ekran görüntüleri)
 tests/              pytest (simülatör + gerçek API'leri taklit eden SoapySDR/libiio sahteleri)
 ```
 

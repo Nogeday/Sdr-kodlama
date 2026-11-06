@@ -1180,13 +1180,21 @@ class RxNode:
                     if restore_err is not None:
                         self._warn(f"{self.name}: tarama sonrası RX ayarları geri yüklenemedi: {restore_err}")
         self._count("sweeps")
+        # the rx.sweep payload is a closed contract: sweep quality warnings (RF compression,
+        # ADC clipping) reach GUIs through rx.status warnings and the ctl.ack result instead
+        for w in result.warnings:
+            self._warn(f"{self.name}: tarama #{int(result.sweep_id)}: {w}")
         payload = result.to_bus_payload(self.name, int(cfg.publish_max_points))
         self._publish(RX_SWEEP, payload)
         log.info("%s: tarama bitti: %.3f s, %.3g GHz/s, %d tespit", self.name, result.duration_s,
                  result.rate_hz_per_s / 1e9, len(result.detections))
         return {"duration_s": float(result.duration_s), "rate_hz_per_s": float(result.rate_hz_per_s),
                 "n_detections": len(result.detections), "sweep_id": int(result.sweep_id),
-                "n_steps": int(result.n_steps), "rbw_hz": float(result.rbw_hz)}
+                "n_steps": int(result.n_steps), "rbw_hz": float(result.rbw_hz),
+                "warnings": list(result.warnings),
+                "compressed_steps": [int(i) for i in result.compressed_steps],
+                "clipped_steps": [int(i) for i in result.clipped_steps],
+                "compressed_detections": [int(i) for i in result.compressed_detections]}
 
     def _restore_after_sweep(self) -> None:
         dev = self._dev

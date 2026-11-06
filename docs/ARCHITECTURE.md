@@ -338,13 +338,22 @@ Sweeper(device, cfg: SweepConfig, dsp: DspConfig, detect: DetectConfig,
     .plan() -> list[float] ; .run(on_step=None) -> SweepResult ; .abort()   (run() MeasurementError fırlatır)
     # kurucu konfigürasyonu tarama başlamadan doğrular (ConfigError; sweep.publish_max_points pozitif tamsayı dahil)
     .nfft .df_hz .rbw_hz .step_hz .usable_half_bins .dc_notch_bins .n_capture .buffer_size .n_bins .effective_averages
+    .compression_check_peak_dbfs       # = max(agc.target_peak_dbfs, agc.high_peak_dbfs − COMPRESSION_CHECK_MARGIN_DB)
+    # gain_mode="auto": adım başına GainController.propose (ağır kırpmada bant minimumuna atlama), ≤ AUTO_GAIN_MAX_ITER
+    #   değişim; ardından minimuma ≤ PROBE_STEP_DB yakın + tepe ≥ compression_check_peak_dbfs + kırpmasız biten adımda
+    #   RF ön uç sıkışma kontrolü (gain_slope: döngünün kendi çifti ya da TEK prob yakalaması; kazanç geri yüklenir)
 SweepResult(f_hz, p_db, unit, calibrated, rbw_hz, n_steps, step_hz, steps, duration_s, rate_hz_per_s,
             timing{tune_s, settle_s, capture_s, dsp_s, other_s}, detections, t_start_ns, t_end_ns, sweep_id,
             start_hz, stop_hz, df_hz, fs_hz, nfft, window, enbw_bins, averages, gain_ref_db, gain_mode,
-            valid, source_step, threshold_db)
+            valid, source_step, threshold_db, compressed_mask, warnings)
+    # steps[i]: index, fc, gain_db, gain_iters, peak_dbfs, clip_fraction, overflow, t_tune, t_settle, t_capture, t_dsp,
+    #           t_ns, bins_used, compressed (bool), gain_slope (float | None), probe_gain_db (float | None)
     .decimate(max_points, mode="max"|"mean"|"min") -> (f, p) ; .decimation_for(max_points) ; .to_spectrum()
-    .band_power_db(f_lo, f_hi) ; .noise_floor_db ; .clipped_steps ; .to_bus_payload(device_name, max_points=8192)
+    .band_power_db(f_lo, f_hi) ; .noise_floor_db ; .clipped_steps ; .compressed_steps ; .compressed_detections
+    .to_bus_payload(device_name, max_points=8192)   # compressed_mask / compressed_detections / warnings yüke GİRMEZ
 plan_offsets(...) ; plan_coverage(...) ; gain_referred_unit(gain_ref_db) -> "dBFS@<G>dB"
+compression_probe_gain_db(gain_db, peak_dbfs, gr) -> float | None   # GainController.settle ile aynı prob kuralı
+AUTO_GAIN_MAX_ITER = 2 ; AUTO_GAIN_OVERLOAD_CLIP = 1e-2 ; COMPRESSION_CHECK_MARGIN_DB = 6.0
 # node
 RxNode(app, device=None, publisher=None, cal=None, *, name=None, ctl_subscriber=None, on_publish=None)
     .start() ; .run(duration_s=None) ; .stop() (idempotent, her thread'den)
@@ -358,6 +367,46 @@ decimate_max(p_db, max_points) -> (p, D)
 COMMANDS = ("ping", "set_center_freq", "set_gain", "set_gain_mode", "set_sample_rate", "set_bandwidth", "sweep", "stop")
 NODE_GAIN_MODES = ("manual", "soft_agc", "hw_slow", "hw_fast", "hw_hybrid")
 ```
+
+Tarayıcı (`Sweeper`): Pluto aynı anda en fazla ~20 MHz gördüğü için bant, LO adım adım kaydırılarak
+taranır; her adımda tek bir burst (tam bir libiio tamponu, USB boşluğuna denk gelemez) yakalanır,
+Welch spektrumu ortak frekans ızgarasına dikilir (her bin'i merkezine en yakın adım verir, DC
+çentiği binleri yalnız başka adım kapsamıyorsa kullanılır) ve birleşik spektrumda tek bir CFAR
+tespiti çalışır (ayrıntı: `eds/rx/sweep.py` modül docstring'i). `gain_mode = "fixed"` her adımda
+`sweep.gain_db`'yi (bandın kazanç aralığına kırpılmış) kullanır. `"auto"` her adımın zaman-alanı
+seviyesine göre kazancı ayarlar (AGC kontrol yasası; ağır kırpmada bant minimumuna atlar; adım
+başına ≤ 2 değişim, kazanç sonraki adıma taşınır) ve seviyeleri `gain_ref = sweep.gain_db`'ye
+normalize eder (birim `dBFS@<G>dB`; kalibrasyon `dBm` verirse mutlak).
+
+RF ön uç sıkışması (yalnız `"auto"`): kırpma tek aşırı yük değildir. Düşük kazançta AD936x
+LNA/karıştırıcısı ADC kırpmadan ÖNCE sıkışır; çok güçlü bir giriş (bant minimumunda ≳ +1 dBm) tam
+ölçeğin birkaç dB altında, kırpmasız, "normal" görünen bir tepe verir (simülatörde minimum kazançta
+≈ −5 dBFS). Kazanç döngüsü bunu geçerli seviye sanır ve dikilen seviye ile tespitlerin gücü/SNR'ı
+sıkışma kadar DÜŞÜK çıkar. Bu yüzden kazanç döngüsünden sonra son yakalaması (1) bandın minimum
+kazancına `PROBE_STEP_DB` (6 dB) kadar yakın, (2) tepesi `compression_check_peak_dbfs` (varsayılan
+`[agc]` ile −9 dBFS) ve üstü, (3) kırpmasız olan adım kontrol edilir. Neden bu sınırlar: daha
+yüksek kazançta ADC sıkışmadan önce kırpar (o durum kazanç döngüsünün işi); minimum kazançta derin
+sıkışmanın çıkışı ≈ −5 dBFS'ye, 6 dB yukarıda tam ölçeğe yakın doyar ve ≥ 2 dB sıkışmış bir ton
+doyumun ≈ 1 dB altında okunur, −9 dBFS ≈ 3 dB pay bırakır. Karar `gain_slope` ile verilir: kazanç
+değişimi başına seviye değişimi doğrusal alıcıda 1.0'dır, `COMPRESSION_SLOPE_MAX` (0.85) altı =
+sıkışma. Çift, kazanç döngüsünün kendi son değişimi sonuç veriyorsa odur (ek maliyet yok); değilse
+TEK bir prob yakalaması alınır (`GainController.settle` ile aynı kural: 6 dB aşağı, minimuma 3
+dB'den yakınsa 3–6 dB yukarı) ve kazanç geri yüklenir — prob dikilmez. Pencere dışındaki adımlar
+(neredeyse hepsi) ek yakalama yapmaz; sabit kazançlı taramalar hiç kontrol edilmez. Sıkışmış
+adımın seviyesi düzeltilmez (sıkışma miktarı bilinmez; değer bir alt sınırdır): binleri aynı
+frekansı kapsayan sıkışmamış bir adıma karşı birleştirmede kaybeder (güçlü verici bileşik sinyalin
+tamamını sıkıştırır, o adımdaki zayıf sinyaller de bastırılır), kalan binleri `compressed_mask`'te,
+bunlara değen tespitler `compressed_detections`'ta, her sıkışmış adım merkez frekansı ve eğimiyle
+Türkçe `warnings`'te listelenir (otomatik kazançla da kırpan adımlar da). **ADC kırpması her
+modda raporlanır:** sabit kazançlı taramada `clip_fraction > agc.max_clip_fraction` olan her adım
+için `ADC kırpması: ... sabit kazançla kırpıyor` uyarısı üretilir (kırpma harmonikleri CFAR'da çok
+sayıda sahte tespit doğurur; sıkışma ise sabit kazançta denetlenmez). `eds sweep` uyarıları
+tespit tablosundan sonra stderr'e `UYARI:` ile yazar, tabloya `Not = SIKIŞMA` sütunu, PNG
+altbilgisine kırmızı bayrak, `.npz` meta'sına `compressed_steps` / `compressed_detections` /
+`warnings` ekler. Bu alanların hiçbiri `rx.sweep` yüküne girmez (kapalı sözleşme); RX düğümünde
+`ctl.rx sweep` sonucu bunları `ctl.ack` `result`'ında (`warnings`, `compressed_steps`,
+`clipped_steps`, `compressed_detections`) ve `rx.status` `warnings` listesinde
+(`<ad>: tarama #N: <uyarı>`) taşır. Çözüm: harici zayıflatıcı.
 
 Düğüm: cihaz → `RxStreamer` (soft_agc'de `GainController.update` okuyucu thread'de) → settling
 blokları atlanır → bitişik örnekler `welch_len(nfft, averages, overlap)` uzunluğunda örtüşmesiz

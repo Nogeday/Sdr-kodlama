@@ -9,9 +9,9 @@
 
 1. [Fiziksel kısıtlar → kodun yaptığı](#1-fiziksel-kısıtlar--kodun-yaptığı)
 2. [Yazılım yığını ve doğrulama komutları](#2-yazılım-yığını-ve-doğrulama-komutları)
-3. [İki Pluto'yu aynı anda bağlamak (IP, URI, seri no)](#3-iki-plutoyu-aynı-anda-bağlamak-ip-uri-seri-no)
+3. [Aynı anda iki Pluto bağlamak (IP, URI, seri no)](#3-aynı-anda-iki-pluto-bağlamak-ip-uri-seri-no)
 4. [Firmware sürümü](#4-firmware-sürümü)
-5. [İki Pluto ile DF: gerçekler](#5-iki-pluto-ile-df-gerçekler)
+5. [DF için iki Pluto: gerçekler](#5-df-için-iki-pluto-gerçekler)
 6. [Spesifikasyon dışı modlar (AD9364 unlock, 2R2T)](#6-spesifikasyon-dışı-modlar-ad9364-unlock-2r2t)
 7. [Tezgah bağlantı şemaları](#7-tezgah-bağlantı-şemaları)
 8. [RF güvenliği](#8-rf-güvenliği)
@@ -324,7 +324,7 @@ eds info -c config/dual_pluto.toml                # profil doğrulaması + süre
 
 ---
 
-## 3. İki Pluto'yu aynı anda bağlamak (IP, URI, seri no)
+## 3. Aynı anda iki Pluto bağlamak (IP, URI, seri no)
 
 **Varsayılan olarak her Pluto 192.168.2.1 adresini kullanır** — iki Pluto aynı anda
 bağlıyken ağ (ince katman, `ip:` URI'leri) çakışır. İkinci Pluto'nun IP'sini değiştirin:
@@ -387,7 +387,7 @@ Available contexts:
 
 ---
 
-## 5. İki Pluto ile DF: gerçekler
+## 5. DF için iki Pluto: gerçekler
 
 İki ayrı Pluto ile faz farkı (interferometre) DF'i **ancak** aşağıdakiler yönetilirse çalışır.
 EDS'te ilgili modüller: `eds.hal.group.DeviceGroup`, `eds.df.coherence`
