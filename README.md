@@ -1,224 +1,259 @@
-# EDS — Elektronik Destek Sistemi · RX omurgası
+# EDS — Elektronik Destek Sistemi
 
-KTÜ TEKNOFEST **Elektronik Harp** takımının Elektronik Destek (ED) sisteminin alıcı (RX)
-omurgası. Faz-0 donanımı **2× ADALM-Pluto (AD9363)**; nihai mimaride DF için **KrakenSDR**
-(5 kanal koherent) ve TX için **HackRF** gelecek. Bu kod atılacak "Pluto kodu" değildir:
-donanım soyutlaması, mesajlaşma ve klasör yapısı yeni donanım geldiğinde yeniden yazım
-gerektirmeyecek şekilde kurulmuştur.
+**KTÜ TEKNOFEST Elektronik Harp takımının Elektronik Destek (ED) sistemi:** RF ortamını dinleyen
+alıcı omurgası (RX) ve operatör konsolu. Pluto SDR'den (ya da donanım yokken fizik tabanlı
+AD9363 simülatöründen) gelen örnekleri işler: spektrum çıkarır, sinyalleri tespit eder (CFAR),
+frekans/güç kalibrasyonu uygular, sonuçları ZeroMQ bus'ına yayınlar. Operatör konsolu bu bus'ı
+dinleyip canlı spektrum, waterfall, emiter tablosu, DF ve sistem durumunu gösterir. Sistem aynı
+zamanda **kendi ölçüm cihazıdır**: KTR'nin istediği 9 nicel spesifikasyonu ölçüp raporlar. Faz-0
+donanımı 2× ADALM-Pluto (AD9363). KrakenSDR (DF) ve HackRF (TX) geldiğinde üst katmanlar
+değişmeden genişleyecek şekilde kuruldu.
 
-Sistem aynı zamanda **kendi ölçüm cihazıdır**: KTR'nin istediği 9 nicel spesifikasyonu
-(duyarlılık, dinamik alan, anlık BW, tarama hızı, frekans çözünürlüğü, DF RMS, imaj
-bastırma, taşma-sız max örnekleme hızı, uçtan-uca gecikme) kendisi ölçer ve **tablo + grafik
-+ spektrum analizörü tarzı ekran görüntüsü** olarak raporlar (`eds measure all`).
+![Operatör konsolu — simülasyon modunda canlı veri](docs/img/gui/konsol.png)
 
-```
-$ eds -c config/rx_sim.toml measure all --quick
-#  Parametre                              Ölçülen  Birim     Hedef  Durum
-1  Duyarlılık (MDS)                  -131.8 ± 0.9  dBm    ≤ -100.0  KARŞILAŞTIRILMADI
-2  Dinamik alan                       100.5 ± 0.5  dB       ≥ 60.0  KARŞILAŞTIRILMADI
-3  Anlık bant genişliği                      16.9  MHz      ≥ 18.0  KARŞILAŞTIRILMADI
-4  Tarama hızı                              0.512  GHz/s    ≥ 5.00  KARŞILAŞTIRILMADI
-5  Frekans çözünürlüğü                  1352 ± 38  Hz      ≤ 10000  KARŞILAŞTIRILMADI
-6  DF RMS hatası                                —  °        ≤ 5.00  ATLANDI
-7  İmaj bastırma                             55.1  dB       ≥ 40.0  KARŞILAŞTIRILMADI
-8  Taşmasız maksimum örnekleme hızı          6.00  MS/s     ≥ 4.00  KARŞILAŞTIRILMADI
-9  Uçtan uca gecikme                         39.6  ms        ≤ 100  KARŞILAŞTIRILMADI
-
-Toplam: 9  |  GEÇTİ: 0  KALDI: 0  KARŞILAŞTIRILMADI: 8  HEDEF YOK: 0  ATLANDI: 1  HATA: 0
-Rapor: reports/20261105-201723   (report.html, summary.md/.csv, results.json, tables/, figures/*.png)
-```
-> Yukarıdaki değerler **simülatörden** ve **hızlı moddan** gelir: rapor ikisini de bant ve şekil
-> etiketiyle belirtir, hızlı mod sonuçları hedefle **karşılaştırılmaz** (KARŞILAŞTIRILMADI);
-> `df_rms` tek cihazlı `rx_sim.toml`'da 2 kanal olmadığı için atlanır (`config/dual_sim.toml`
-> ile koşar). Hedef kararı için `--quick` olmadan ve donanımda ölçün. Hedefler
-> `config/ktr_targets.toml` içindeki **örnek** değerlerdir — takımın KTR değerleriyle güncelleyin.
+<sub>Simülatörden canlı veri (433 MHz ISM demo sahnesi):
+- **Canlı spektrum:** emiterler bant genişliği sınıfına göre renkli (mavi dar, turuncu orta, pembe geniş).
+- **Waterfall:** darbeli telemetri kesikli çizgi olarak görünüyor.
+- **Emiter tablosu ve parametre paneli:** seçili E002, FM drone bağlantısı.
+- **⁎ işareti:** E002'nin LO aynasındaki sıfır-IF IQ imajını gösteriyor.
+- **Kırmızı "Overflow 1":** bu çekimde CPU yükü nedeniyle gerçekten bir taşma oldu ve GUI bunu bildirdi.</sub>
 
 ---
 
-## 1. Hızlı başlangıç (Linux ve Windows)
+## İçindekiler
 
-Takıma yeni katıldıysanız bu iki rehberi **sırayla** izleyin. İkisi de Türkçe, adım adım ve
-ekran görüntülüdür; her adımda ne yaptığınızı, neden yaptığınızı ve başarılı olunca ne
-göreceğinizi anlatır:
+1. [5 dakikalık hızlı başlangıç (simülasyon)](#1-5-dakikalık-hızlı-başlangıç-simülasyon)
+2. [Tek komutla çalıştırma](#2-tek-komutla-çalıştırma)
+3. [Mimari](#3-mimari)
+4. [Operatör konsolu (GUI)](#4-operatör-konsolu-gui)
+5. [Klasör haritası](#5-klasör-haritası)
+6. [Donanım kurulumu (Pluto)](#6-donanım-kurulumu-pluto)
+7. [Test](#7-test)
+8. [KTR ölçümleri](#8-ktr-ölçümleri)
+9. [Belgeler](#9-belgeler)
 
-| Sıra | Rehber | İçerik | Süre |
-|---|---|---|---|
-| 1 | 📘 **[Kurulum Rehberi — `docs/KURULUM.md`](docs/KURULUM.md)** | Miniforge (conda) kurulumu, depo, `eds` ortamı, doğrulama ve testler; Linux ve Windows ayrı ayrı; Pluto USB izni/sürücüsü; WSL2; sorun giderme; güncelleme ve kaldırma | ~20 dk |
-| 2 | 📗 **[Kullanım Rehberi — `docs/KULLANIM.md`](docs/KULLANIM.md)** | Konfigürasyon dosyası, RX düğümü ve ZeroMQ bus, geniş bant tarama (otomatik kazanç ve RF sıkışma uyarısı dahil), kalibrasyon, 9 KTR ölçümü ve raporu okumak, kendi programından bus'a bağlanmak, kontrol listeleri | okudukça |
+---
 
-Diğer belgeler (ihtiyaç oldukça):
+## 1. 5 dakikalık hızlı başlangıç (simülasyon)
 
-| Belge | Ne zaman okunur |
-|---|---|
-| [`docs/HARDWARE_PLUTO.md`](docs/HARDWARE_PLUTO.md) | Pluto tezgâhı: iki Pluto, seri no ile seçim, harici referans, `xo_correction`, overflow algılama, TX artefaktları, güvenlik |
-| [`docs/MEASUREMENTS.md`](docs/MEASUREMENTS.md) | 9 KTR ölçümünün tanımı, yöntemi, tezgâh kurulumu ve KTR'de nasıl yazılacağı |
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Kod yapısı, modül arayüzleri, konvansiyonlar (PSD ölçekleme, dBFS, ppm işareti, birimler) |
-| [`examples/`](examples) | Bus'ı dinleyen ve komut gönderen küçük örnek programlar (KULLANIM.md §8) |
-
-Önerilen kurulum yolu her iki işletim sisteminde de aynıdır: [Miniforge](https://github.com/conda-forge/miniforge)
-ve depodaki [`environment.yml`](environment.yml) (SoapySDR 0.8.1 + SoapyPlutoSDR 0.2.4 + libiio 0.26,
-derleme gerektirmez):
+SDR sürücüsü **gerekmez**: simülasyon modu yalnız pip paketleriyle çalışır.
 
 ```bash
-git clone https://github.com/Nogeday/Sdr-kodlama.git && cd Sdr-kodlama
-conda env create -f environment.yml      # Windows: "Miniforge Prompt" içinde
-conda activate eds
-pip install -e ".[dev]"
-
-python -m pytest                         # ~1700 test, donanım gerekmez (fizik tabanlı AD9363 simülatörü)
-eds -c config/rx_sim.toml measure all --quick   # simülatörde 9 KTR ölçümü → reports/<zaman>/report.html
+git clone https://github.com/Nogeday/Sdr-kodlama.git
+cd Sdr-kodlama
+./setup.sh --sim                 # .venv + eds + GUI (PySide6, pyqtgraph); sonda kendini doğrular
+source .venv/bin/activate
+python run.py                    # bus proxy + simüle RX düğümü + operatör GUI — tek komut
 ```
 
-Ayrıntılar, her adımın beklenen çıktısı ve hata çözümleri: [`docs/KURULUM.md`](docs/KURULUM.md).
-Kurulum bitince: [`docs/KULLANIM.md`](docs/KULLANIM.md).
+Birkaç saniye içinde konsol açılır ve canlı veri gösterir. **Kapatmak için:** pencereyi kapatın
+ya da terminalde Ctrl-C. Her iki durumda da bütün süreçler birlikte, temiz kapanır.
 
-Ubuntu'da conda yerine sistem paketleriyle: `./scripts/install_ubuntu.sh` (apt + SoapyPlutoSDR
-derlemesi + udev + `.venv`), sonra `source .venv/bin/activate` ve `make test`.
+`setup.sh` adımları ekrana yazar (`[1/5] … [5/5]`) ve sonunda GUI'nin açılabildiğini dener.
+İkinci kez çalıştırmak güvenlidir: yalnızca eksik olanı kurar.
 
-Donanımla:
+> **Windows:** `setup.sh` Ubuntu içindir. Windows'ta Miniforge ile `conda env create -f environment.yml`,
+> `conda activate eds`, `pip install -e ".[gui,dev]"`, `python run.py`. Ayrıntı:
+> [`docs/KURULUM.md`](docs/KURULUM.md) §4.
+
+Kısa komutların listesi: `make help`.
+
+## 2. Tek komutla çalıştırma
+
+`python run.py` ile `python -m eds.launch` aynı şeydir. Başlatıcı her süreci ayrı başlatır ve
+birini kaybederse diğerlerini de kapatıp nedenini yazar.
+
+| Komut | Ne çalışır | Ne zaman |
+|---|---|---|
+| `python run.py` (`make run-sim`) | proxy + **simüle** RX düğümü + GUI | Donanımsız geliştirme, demo |
+| `python run.py --mode hardware` (`make run`) | proxy + **Pluto** RX düğümü + GUI | Tezgâh / yarışma |
+| `python run.py --no-gui --listen-all` | proxy + RX düğümü, portlar ağa açık | Hat bir makinede (ör. Jetson), GUI başka makinede |
+| `python run.py --gui-only --connect tcp://<ip>:5551` | yalnız GUI | Laptop'tan uzaktaki hatta bağlanmak |
+| `python -m eds.gui` (`make gui`) | yalnız GUI (vars. `tcp://127.0.0.1:5555`) | Elle başlatılmış bir `eds rx`'e bağlanmak |
+
+Diğer seçenekler: `-c DOSYA` (konfigürasyon), `--set anahtar=değer` (RX düğümüne iletilir),
+`--duration S`, `--frontend-port/--backend-port`. Hepsi için: `python run.py --help`.
+
+Çalışan bir hatta komut göndermek (ör. merkez frekansı değiştirmek):
+
 ```bash
-SoapySDRUtil --find="driver=plutosdr"          # Pluto(lar)ı gör (uri, label; seri no GÖSTERMEZ)
-python -c "import iio; print(iio.scan_contexts())"   # URI ↔ seri numarası (conda ortamında iio_info yok;
-                                               #   apt yolunda: iio_info -s)
-eds devices --backend soapy --probe            # aç, çalışma zamanı sınırları ve sensörleri yazdır
-eds info -c config/rx_pluto.toml               # konfigürasyonu profile karşı doğrula
-eds cal ppm -c config/rx_pluto.toml --gsm-arfcn 62     # TCXO ppm (GSM FCCH) → cal/<seri>.json
-eds measure max_rate -c config/rx_pluto.toml   # USB 2.0 sürdürülebilir örnekleme hızını ÖLÇ
-eds rx -c config/rx_pluto.toml                 # RX düğümü: ZMQ'ya spektrum/tespit/durum yayınla
+eds --set bus.mode='"proxy"' bus send ctl.rx --cmd set_center_freq --arg hz=434.5e6 --wait-ack 2
 ```
-İlk donanım oturumu adım adım: [`docs/KURULUM.md` §6](docs/KURULUM.md#6-plutoyu-bağlamak-ve-ilk-donanım-testi).
-Ayrıntılar: [`docs/HARDWARE_PLUTO.md`](docs/HARDWARE_PLUTO.md) (tezgâh bağlantıları, iki Pluto,
-süreç başına tek Pluto, seri no ile seçim, harici referans, xo_correction, overflow algılama,
-Pluto TX artefaktları, güvenlik).
-
-## 2. Donanım kısıtları → kodun cevabı
-
-| Kısıt (AD9363 / Pluto) | Kod ne yapıyor |
-|---|---|
-| 325 MHz – 3.8 GHz, ≤ 20 MHz BW | `config/profiles/ad9363_pluto.toml`; her ayar donanıma gitmeden **profile karşı doğrulanır** (`ProfileViolation`, tüm ihlaller Türkçe listelenir). AD9364 "unlock" yalnızca bilinçli seçilen ayrı profil. |
-| 1R1T, 2 cihaz = 2 kanal | `DeviceGroup` iki Pluto'yu tek çok kanallı cihaz gibi okur; `coherent=False` (ortak referans + kalibrasyon olmadan). SoapyPlutoSDR süreç başına tek libiio bağlamı tuttuğundan her fazla Pluto (DF grubu, `pluto_tx` uyaranı) kendi alt sürecinde çalışır (`[[device]] isolation`). |
-| 12-bit ADC | Kırpma tespiti (`iq_levels`), yazılım AGC (`soft_agc`), taramada otomatik kazanç (`sweep.gain_mode = "auto"`) ve kazanç en düşükteyken **RF ön uç sıkışması** denetimi (seviye/kazanç eğimi < 0.85 → tabloda `SIKIŞMA`, `UYARI:` satırları; [KULLANIM.md §5.4](docs/KULLANIM.md#54-kazanç-fixed-ve-auto-rf-ön-uç-sıkışması)), banda bağlı kazanç tablosu (≤1.3 GHz: −1…73 dB, üstü −3…71 dB). |
-| 40 MHz TCXO ±25 ppm | CW veya **GSM FCCH** ile ppm kestirimi; donanımda `xo_correction` (LO **ve** fs birlikte düzelir), olmazsa yazılım düzeltmesi; sıcaklık farkı uyarısı. |
-| USB 2.0 | Sürdürülebilir hız **ölçülür** (`max_rate`, DSP hattı açıkken); tarama 20 MS/s **burst** kullanır (USB sınırı adımlar arasında geçerli değil); overflow'da blok içi boşluk asla oluşmaz. SoapyPlutoSDR overflow bildirmediği için örnek kaybı ince katmandan RX DMA durum yazmacıyla algılanır. |
-| Sıfır-IF | DC/RF-DC/quadrature tracking; DC çevresi geçersiz bin; taramada `dc_avoid` (%50 örtüşme); imaj bastırma ölçülür. |
-| Retune sonrası bayat tampon | `settle_buffers` ile işaretlenir ve atılır (`RxDevice.capture/flush`). |
 
 ## 3. Mimari
 
 ```
-                 eds (CLI)  ·  eds.rx.node (servis)  ·  eds.measure (KTR ölçümleri + rapor)
-                                     │
-   eds.calib (ppm, FCCH, güç)   eds.df (koherens, interferometre)   eds.rx (stream, AGC, sweep)
-                                     │
-                         eds.dsp (Welch PSD, çok çözünürlüklü CFAR, tepe)
-                                     │
-                      eds.hal.RxDevice  ──  eds.bus (ZeroMQ pub/sub + JSON şema)
-        ┌─────────────────┬──────────┴─────────┬──────────────┬──────────────────┐
-  soapy_backend      pluto_iio (ince)      group (N×1ch)    proc (süreç       sim (fizik tabanlı AD9363)
-  (SoapyPlutoSDR)    xo_correction,         2× Pluto         yalıtımı: Pluto   CI · demo · ölçüm
-                     tracking, sıcaklık,                     başına süreç)     prosedürü doğrulama
-                     DMA overflow yazmacı
+ ┌───────────────────────────┐
+ │ KAYNAK                    │      --mode sim:      eds.hal.sim  (fizik tabanlı AD9363 modeli)
+ │  sim  │  HAL (SoapySDR)   │      --mode hardware: eds.hal.soapy_backend → SoapyPlutoSDR → libiio → Pluto
+ └─────────────┬─────────────┘                       (+ ince libiio katmanı: PPM, tracking, taşma kaydı)
+               │ IQ blokları
+ ┌─────────────▼─────────────┐
+ │ RX DÜĞÜMÜ  (eds.rx.node)  │  Welch PSD → kalibrasyon (ppm, dBm) → çok çözünürlüklü CFAR
+ │  ayrı süreç               │  hız sınırlı + seyreltilmiş spektrum yayını (GUI için 20 fps / 2048 bin)
+ └─────────────┬─────────────┘
+               │ PUB          rx.spectrum · rx.detections · rx.status · rx.sweep · cal.result
+ ┌─────────────▼─────────────┐                    ▲
+ │ BUS PROXY  XSUB :5550     │                    │ ctl.ack
+ │  (ZeroMQ)  XPUB :5551     │◄───────────────────┼──────── ctl.rx  (komut: frekans, kazanç, tarama…)
+ └──┬──────────┬─────────┬───┘                    │
+    │ SUB      │ SUB     │ SUB
+ ┌──▼───────┐ ┌▼───────┐ ┌▼────────────────────────────┐
+ │ OPERATÖR │ │eds bus │ │ diğer modüller (DF, ölçüm,   │   df.bearing · meas.result
+ │ GUI      │ │ echo   │ │ kendi programlarınız)        │   (bus'a yayın yapanlar da proxy'ye bağlanır)
+ └──────────┘ └────────┘ └──────────────────────────────┘
 ```
-* **Akış ve cihaz soyutlaması SoapySDR**'dir. Pluto'ya özel kontroller önce Soapy API'si
-  ile denenir, yoksa ince libiio katmanına düşülür; pyadi-iio birincil arayüz değildir.
-* **Yeni donanım = yeni profil TOML (+ gerekirse yeni backend dosyası).** KrakenSDR,
-  HackRF, bladeRF 2.0, USRP B210 profilleri `status = "planned"` olarak hazır; üst katmanlar
-  yalnızca `RxDevice` (`num_channels`, `coherent`) görür.
-* Konvansiyonlar (PSD ölçekleme, dBFS tanımı, ppm işareti, birimler) ve modül arayüzleri:
-  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-## 4. ZeroMQ topic'leri
+- **GUI pipeline'a gömülü değildir.** Ayrı bir süreçte çalışan bir bus abonesidir. Kaynağın
+  simülatör mü Pluto mu olduğunu bilmez: aynı mesajları çizer. Spektrum için "yalnız en son kare"
+  aboneliği kullanır; GUI yavaşlasa da kuyruk birikmez ve RX düğümü asla beklemez.
+- **Mesaj sözleşmesi tek yerde:** [`contracts/topics.json`](contracts/topics.json) +
+  `contracts/schemas/*.schema.json` (JSON Schema 2020-12). Çerçeve: `[topic, json]`; her mesaj
+  `{topic, v, src, seq, t_ns, data}` zarfını taşır.
 
-Tek doğruluk kaynağı: [`contracts/topics.json`](contracts/topics.json) + `contracts/schemas/*.schema.json`
-(JSON Schema 2020-12). Çerçeve: multipart `[topic, json]`; her mesaj zarf taşır:
-`{topic, v, src, seq, t_ns, data}`.
-
-| Topic | Üretici | İçerik |
+| Topic | Kim yayınlar | İçerik |
 |---|---|---|
-| `rx.status` | rx | frekans/hız/kazanç, overflow/drop sayaçları, sıcaklık, ppm, headroom |
-| `rx.spectrum` | rx | PSD karesi (dBm/dBFS), RBW, zaman damgaları (`t_acq_ns`, `t_acq_end_ns`, `t_proc_ns`) |
-| `rx.detections` | rx | CFAR tespitleri (merkez/tepe frekansı, BW, güç, SNR) |
-| `rx.sweep` | rx | geniş bant tarama (max-hold desimasyonlu) + tespitler + tarama hızı |
-| `cal.result` | rx / calib | ppm, güç, imaj, koherens kalibrasyon sonuçları |
-| `df.bearing` | df | kerteriz (Faz-0: 2 elemanlı interferometre) |
-| `meas.result` | measure | KTR ölçüm sonucu (değer, birim, koşullar, hedef, geçti/kaldı) |
-| `ctl.rx` / `ctl.ack` | gui → rx / rx | komut (frekans, kazanç, hız, BW, tarama, durdur) ve yanıtı |
+| `rx.spectrum` | RX düğümü | Seyreltilmiş PSD karesi (dBm/dBFS), RBW, kalibrasyon modu, kazanç, zaman damgaları |
+| `rx.detections` | RX düğümü | CFAR tespitleri: merkez/tepe frekans, BW, tepe/bant gücü, SNR, gürültü |
+| `rx.status` | RX düğümü | Durum, frekans, örnekleme hızı, kazanç, overflow/drop, PPM, sıcaklık, uyarılar |
+| `rx.sweep` | RX düğümü | Geniş bant tarama sonucu + tarama hızı |
+| `df.bearing` | DF modülü | Kerteriz (azimut, belirsizlik, kalite) |
+| `meas.result` | ölçüm aracı | KTR ölçüm sonucu (değer, birim, koşullar, hedef) |
+| `cal.result` | kalibrasyon | PPM / güç / koherens kalibrasyonu |
+| `ctl.rx` / `ctl.ack` | GUI/operatör → RX / RX | Komut ve yanıtı |
 
-Topic adları değişecekse yalnızca `contracts/topics.json` ve `src/eds/bus/topics.py`
-değişir; `tests/bus/test_contracts.py` ikisinin birebir eşleştiğini doğrular.
-Araçlar: `eds bus proxy` (XSUB/XPUB), `eds bus echo rx.detections`,
-`eds bus send ctl.rx --endpoint tcp://127.0.0.1:5556 --cmd set_center_freq --arg hz=2.4e9 --wait-ack 2`
-(direct modda düğüm `--set "bus.ctl_endpoints=['tcp://127.0.0.1:5556']"` ile başlatılmış olmalı;
-hazır konfigürasyonlarda uzaktan kontrol kapalıdır). Adım adım: [KULLANIM.md §4](docs/KULLANIM.md#4-rx-düğümü-ve-zeromq-bus).
+Daha ayrıntılı mimari ve modül arayüzleri: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-## 5. KTR ölçümleri (`eds measure ...`)
+## 4. Operatör konsolu (GUI)
 
-| spec_id | Ölçülen | Yöntem (özet) |
+`PySide6` + `pyqtgraph`, koyu operatör teması, paneller yerinden oynatılabilir (dock).
+
+| Panel | Kaynak | Ne gösterir |
 |---|---|---|
-| `sensitivity` | dBm | Pd–giriş gücü eğrisi (Pd = 0.9 @ CFAR Pfa, RBW) + DANL/NF/MDS(B) |
-| `dynamic_range` | dB | anlık DR (min(kırpma, 1 dB sıkışma) − RBW gürültüsü), SFDR (imaj dâhil, kaynak artefaktları hariç), kazanç yönetimli toplam DR |
-| `inst_bw` | MHz | ton adımlama ile −3/−1 dB geçirme bandı (kaynak yoksa gürültü şekli) |
-| `scan_speed` | GHz/s | gerçek tarayıcı ile süpürülen aralık / süre; tune/settle/yakalama/işleme dökümü |
-| `freq_resolution` | Hz | RBW = ENBW·fs/N ve ölçülen en küçük ayrılabilir iki-ton aralığı; frekans doğruluğu (ham / kayıtlı kalibrasyon ppm'i ile; referansa kilitli kaynakla) |
-| `df_rms` | ° | koherens kontrolü + kablolu faz kalibrasyonu + açı taraması, wrap'li RMS |
-| `image_rejection` | dB | P(+Δ) − P(−Δ), quadrature tracking açık/kapalı |
-| `max_rate` | MS/s | sıfır overflow + sıfır örnek kaybı ile en yüksek sürekli hız (başlık: DSP hattı açık, gerçek RxNode; ayrıca yalnız taşıma) |
-| `latency` | ms | RF olayı → ZMQ teslimi p50/p95 (p99 N ≥ 100) + boru hattı dökümü; kaynaksız yalnız host tarafı (Mod A) |
+| **Canlı spektrum** | `rx.spectrum` + `rx.detections` | PSD izi, tepe tutma izi, gürültü tabanı. Tespit edilen emiterler BW sınıfı renginde kutu ve etiketle işaretli. |
+| **Waterfall** | `rx.spectrum` | Kayan spektrogram, en yeni satır üstte. Geçmiş uzunluğu `--history` ile ayarlanır. |
+| **Emiter tablosu** | `rx.detections` | ID, frekans, BW, güç, SNR, modülasyon, A/S, güven, son görülme, kazanç/kalibrasyon. Başlığa tıklayınca sıralanır. |
+| **Parametreler** | seçili emiter | Bilinen bütün parametreler: kenarlar, bant gücü, en yüksek tepe, RBW, görülme sayısı, IQ imajı şüphesi… |
+| **Yön bulma (DF)** | `df.bearing`, `meas.result` | Azimut iğnesi, belirsiz ve ön-arka ayna yönleri, kalite/koherens, DF RMS. Veri yoksa "DF verisi yok". |
+| **Durum çubuğu** | `rx.status` + GUI ölçümü | Durum lambası, merkez, örnekleme hızı, kazanç, **overflow** (>0 ise kırmızı), akış hızı, **gecikme** (medyan/p95 ms), kalibrasyon modu, PPM, sıcaklık, uyarılar, bus bağlantısı ve fps. |
 
-Tanımlar, tezgâh kurulumu ve KTR'de nasıl yazılacağı: [`docs/MEASUREMENTS.md`](docs/MEASUREMENTS.md).
-Rapor klasörü: `report.html` (tek dosya, A4 yazdırılabilir), `summary.md`, `summary.csv`,
-`results.json`, `tables/*.csv`, `figures/*.png`. Simülatör verisi, hızlı mod ve spesifikasyon
-dışı profil raporda banner (ve şekil etiketi) ile işaretlenir. Koşulsuz sayıya karar verilmez:
-hızlı mod, gerçek zamanlı olmayan simülatör, koherent olmayan kanallar, ölçümün kendi karar
-engelleri (`blockers`) ve birim/kalibrasyon uyuşmazlığı (ör. dBFS değer, dBm hedef) durumunda
-sonuç **KARŞILAŞTIRILMADI** olur (nedeniyle birlikte).
+Görsel kurallar:
+- **Renk = BW sınıfı:** <span>dar (< 25 kHz) mavi, orta (25 kHz – 1 MHz) turuncu, geniş (≥ 1 MHz) pembe</span>.
+  Spektrumda, tabloda ve parametre panelinde aynıdır.
+- **Kalibrasyonsuz değerler:** başında `~`, gri yazı, tooltip'te açıklama. Kalibreli olanlar dBm.
+- **`⁎` olası IQ imajı:** bir emiter, kendisinden ≥ 20 dB güçlü ve aynı genişlikte bir emiterin
+  LO'ya göre aynasındaysa işaretlenir (sıfır-IF artefaktı). Gizlenmez, yalnızca işaretlenir.
 
-Sinyal kaynakları (`measure.source`): `sim`, `pluto_tx` (2. Pluto TX, kendi alt sürecinde →
-≥30 dB zayıflatıcı → RX), `scpi` (laboratuvar üreteci, TCP 5025), `manual` (operatör), `none`.
-Ölçümler RX girişini profilin `rx_max_input_dbm` (AD9363: −5 dBm) tavanının üstüne sürmez
-(`latency`'nin uyarlamalı tonu hariç); TX→RX yolunda ≥ 30 dB sabit zayıflatıcı yine de zorunludur.
+Şu an olmayanlar (bilinçli):
+- **Modülasyon / analog-sayısal / güven sütunları "—" gösterir,** çünkü repoda henüz sınıflandırıcı
+  yok ve GUI tahmin uydurmaz.
+- **DF paneli şimdilik "DF verisi yok" gösterir,** çünkü sürekli `df.bearing` yayınlayan bir düğüm
+  henüz yok. `eds measure df_rms` sonucu RMS olarak görünür.
+- **GUI'den donanım kontrolü (frekans, kazanç, tarama) Faz-2'dedir.** Altyapısı hazır:
+  `ctl.rx` / `ctl.ack`.
 
-## 6. Klasör yapısı
+## 5. Klasör haritası
 
 ```
-contracts/          topic kayıt defteri + JSON şemaları (dil bağımsız sözleşme)
-config/             çalıştırılabilir konfigürasyonlar (rx_sim, rx_pluto, dual_pluto, dual_sim),
-  profiles/         cihaz profilleri (AD9363 resmî sınırlar; planlanan Kraken/HackRF/...)
-  ktr_targets.toml  KTR hedefleri (rapor "Hedef/Durum" sütunları)
+run.py                tek komutla çalıştırma (python -m eds.launch kısayolu)
+setup.sh              kurulum: --sim (yalnız pip) | --hardware (+ SDR sürücüleri)
+Makefile              kısa komutlar (make help)
+environment.yml       conda ortamı (Linux + Windows, sürümleri sabit SDR yığını)
+DEPENDENCIES.md       hangi paket neden kuruluyor
+contracts/            bus sözleşmesi: topic kayıt defteri + JSON şemaları (dil bağımsız)
+config/               çalıştırılabilir konfigürasyonlar
+  sim_gui.toml          GUI demo sahnesi (433 MHz, simülatör) — run.py varsayılanı
+  rx_sim.toml           simülatör, geniş sahne (KTR ölçümleri)
+  rx_pluto.toml         tek Pluto · dual_pluto.toml / dual_sim.toml: iki kanal (DF)
+  profiles/             cihaz profilleri: AD9363 resmî sınırlar; planlanan Kraken/HackRF/bladeRF/B210
+  ktr_targets.toml      KTR hedefleri (rapordaki Hedef/Durum sütunları)
 src/eds/
-  core/             tipler (IQBlock), konfigürasyon, profiller, hatalar, birimler
-  hal/              RxDevice; soapy_backend, pluto_iio, group, proc (süreç yalıtımı), tx/tx_hw, sim/
-  dsp/              pencereler, Welch PSD, tepe, istatistik (gamma), CFAR, seviyeler
-  rx/               stream (okuyucu iş parçacığı), agc, sweep, node (servis)
-  calib/            ppm (CW, GSM FCCH), güç tablosu, kalibrasyon deposu, uygulama
-  df/               koherens, 2 elemanlı interferometre, metrikler
-  bus/              topics, zarf, pub/sub/proxy, şema doğrulama
-  measure/          çerçeve, oturum, uyaran yardımcıları, specs/ (9 ölçüm), rapor, grafikler
-  cli/              `eds` komutu
-cal/                cihaz başına kalibrasyon dosyaları (cal/<seri>.json)
-reports/            ölçüm raporları
-scripts/            install_ubuntu.sh, udev kuralı
-examples/           bus'a bağlanan örnek programlar (dinleyici, komut gönderici, saf pyzmq)
-docs/               KURULUM.md (kurulum), KULLANIM.md (kullanım), HARDWARE_PLUTO.md,
-                    MEASUREMENTS.md, ARCHITECTURE.md; img/ (rehberlerin ekran görüntüleri)
-tests/              pytest (simülatör + gerçek API'leri taklit eden SoapySDR/libiio sahteleri)
+  hal/                  donanım soyutlaması: SoapySDR backend, ince libiio katmanı, simülatör, 2× Pluto grubu
+  dsp/                  Welch PSD, pencereler, çok çözünürlüklü CFAR, tepe bulma
+  rx/                   akış, yazılım AGC, geniş bant tarayıcı, RX düğümü (servis)
+  calib/                PPM (CW / GSM FCCH), güç kalibrasyonu, kalibrasyon deposu
+  df/                   koherens kontrolü, 2 elemanlı interferometre
+  bus/                  ZeroMQ yayın/abone/proxy, zarf, şema doğrulama
+  measure/              9 KTR ölçümü, rapor (HTML/MD/CSV/PNG)
+  gui/                  operatör konsolu (bus abonesi): model, bus istemcisi, paneller, tema
+  launch.py             tek komutla başlatıcı (proxy + RX + GUI)
+  cli/                  `eds` komutu (rx, sweep, cal, measure, bus, …)
+examples/             kendi programından bus'ı dinleme / komut gönderme örnekleri
+scripts/              install_ubuntu.sh (SDR yığını), Pluto udev kuralı
+tests/                ~1700 test (simülatör + gerçek API'leri taklit eden SoapySDR/libiio sahteleri + GUI)
+docs/                 kurulum, kullanım, donanım, ölçüm ve mimari belgeleri
+cal/ · reports/       cihaz kalibrasyon dosyaları · ölçüm raporları (çalışınca oluşur)
 ```
 
-## 7. Geliştirme
+## 6. Donanım kurulumu (Pluto)
 
 ```bash
-make test         # tüm testler        make test-fast   # realtime testler hariç
-make lint         # ruff               eds -v ...       # ayrıntılı günlük + traceback
+./setup.sh --hardware            # SDR yığını (libiio, SoapySDR, SoapyPlutoSDR), udev, .venv + GUI
+                                 # sonunda: SoapySDRUtil --find ile Pluto'yu arar; bulamazsa ne yapacağınızı yazar
+# udev/plugdev grubu için OTURUMU KAPATIP AÇIN, Pluto'yu takın, sonra:
+source .venv/bin/activate
+python run.py --mode hardware    # config/rx_pluto.toml ile Pluto + GUI
 ```
-Kurallar: birimler Hz/s/dB; örnekler `complex64`, tam ölçek = 1.0; yalnızca
-`eds.core.errors` istisnaları; kullanıcıya dönük metinler Türkçe, kod İngilizce.
 
-## 8. Yol haritası
+Kodun AD9363 kısıtlarına cevabı:
 
-* **Faz-1 DF:** KrakenSDR (Heimdall DAQ) backend'i → `RxDevice(num_channels=5, coherent=True)`;
-  `eds.df`'e MUSIC/Bartlett; `df_rms` ölçümü değişmeden çalışır.
-* **TX:** HackRF profili hazır; `SoapyTxSource` HackRF ile de çalışır (aynı Soapy API).
-* **Tarama hızı:** AD9361 fastlock profilleri ile retune süresinin kısaltılması.
-* Donanımda henüz koşulmamış yollar (SoapySDR/libiio) gerçek API'leri taklit eden sahtelerle
-  test edilmiştir; ilk donanım oturumunda `eds devices --probe` ve `eds measure max_rate`
-  ile doğrulanmalıdır.
+| Kısıt | Kodun cevabı |
+|---|---|
+| 325 MHz–3.8 GHz, ≤ 20 MHz BW | Her ayar donanıma gitmeden profile göre doğrulanır |
+| 12-bit ADC | Kırpma ve RF sıkışma tespiti, yazılım AGC |
+| TCXO ±25 ppm | PPM kalibrasyonu, donanımda `xo_correction` |
+| USB 2.0 | Sürdürülebilir hız ölçülür, taşmalar DMA kaydından okunur |
+| İki Pluto | Her Pluto ayrı süreçte çalışır (SoapyPlutoSDR sınırı) |
+
+İlk donanım oturumu, iki Pluto ve tezgâh bağlantıları: [`docs/KURULUM.md`](docs/KURULUM.md) §6 ve
+[`docs/HARDWARE_PLUTO.md`](docs/HARDWARE_PLUTO.md).
+
+## 7. Test
+
+```bash
+make test          # bütün testler (~3 dk); donanım gerekmez
+make test-fast     # zamanlamaya duyarlı (realtime) testler hariç
+make lint          # ruff
+```
+
+| Test grubu | Kapsam |
+|---|---|
+| Simülatör ve fizik | NF, filtreler, PPM, IQ imajı, sıkışma, USB2 taşma modeli |
+| DSP ve kalibrasyon | PSD ölçekleme, CFAR yanlış alarm oranı, PPM kestirimi, güç kalibrasyonu, DF geometrisi |
+| Donanım katmanı | Gerçek SoapySDR / libiio API'lerini taklit eden sahtelere karşı; ayrıca gerçek bağlamaların kurulu olduğu conda ortamında da koşuldu |
+| Bus | Her topic'in JSON şemasına uyması, proxy |
+| GUI | Ekransız (`QT_QPA_PLATFORM=offscreen`): sentetik mesajlar + simüle bir RX düğümünden canlı veri |
+| Başlatıcı | Süreçlerin başlayıp proxy üzerinden yayın yapması ve hepsinin temiz kapanması |
+
+GUI testleri PySide6 kurulu değilse kendiliğinden atlanır.
+
+## 8. KTR ölçümleri
+
+`eds measure all -c config/rx_sim.toml` (ya da `make demo` / `make report-sim`) dokuz spesifikasyonu
+ölçer ve `reports/<zaman>/` altına HTML/MD/CSV/JSON rapor ile grafikler yazar:
+
+| Spesifikasyon | Birim |
+|---|---|
+| duyarlılık | dBm |
+| dinamik alan | dB |
+| anlık BW | MHz |
+| tarama hızı | GHz/s |
+| frekans çözünürlüğü | Hz |
+| DF RMS | ° |
+| imaj bastırma | dB |
+| taşmasız maks. örnekleme hızı | MS/s |
+| uçtan uca gecikme | ms |
+
+Simülatör verisi, hızlı mod ve kalibrasyonsuz değerler raporda açıkça işaretlenir; karşılaştırılamayan
+değerlere hüküm verilmez. Tanımlar ve tezgâh kurulumu: [`docs/MEASUREMENTS.md`](docs/MEASUREMENTS.md).
+
+## 9. Belgeler
+
+| Belge | İçerik |
+|---|---|
+| [`docs/KURULUM.md`](docs/KURULUM.md) | Adım adım kurulum: Linux, Windows, WSL2, Pluto bağlantısı, sorun giderme |
+| [`docs/KULLANIM.md`](docs/KULLANIM.md) | Adım adım kullanım: konfigürasyon, RX düğümü ve bus, tarama, kalibrasyon, ölçümler, senaryolar |
+| [`docs/HARDWARE_PLUTO.md`](docs/HARDWARE_PLUTO.md) | Pluto'ya özgü ayrıntılar, iki Pluto, harici referans, güvenlik |
+| [`docs/MEASUREMENTS.md`](docs/MEASUREMENTS.md) | 9 KTR ölçümünün tanımı ve yöntemi |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Konvansiyonlar ve modül arayüzleri |
+| [`DEPENDENCIES.md`](DEPENDENCIES.md) | Hangi paket neden kuruluyor |

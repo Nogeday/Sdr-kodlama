@@ -8,7 +8,6 @@ version = "0.1.0"
 description = "KTÜ TEKNOFEST Elektronik Harp — Elektronik Destek (ED) sistemi: RX omurgası, ölçüm/raporlama, DF temeli"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Proprietary — KTÜ EH takımı" }
 dependencies = [
     "numpy>=1.24",
     "pyzmq>=25",
@@ -16,6 +15,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Operatör konsolu (GUI): yalnızca bus abonesi — SoapySDR/libiio GEREKTİRMEZ (bkz. DEPENDENCIES.md)
+gui = ["PySide6>=6.6", "pyqtgraph>=0.13.3"]
 # Rapor grafikleri / "ekran görüntüsü" PNG'leri
 report = ["matplotlib>=3.7"]
 # Mesaj şeması doğrulaması (geliştirme sırasında açık tutun)
@@ -26,6 +27,8 @@ dev = ["pytest>=7.4", "jsonschema>=4.18", "matplotlib>=3.7", "ruff>=0.4"]
 
 [project.scripts]
 eds = "eds.cli.main:main"
+eds-gui = "eds.gui.__main__:run"
+eds-launch = "eds.launch:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -4,8 +4,12 @@ Bu rehber EDS'yi (Elektronik Destek RX omurgası) **sıfırdan çalışır hâle
 önce donanım olmadan **simülatörde**, sonra **ADALM-Pluto** ile. Her adımda ne yaptığını,
 neden yaptığını ve başarılı olduğunda ne göreceğini anlatır.
 
-> **Kısa yol (her iki işletim sistemi):** Miniforge kur → `conda env create -f environment.yml`
-> → `conda activate eds` → `pip install -e ".[dev]"` → `eds measure all -c config/rx_sim.toml --quick`.
+> **En kısa yol (Ubuntu):** `./setup.sh --sim` (yalnız pip; operatör GUI'si dahil, SDR sürücüsü yok)
+> ya da `./setup.sh --hardware` (+ Pluto sürücüleri) → `source .venv/bin/activate` → `python run.py`.
+> Hangi paketin neden kurulduğu: [`DEPENDENCIES.md`](../DEPENDENCIES.md).
+>
+> **Kısa yol (her iki işletim sistemi, conda):** Miniforge kur → `conda env create -f environment.yml`
+> → `conda activate eds` → `pip install -e ".[gui,dev]"` → `python run.py` (simülasyon + GUI).
 > Ayrıntılar ve işletim sistemine özgü adımlar aşağıda.
 
 > 📗 **Kurulum bitti mi?** → Programın nasıl kullanılacağı (RX düğümü, tarama, ölçüm, rapor,

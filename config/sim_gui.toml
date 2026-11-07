@@ -1,0 +1,80 @@
+# EDS — Operatör konsolu (GUI) demo sahnesi: SİMÜLATÖR, donanım gerekmez.
+#
+#   python -m eds.launch --mode sim          # (vars. bu dosya) RX düğümü + GUI tek komutla
+#   eds rx -c config/sim_gui.toml            # yalnız RX düğümü; GUI: python -m eds.gui -c config/sim_gui.toml
+#
+# 433 MHz ISM bandı, 4 MHz'lik tek pencerede farklı sinyal türleri (BW sınıflarının üçü de var):
+#   dar bant (< 25 kHz)  : CW işaret vericisi, dar bant FM telsiz, darbeli telemetri (waterfall'da kesikli)
+#   orta (25 kHz–1 MHz)  : FM drone kumanda bağlantısı, LoRa benzeri 125 kHz
+#   geniş (≥ 1 MHz)      : analog video benzeri 1.5 MHz gürültü bandı
+
+[[device]]
+name = "rx0"
+backend = "sim"
+profile = "ad9363_pluto"
+sim = { ppm = 11.7, realtime = true }
+
+[rx]
+center_freq_hz = 434.0e6          # 432–436 MHz; kullanılabilir ±0.4·fs = 432.4–435.6 MHz
+sample_rate_hz = 4e6              # 4 MS/s × 4 B = 16 MB/s (USB2 modelinin altında: taşma yok)
+bandwidth_hz = 4e6
+gain_mode = "manual"
+gain_db = 50.0
+
+[dsp]
+nfft = 4096
+averages = 8                      # ~5 ms pencere → 20 fps GUI için bol kare
+
+[bus]
+mode = "direct"
+pub_endpoint = "tcp://*:5555"
+sub_endpoint = "tcp://127.0.0.1:5555"
+status_period_s = 0.5
+spectrum_rate_hz = 20.0           # GUI için ~20 fps (her DSP penceresinde değil)
+spectrum_max_bins = 2048          # tepe korumalı seyreltme: 4096 → 2048 nokta
+
+[sim]
+seed = 2026
+
+[[sim.emitters]]
+name = "video_downlink"
+kind = "noise"
+freq_hz = 432.95e6
+power_dbm = -72.0
+bw_hz = 1.5e6
+
+[[sim.emitters]]
+name = "beacon_cw"
+kind = "cw"
+freq_hz = 433.78e6
+power_dbm = -95.0
+
+[[sim.emitters]]
+name = "ism433_uav_link"
+kind = "fm"
+freq_hz = 433.92e6
+power_dbm = -58.0
+bw_hz = 60e3
+params = { dev_hz = 25e3, mod_hz = 2e3 }
+
+[[sim.emitters]]
+name = "lora_like"
+kind = "noise"
+freq_hz = 434.5e6
+power_dbm = -78.0
+bw_hz = 125e3
+
+[[sim.emitters]]
+name = "nbfm_voice"
+kind = "fm"
+freq_hz = 434.95e6
+power_dbm = -82.0
+bw_hz = 12.5e3
+params = { dev_hz = 2.5e3, mod_hz = 1e3 }
+
+[[sim.emitters]]
+name = "telemetry_burst"
+kind = "pulse"
+freq_hz = 435.25e6
+power_dbm = -66.0
+params = { pri_s = 0.4, pw_s = 0.15 }

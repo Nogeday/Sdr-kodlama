@@ -6,6 +6,11 @@ tarama, kalibrasyon, 9 KTR ölçümü ve rapor, kendi programınızdan (GUI, DF)
 Her adımda aynı düzeni izler: **amaç** (neden yapıyoruz), **komut**, **gerçek çıktı**,
 **çıktı nasıl okunur**, **sık hatalar**.
 
+> [!TIP]
+> **Operatör konsolu (GUI):** `python run.py` bus proxy + RX düğümü + GUI'yi tek komutla açar
+> (`--mode hardware` ile Pluto). Panellerin anlatımı: [README §4](../README.md#4-operatör-konsolu-gui).
+> Bu rehberdeki `eds ...` komutları GUI'nin arkasındaki parçaları tek tek çalıştırmayı anlatır.
+
 > [!NOTE]
 > **Ön koşul:** [KURULUM.md](KURULUM.md) tamamlandı ve `eds --version` çalışıyor.
 > Bu rehber kurulumu tekrar anlatmaz. Pluto'yu ilk kez bağlıyorsanız oradaki
